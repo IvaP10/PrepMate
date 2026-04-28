@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local packages (installed deps — do NOT commit)
+.packages/
+
+# ML model files (auto-downloaded on first run)
+models/
+
+# Secrets — never commit these
+key.env
+.env
+.env.*
+*.env
+!requirements*.txt
+
+# Frontend secrets
+Frontend/.env.local
+Frontend/.env.production
+Frontend/.env.development
+
+# Logs and runtime
+*.log
+*.pid
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+.next/
+out/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Type checker caches
+.pyre/
+.mypy_cache/
+.pytype/
+
+# Test artifacts
+test_resume.pdf
+
+# Misc build artifacts
+package-lock.json

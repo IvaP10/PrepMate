@@ -1,0 +1,108 @@
+'use client'
+
+import React, { createContext, useContext, useState, useCallback, useEffect } from 'react'
+import type { ResumeData, VerifyFormData } from '@/types/resume'
+import { getResume } from '@/lib/api'
+
+interface ResumeContextType {
+  resumeData: ResumeData | null
+  isLoading: boolean
+  error: string | null
+
+  uploadedFileId: string | null
+  uploadProgress: number
+
+  setResumeData: (data: ResumeData) => void
+  setUploadedFileId: (fileId: string) => void
+  setUploadProgress: (progress: number) => void
+  setError: (error: string | null) => void
+  setLoading: (loading: boolean) => void
+
+  isDataComplete: boolean
+  justParsed: boolean
+  setJustParsed: (val: boolean) => void
+
+  reset: () => void
+}
+
+const ResumeContext = createContext<ResumeContextType | undefined>(undefined)
+
+export function ResumeProvider({
+  children,
+  userId,
+}: {
+  children: React.ReactNode
+  userId?: string | null
+}) {
+  const [resumeData, setResumeData] = useState<ResumeData | null>(null)
+  const [uploadedFileId, setUploadedFileId] = useState<string | null>(null)
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [isLoading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [justParsed, setJustParsed] = useState(false)
+
+  // Auto-load saved resume from backend when user is authenticated
+  useEffect(() => {
+    if (!userId) return
+    let cancelled = false
+
+    const loadSavedResume = async () => {
+      try {
+        const saved = await getResume()
+        if (!cancelled && saved?.fullName) {
+          setResumeData(saved)
+        }
+      } catch {
+        // No resume saved yet — that's fine, don't show an error
+      }
+    }
+
+    loadSavedResume()
+    return () => { cancelled = true }
+  }, [userId])
+
+  const isDataComplete = Boolean(
+    resumeData?.fullName &&
+    resumeData?.skills?.length > 0
+  )
+
+  const reset = useCallback(() => {
+    setResumeData(null)
+    setUploadedFileId(null)
+    setUploadProgress(0)
+    setLoading(false)
+    setError(null)
+    setJustParsed(false)
+  }, [])
+
+  const value: ResumeContextType = {
+    resumeData,
+    isLoading,
+    error,
+    uploadedFileId,
+    uploadProgress,
+    setResumeData,
+    setUploadedFileId,
+    setUploadProgress,
+    setError,
+    setLoading,
+    isDataComplete,
+    justParsed,
+    setJustParsed,
+    reset,
+  }
+
+  return (
+    <ResumeContext.Provider value={value}>
+      {children}
+    </ResumeContext.Provider>
+  )
+}
+
+export function useResume() {
+  const context = useContext(ResumeContext)
+  if (!context) {
+    throw new Error('useResume must be used within ResumeProvider')
+  }
+  return context
+}
