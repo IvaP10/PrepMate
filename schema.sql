@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS UserInfo (
     is_unlimited             BOOLEAN     NOT NULL DEFAULT FALSE,
     is_admin                 BOOLEAN     NOT NULL DEFAULT FALSE,
     plan_type                VARCHAR(50) NOT NULL DEFAULT 'free',
+    avatar_url               TEXT,
+    notification_prefs       JSONB       NOT NULL DEFAULT '{}'::jsonb,
     resume_uploaded_at       TIMESTAMP,
     updated_at               TIMESTAMP   NOT NULL DEFAULT NOW(),
     date_created             TIMESTAMP   NOT NULL DEFAULT NOW()
@@ -73,6 +75,19 @@ CREATE TABLE IF NOT EXISTS Interviews (
 CREATE INDEX IF NOT EXISTS idx_interviews_user ON Interviews (user_id);
 CREATE INDEX IF NOT EXISTS idx_interviews_status ON Interviews (status);
 CREATE INDEX IF NOT EXISTS idx_interviews_created ON Interviews (created_at DESC);
+
+CREATE TABLE IF NOT EXISTS JobProfiles (
+    profile_id  SERIAL      PRIMARY KEY,
+    user_id     VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    role        VARCHAR(255) NOT NULL,
+    company     VARCHAR(255),
+    tech_stack  JSONB       NOT NULL DEFAULT '[]'::jsonb,
+    is_selected BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMP   NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP   NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_profiles_user ON JobProfiles (user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS InterviewQuestions (
     question_id        VARCHAR(64)  PRIMARY KEY,

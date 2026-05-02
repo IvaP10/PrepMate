@@ -9,7 +9,7 @@ interface CtaSectionProps {
 const benefits = [
   "Questions tailored to your actual resume",
   "Scored mock interviews with actionable feedback",
-  "Practice mode with strategic advice per response",
+  "Focused dashboard exercises for weak answers",
 ]
 const TARGET_SCORE = 86
 const TARGET_SESSIONS = 12

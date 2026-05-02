@@ -75,6 +75,19 @@ def ensure_runtime_schema():
             "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS retry_state JSONB",
             "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS stt_confidence NUMERIC(5,2)",
             """
+            CREATE TABLE IF NOT EXISTS JobProfiles (
+                profile_id SERIAL PRIMARY KEY,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                role VARCHAR(255) NOT NULL,
+                company VARCHAR(255),
+                tech_stack JSONB NOT NULL DEFAULT '[]'::jsonb,
+                is_selected BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_job_profiles_user ON JobProfiles (user_id, created_at DESC)",
+            """
             CREATE TABLE IF NOT EXISTS SupportSubmissions (
                 submission_id BIGSERIAL PRIMARY KEY,
                 user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
@@ -93,6 +106,8 @@ def ensure_runtime_schema():
             """,
             "CREATE INDEX IF NOT EXISTS idx_support_user_created ON SupportSubmissions (user_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_support_status_created ON SupportSubmissions (status, created_at DESC)",
+            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS avatar_url TEXT",
+            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS notification_prefs JSONB NOT NULL DEFAULT '{}'::jsonb",
         ]
         for statement in statements:
             cursor.execute(statement)

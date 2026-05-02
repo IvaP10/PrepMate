@@ -13,9 +13,9 @@ const steps = [
   {
     number: "02",
     icon: MonitorPlay,
-    title: "Select Your Preferred Simulation Mode",
+    title: "Pick a Saved Job Profile",
     description:
-      "Choose a Mock Interview for a comprehensive, timed evaluation, or Practice Mode for an iterative learning experience with immediate feedback.",
+      "Create role, company, and tech stack profiles once, then start a mock interview against the right target with one tap.",
   },
   {
     number: "03",

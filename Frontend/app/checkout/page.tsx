@@ -14,12 +14,59 @@ import { createPaymentSession, verifyRazorpayPayment } from "@/lib/api"
 type PaymentMethod = "upi" | "card" | "netbanking"
 type UpiMode = "id" | "qr"  // whether user wants to type ID or scan QR
 
+const MEMBERSHIP_PLANS: Record<string, {
+    name: string
+    amount: number
+    cadence: string
+    description: string
+    detail: string
+}> = {
+    starter: {
+        name: "Starter",
+        amount: 299,
+        cadence: "Monthly · 1 month access",
+        description: "Mock interviews to practice with, performance analysis after every session",
+        detail: "Get interview ready",
+    },
+    pro: {
+        name: "Pro",
+        amount: 999,
+        cadence: "Monthly membership",
+        description: "Unlimited mocks, full coaching, all exercise modes, deep analytics",
+        detail: "Unlock the full experience",
+    },
+    pro_annual: {
+        name: "Pro (Annual)",
+        amount: 10788,
+        cadence: "Billed yearly at ₹10,788",
+        description: "Everything in Pro — save 10% with annual billing",
+        detail: "₹899 / month billed annually",
+    },
+    premium: {
+        name: "Premium",
+        amount: 1499,
+        cadence: "Monthly membership",
+        description: "Everything in Pro plus technical rounds, code editor, problem walkthroughs",
+        detail: "Ace every round, including technical",
+    },
+    premium_annual: {
+        name: "Premium (Annual)",
+        amount: 16188,
+        cadence: "Billed yearly at ₹16,188",
+        description: "Everything in Premium — save 10% with annual billing",
+        detail: "₹1,349 / month billed annually",
+    },
+}
+
 /* ─────────────────────── Component ─────────────────────── */
 function CheckoutContent() {
     const searchParams = useSearchParams()
     const router = useRouter()
+    const planParam = searchParams.get("plan")
+    const membershipPlan = planParam ? MEMBERSHIP_PLANS[planParam] : null
     const sessionsParam = searchParams.get("sessions")
     const sessionCount = sessionsParam ? parseInt(sessionsParam) : 5
+    const isMembershipCheckout = Boolean(membershipPlan && planParam)
 
     /* ── payment method ── */
     const [selectedMethod, setSelectedMethod] = useState<PaymentMethod>("upi")
@@ -58,6 +105,22 @@ function CheckoutContent() {
     useEffect(() => {
         async function fetchPricing() {
             setPricingLoading(true)
+            if (membershipPlan) {
+                setPricing({
+                    sessions: 0,
+                    price_per_credit: 0,
+                    base_price: membershipPlan.amount,
+                    discount: 0,
+                    discount_percent: 0,
+                    subtotal: membershipPlan.amount,
+                    processing_fee: 0,
+                    processing_fee_percent: 0,
+                    total: membershipPlan.amount,
+                    currency: "INR",
+                })
+                setPricingLoading(false)
+                return
+            }
             try {
                 const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api"
                 const res = await fetch(
@@ -76,7 +139,7 @@ function CheckoutContent() {
             }
         }
         fetchPricing()
-    }, [sessionCount])
+    }, [sessionCount, membershipPlan])
 
     const fmtPrice = (n: number) =>
         `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
@@ -144,7 +207,7 @@ function CheckoutContent() {
             amount: Math.round(order.amount * 100),
             currency: "INR",
             name: "InterAI",
-            description: `${sessionCount} Interview Credits`,
+            description: membershipPlan ? `${membershipPlan.name} Membership` : `${sessionCount} Interview Sessions`,
             order_id: order.session_url,  // razorpay order_id from backend
             prefill: {} as any,
             handler: async (resp: any) => {
@@ -155,7 +218,7 @@ function CheckoutContent() {
                         resp.razorpay_payment_id,
                         resp.razorpay_signature
                     )
-                    toast.success(result.message || "Payment successful! Credits added.")
+                    toast.success(result.message || "Payment successful!")
                     router.push("/")
                 } catch (err: any) {
                     toast.error(err?.message || "Verification failed. Contact support.")
@@ -207,7 +270,7 @@ function CheckoutContent() {
         setProcessingLabel("Creating order…")
 
         try {
-            const res = await createPaymentSession("credits", "razorpay", selectedMethod, sessionCount)
+            const res = await createPaymentSession(isMembershipCheckout && planParam ? planParam : "credits", "razorpay", selectedMethod, isMembershipCheckout ? undefined : sessionCount)
             setProcessingLabel("Opening payment gateway…")
             await openRazorpay(res)
         } catch (e: any) {
@@ -583,11 +646,18 @@ function CheckoutContent() {
                                             <Zap className="h-6 w-6 text-primary" />
                                         </div>
                                         <div className="flex-1 min-w-0">
-                                            <h3 className="text-base font-semibold text-foreground">Interview Credits × {sessionCount}</h3>
-                                            <p className="text-sm text-muted-foreground mt-0.5">Mock & Practice sessions</p>
+                                            <h3 className="text-base font-semibold text-foreground">
+                                                {membershipPlan ? `${membershipPlan.name} Membership` : `Mock Interviews × ${sessionCount}`}
+                                            </h3>
+                                            <p className="text-sm text-muted-foreground mt-0.5">
+                                                {membershipPlan ? membershipPlan.description : "Mock interview sessions"}
+                                            </p>
                                             <div className="mt-3 flex flex-wrap items-center gap-2">
-                                                <span className="text-xs text-muted-foreground bg-secondary rounded-md px-2.5 py-1 font-medium">₹{pricing?.price_per_credit ?? 199} / credit</span>
-                                                {pricing && pricing.discount > 0 && <span className="text-xs font-bold text-green-700 dark:text-green-400 bg-green-100 dark:bg-green-500/10 rounded-md px-2.5 py-1">{pricing.discount_percent}% OFF</span>}
+                                                <span className="text-xs text-muted-foreground bg-secondary rounded-md px-2.5 py-1 font-medium">
+                                                    {membershipPlan ? membershipPlan.cadence : `₹${pricing?.price_per_credit ?? 199} / interview`}
+                                                </span>
+                                                {membershipPlan && <span className="text-xs font-medium text-muted-foreground bg-secondary rounded-md px-2.5 py-1">{membershipPlan.detail}</span>}
+                                                {!membershipPlan && pricing && pricing.discount > 0 && <span className="text-xs font-bold text-green-700 dark:text-green-400 bg-green-100 dark:bg-green-500/10 rounded-md px-2.5 py-1">{pricing.discount_percent}% OFF</span>}
                                             </div>
                                         </div>
                                         <div className="text-right shrink-0">
@@ -596,7 +666,7 @@ function CheckoutContent() {
                                         </div>
                                     </div>
                                     <div className="mt-4 flex items-center gap-6 pt-4 border-t border-border/30">
-                                        <div className="flex items-center gap-2 text-xs text-muted-foreground"><Shield className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />Credits never expire</div>
+                                        <div className="flex items-center gap-2 text-xs text-muted-foreground"><Shield className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />Cancel anytime</div>
                                         <div className="flex items-center gap-2 text-xs text-muted-foreground"><Zap className="h-3.5 w-3.5 text-amber-500" />Instant activation</div>
                                     </div>
                                 </div>
@@ -663,26 +733,30 @@ function CheckoutContent() {
                                     </div>
                                     <div className="p-6 space-y-3">
                                         <div className="flex items-center justify-between text-sm">
-                                            <span className="text-muted-foreground">Price ({sessionCount} credits)</span>
+                                            <span className="text-muted-foreground">
+                                                {membershipPlan ? membershipPlan.name : `Price (${sessionCount} interviews)`}
+                                            </span>
                                             <span className="text-foreground">{fmtPrice(pricing?.base_price ?? 0)}</span>
                                         </div>
-                                        {pricing && pricing.discount > 0 && (
+                                        {!membershipPlan && pricing && pricing.discount > 0 && (
                                             <div className="flex items-center justify-between text-sm">
                                                 <span className="text-green-700 dark:text-green-400">Discount ({pricing.discount_percent}%)</span>
                                                 <span className="text-green-700 dark:text-green-400">−{fmtPrice(pricing.discount)}</span>
                                             </div>
                                         )}
-                                        <div className="flex items-center justify-between text-sm">
-                                            <span className="text-muted-foreground">Processing Fee <span className="text-[10px] ml-1 text-muted-foreground/50">({pricing?.processing_fee_percent ?? 2}%)</span></span>
-                                            <span className="text-foreground">+{fmtPrice(pricing?.processing_fee ?? 0)}</span>
-                                        </div>
+                                        {!membershipPlan && (
+                                            <div className="flex items-center justify-between text-sm">
+                                                <span className="text-muted-foreground">Processing Fee <span className="text-[10px] ml-1 text-muted-foreground/50">({pricing?.processing_fee_percent ?? 2}%)</span></span>
+                                                <span className="text-foreground">+{fmtPrice(pricing?.processing_fee ?? 0)}</span>
+                                            </div>
+                                        )}
                                         <div className="border-t border-border/40 pt-3 mt-1">
                                             <div className="flex items-center justify-between">
                                                 <span className="text-base font-bold text-foreground">Total</span>
                                                 <span className="text-base font-bold text-foreground">{fmtPrice(pricing?.total ?? 0)}</span>
                                             </div>
                                         </div>
-                                        {pricing && pricing.discount > 0 && (
+                                        {!membershipPlan && pricing && pricing.discount > 0 && (
                                             <div className="rounded-lg bg-green-50 dark:bg-green-500/10 border border-green-200 dark:border-green-500/20 px-4 py-2.5 text-center">
                                                 <p className="text-xs font-semibold text-green-700 dark:text-green-400">You save {fmtPrice(pricing.discount)} on this order!</p>
                                             </div>

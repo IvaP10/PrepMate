@@ -3,7 +3,7 @@ import { ThemeLogo } from "@/components/theme-logo"
 const footerLinks = [
   {
     heading: "Product",
-    links: ["Features", "Pricing", "Mock Interview", "Practice Mode"],
+    links: ["Features", "Membership", "Mock Interview", "Exercise Modes"],
   },
   {
     heading: "Company",

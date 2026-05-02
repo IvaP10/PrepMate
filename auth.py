@@ -875,6 +875,124 @@ async def refresh_token(
         "message": "Token refreshed"
     }
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, v):
+        return _validate_password_strength(v)
+
+@router.post("/change-password")
+async def change_password(
+    request: ChangePasswordRequest,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    with get_db() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT password, auth_provider FROM Login WHERE user_id = %s",
+                (current_user["user_id"],)
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+
+            stored_hash, auth_provider = row
+            if auth_provider == "google" or stored_hash is None:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "This account uses Google Sign-In. Password cannot be changed here."
+                )
+
+            if not await verify_password_async(request.current_password, stored_hash):
+                raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
+
+            new_hash = await hash_password_async(request.new_password)
+            with transaction(connection):
+                cursor.execute(
+                    "UPDATE Login SET password = %s WHERE user_id = %s",
+                    (new_hash, current_user["user_id"])
+                )
+
+            _increment_token_version(current_user["user_id"])
+            token = create_jwt_token(current_user["user_id"], current_user["email"])
+            _set_auth_cookie(response, token)
+
+            return {"message": "Password changed successfully"}
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Change password failed")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to change password")
+        finally:
+            cursor.close()
+
+class DeleteAccountRequest(BaseModel):
+    password: Optional[str] = None
+
+@router.delete("/delete-account")
+async def delete_account(
+    request: DeleteAccountRequest,
+    response: Response,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    with get_db() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "SELECT password, auth_provider FROM Login WHERE user_id = %s",
+                (current_user["user_id"],)
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "Account not found")
+
+            stored_hash, auth_provider = row
+
+            if auth_provider != "google":
+                if not request.password:
+                    raise HTTPException(status.HTTP_400_BAD_REQUEST, "Password is required to delete your account")
+                if not await verify_password_async(request.password, stored_hash):
+                    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Password is incorrect")
+
+            user_id = current_user["user_id"]
+            with transaction(connection):
+                cursor.execute(
+                    """DELETE FROM InterviewResponses
+                       WHERE interview_id IN (SELECT interview_id FROM Interviews WHERE user_id = %s)""",
+                    (user_id,)
+                )
+                cursor.execute(
+                    """DELETE FROM InterviewQuestions
+                       WHERE interview_id IN (SELECT interview_id FROM Interviews WHERE user_id = %s)""",
+                    (user_id,)
+                )
+                cursor.execute("DELETE FROM Interviews WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM JobProfiles WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM SupportSubmissions WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM ResumeUploadLogs WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM Transactions WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM Subscriptions WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM UserInfo WHERE user_id = %s", (user_id,))
+                cursor.execute("DELETE FROM Login WHERE user_id = %s", (user_id,))
+
+            _increment_token_version(user_id)
+            _clear_auth_cookie(response)
+            logger.info("Account deleted: %s", user_id)
+
+            return {"message": "Account deleted successfully"}
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Delete account failed")
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to delete account")
+        finally:
+            cursor.close()
+
 @router.post("/logout")
 async def logout(
     response: Response,

@@ -14,6 +14,8 @@ export const API_ENDPOINTS = {
     REFRESH: '/auth/refresh',
     FORGOT_PASSWORD: '/auth/forgot-password',
     RESET_PASSWORD: '/auth/reset-password',
+    CHANGE_PASSWORD: '/auth/change-password',
+    DELETE_ACCOUNT: '/auth/delete-account',
     LOGOUT: '/auth/logout',
   },
   RESUME: {
@@ -33,6 +35,7 @@ export const API_ENDPOINTS = {
   DASHBOARD: {
     STATS: '/dashboard/stats',
     JOBS: '/dashboard/jobs',
+    JOB_PROFILES: '/dashboard/job-profiles',
     RECENT_ACTIVITY: '/dashboard/recent-activity',
     PERFORMANCE: '/dashboard/performance-trend',
     ANALYTICS: '/dashboard/analytics',
@@ -40,6 +43,11 @@ export const API_ENDPOINTS = {
   PROFILE: {
     ME: '/profile/me',
     UPDATE: '/profile/update',
+    UPDATE_ACCOUNT: '/profile/update-account',
+    AVATAR: '/profile/avatar',
+    EXPORT_DATA: '/profile/export-data',
+    DELETE_SESSION_HISTORY: '/profile/session-history',
+    NOTIFICATION_PREFS: '/profile/notification-prefs',
     STATISTICS: '/profile/statistics',
     HISTORY: '/profile/interview-history',
   },

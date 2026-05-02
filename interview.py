@@ -41,6 +41,7 @@ class StartInterviewRequest(BaseModel):
     interview_mode: str
     interview_type: str
     job_id: Optional[int] = None
+    job_profile_id: Optional[int] = None
 
 class InterviewResponse(BaseModel):
     interview_id: str
@@ -314,7 +315,7 @@ async def start_interview(
         cursor.execute(
             """
             SELECT profile_completed, job_id, profile_json, resume_json,
-                   interviews_remaining, is_unlimited, external_profile_signals
+                   interviews_remaining, is_unlimited, external_profile_signals, plan_type
             FROM UserInfo
             WHERE user_id = %s
             """,
@@ -330,9 +331,44 @@ async def start_interview(
             )
 
         profile_json = row[2] or {}
+        resume_json = row[3] or {}
+        interviews_remaining = row[4] or 0
+        is_unlimited = row[5] or False
+        external_profile_signals = row[6] or {}
+        plan_type = row[7] or "free"
+
+        selected_job_profile = None
+        if request.job_profile_id:
+            cursor.execute(
+                """
+                SELECT profile_id, role, company, tech_stack
+                FROM JobProfiles
+                WHERE profile_id = %s AND user_id = %s
+                """,
+                (request.job_profile_id, current_user["user_id"])
+            )
+            selected_job_profile = cursor.fetchone()
+            if not selected_job_profile:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Job profile not found"
+                )
+        elif not request.job_id:
+            cursor.execute(
+                """
+                SELECT profile_id, role, company, tech_stack
+                FROM JobProfiles
+                WHERE user_id = %s
+                ORDER BY is_selected DESC, created_at DESC
+                LIMIT 1
+                """,
+                (current_user["user_id"],)
+            )
+            selected_job_profile = cursor.fetchone()
+
         has_name = bool(profile_json.get("name", ""))
         has_skills = bool(profile_json.get("skills"))
-        if not has_name or not has_skills:
+        if not selected_job_profile and (not has_name or not has_skills):
             missing = []
             if not has_name:
                 missing.append("name")
@@ -343,10 +379,28 @@ async def start_interview(
                 detail=f"Please complete your profile: missing {', '.join(missing)}"
             )
 
-        resume_json = row[3] or {}
-        interviews_remaining = row[4] or 0
-        is_unlimited = row[5] or False
-        external_profile_signals = row[6] or {}
+        if plan_type == "starter" and not is_unlimited:
+            cursor.execute(
+                """
+                SELECT COUNT(*), MAX(created_at)
+                FROM Interviews
+                WHERE user_id = %s
+                  AND interview_mode = 'mock'
+                  AND created_at >= NOW() - INTERVAL '30 days'
+                """,
+                (current_user["user_id"],)
+            )
+            cooldown_row = cursor.fetchone()
+            starter_count = cooldown_row[0] or 0
+            last_started = cooldown_row[1]
+            if starter_count > 0 and starter_count % 3 == 0 and last_started:
+                elapsed_seconds = (datetime.utcnow() - last_started).total_seconds()
+                if elapsed_seconds < 86400:
+                    hours_left = max(1, int((86400 - elapsed_seconds + 3599) // 3600))
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=f"Starter cooldown active. You can start another mock in about {hours_left} hour(s), or upgrade to Pro for no cooldown."
+                    )
 
         if not is_unlimited:
             cursor.execute(
@@ -368,7 +422,23 @@ async def start_interview(
 
         job_id = request.job_id or row[1]
 
-        if job_id:
+        if selected_job_profile:
+            tech_stack = selected_job_profile[3] or []
+            if isinstance(tech_stack, str):
+                try:
+                    tech_stack = json.loads(tech_stack)
+                except Exception:
+                    tech_stack = []
+            role = selected_job_profile[1]
+            company = selected_job_profile[2]
+            job_title = f"{role} at {company}" if company else role
+            job_description = "Tech stack: " + ", ".join(tech_stack) if tech_stack else ""
+            profile_json = {
+                **profile_json,
+                "target_role": role,
+                "skills": profile_json.get("skills") or tech_stack,
+            }
+        elif job_id:
             cursor.execute(
                 "SELECT title, description FROM Jobs WHERE job_id = %s",
                 (job_id,)
@@ -399,7 +469,7 @@ async def start_interview(
 
         duration_minutes = 40 if request.interview_mode == "mock" else 30
 
-        planner_profile = dict(resume_json or profile_json or {})
+        planner_profile = dict(profile_json or resume_json or {})
         planner_profile["external_profile_signals"] = external_profile_signals
 
         knowledge_map = build_knowledge_map(

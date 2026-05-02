@@ -26,6 +26,33 @@ if app_settings.RAZORPAY_KEY_ID and app_settings.RAZORPAY_KEY_SECRET:
 
 RAZORPAY_WEBHOOK_SECRET = app_settings.RAZORPAY_WEBHOOK_SECRET
 
+MEMBERSHIP_PLANS = {
+    "starter": {
+        "amount": 799.0,
+        "currency": "INR",
+        "interviews": 5,
+        "is_unlimited": False,
+        "duration_days": 30,
+        "name": "Starter",
+    },
+    "pro": {
+        "amount": 1499.0,
+        "currency": "INR",
+        "interviews": None,
+        "is_unlimited": True,
+        "duration_days": 30,
+        "name": "Pro",
+    },
+    "pro_annual": {
+        "amount": 11988.0,
+        "currency": "INR",
+        "interviews": None,
+        "is_unlimited": True,
+        "duration_days": 365,
+        "name": "Pro Annual",
+    },
+}
+
 class CreateSubscriptionRequest(BaseModel):
     plan_type: str
     payment_method: str
@@ -51,6 +78,48 @@ class SubscriptionResponse(BaseModel):
     interviews_remaining: Optional[int]
     is_unlimited: bool
 
+
+def _apply_completed_transaction(cursor, user_id: str, credits_to_grant: Optional[int], subscription_id: Optional[str]) -> str:
+    if subscription_id:
+        cursor.execute(
+            """
+            UPDATE Subscriptions
+            SET status = 'active'
+            WHERE subscription_id = %s
+            RETURNING plan_type, is_unlimited
+            """,
+            (subscription_id,)
+        )
+        subscription_row = cursor.fetchone()
+        if not subscription_row:
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        plan_type = subscription_row[0]
+        is_unlimited = bool(subscription_row[1])
+        cursor.execute(
+            """
+            UPDATE UserInfo
+            SET plan_type = %s,
+                is_unlimited = %s,
+                interviews_remaining = CASE WHEN %s THEN interviews_remaining ELSE %s END
+            WHERE user_id = %s
+            """,
+            (
+                plan_type,
+                is_unlimited,
+                is_unlimited,
+                credits_to_grant or 0,
+                user_id,
+            )
+        )
+        return "membership"
+
+    if credits_to_grant is not None and credits_to_grant > 0:
+        cursor.execute(
+            "UPDATE UserInfo SET interviews_remaining = COALESCE(interviews_remaining, 0) + %s WHERE user_id = %s",
+            (credits_to_grant, user_id)
+        )
+    return "purchase"
+
 @router.get("/pricing")
 async def get_pricing(
     sessions: int = 5,
@@ -68,13 +137,16 @@ async def create_subscription(
     request: CreateSubscriptionRequest,
     current_user: Dict = Depends(get_current_user)
 ):
-    if request.plan_type != "credits":
+    is_credit_purchase = request.plan_type == "credits"
+    membership_plan = MEMBERSHIP_PLANS.get(request.plan_type)
+
+    if not is_credit_purchase and not membership_plan:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only 'credits' plan type is currently supported"
+            detail="Unsupported plan type"
         )
 
-    if not request.sessions or request.sessions < 1 or request.sessions > 100:
+    if is_credit_purchase and (not request.sessions or request.sessions < 1 or request.sessions > 100):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Sessions must be between 1 and 100"
@@ -86,9 +158,17 @@ async def create_subscription(
             detail="Provider must be 'razorpay' or 'stripe'"
         )
 
-    pricing = PRICING.calculate_total(request.sessions, request.provider)
-    amount = pricing["total"]
-    currency = pricing["currency"]
+    if is_credit_purchase:
+        pricing = PRICING.calculate_total(request.sessions, request.provider)
+        amount = pricing["total"]
+        currency = pricing["currency"]
+        product_name = f"InterAI {request.sessions} Interview Credits"
+        cancel_url = f"{app_settings.APP_BASE_URL}/checkout?sessions={request.sessions}"
+    else:
+        amount = membership_plan["amount"]
+        currency = membership_plan["currency"]
+        product_name = f"InterAI {membership_plan['name']} Membership"
+        cancel_url = f"{app_settings.APP_BASE_URL}/checkout?plan={request.plan_type}"
 
     with get_db() as connection:
         cursor = connection.cursor()
@@ -119,6 +199,30 @@ async def create_subscription(
             expires_at = now + timedelta(minutes=PRICING.TRANSACTION_EXPIRY_MINUTES)
             session_url = None
             razorpay_order_id = None
+            subscription_id = None
+
+            if membership_plan:
+                subscription_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO Subscriptions (
+                        subscription_id, user_id, plan_type, status,
+                        start_date, end_date, auto_renew, is_unlimited, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        subscription_id,
+                        current_user["user_id"],
+                        request.plan_type,
+                        "pending",
+                        now,
+                        now + timedelta(days=membership_plan["duration_days"]),
+                        True,
+                        membership_plan["is_unlimited"],
+                        now,
+                    )
+                )
 
             if request.provider == "stripe" and stripe.api_key:
                 try:
@@ -128,7 +232,7 @@ async def create_subscription(
                             "price_data": {
                                 "currency": currency.lower(),
                                 "product_data": {
-                                    "name": f"InterAI {request.sessions} Interview Credits",
+                                    "name": product_name,
                                 },
                                 "unit_amount": int(amount * 100),
                             },
@@ -136,7 +240,7 @@ async def create_subscription(
                         }],
                         mode="payment",
                         success_url=f"{app_settings.APP_BASE_URL}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
-                        cancel_url=f"{app_settings.APP_BASE_URL}/checkout?sessions={request.sessions}",
+                        cancel_url=cancel_url,
                         client_reference_id=transaction_id,
                         expires_at=int(expires_at.timestamp()),
                     )
@@ -174,8 +278,8 @@ async def create_subscription(
                 """,
                 (
                     effective_txn_id, current_user["user_id"],
-                    None,  # No subscription_id — avoids FK violation for credit purchases
-                    amount, request.sessions, currency,
+                    subscription_id,
+                    amount, membership_plan["interviews"] if membership_plan else request.sessions, currency,
                     request.payment_method, request.provider,
                     "pending", expires_at, now,
                 )
@@ -184,8 +288,8 @@ async def create_subscription(
             connection.commit()
             connection.autocommit = True
             logger.info(
-                "Pending transaction created: txn=%s, user=%s, sessions=%d, amount=%.2f %s",
-                effective_txn_id, current_user["user_id"], request.sessions, amount, currency,
+                "Pending transaction created: txn=%s, user=%s, plan=%s, amount=%.2f %s",
+                effective_txn_id, current_user["user_id"], request.plan_type, amount, currency,
             )
 
             return {
@@ -247,7 +351,7 @@ async def verify_razorpay_payment(
             connection.autocommit = False
 
             cursor.execute(
-                "SELECT status, credits_purchased, user_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
+                "SELECT status, credits_purchased, user_id, subscription_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
                 (request.razorpay_order_id,)
             )
             txn = cursor.fetchone()
@@ -257,8 +361,17 @@ async def verify_razorpay_payment(
                 raise HTTPException(status_code=404, detail="Transaction not found")
 
             if txn[0] == "completed":
-                connection.rollback()
-                return {"success": True, "message": "Payment already verified", "credits": txn[1]}
+                if txn[3]:
+                    cursor.execute("SELECT status FROM Subscriptions WHERE subscription_id = %s", (txn[3],))
+                    sub_status = cursor.fetchone()
+                    if sub_status and sub_status[0] == "pending":
+                        _apply_completed_transaction(cursor, current_user["user_id"], txn[1], txn[3])
+                        connection.commit()
+                    else:
+                        connection.rollback()
+                else:
+                    connection.rollback()
+                return {"success": True, "message": "Payment already verified"}
 
             if txn[0] != "pending":
                 connection.rollback()
@@ -269,28 +382,26 @@ async def verify_razorpay_payment(
                 raise HTTPException(status_code=403, detail="Transaction does not belong to this user")
 
             credits_to_grant = txn[1]
+            subscription_id = txn[3]
 
             cursor.execute(
                 "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
                 (request.razorpay_order_id,)
             )
 
-            if credits_to_grant is not None and credits_to_grant > 0:
-                cursor.execute(
-                    "UPDATE UserInfo SET interviews_remaining = COALESCE(interviews_remaining, 0) + %s WHERE user_id = %s",
-                    (credits_to_grant, current_user["user_id"])
-                )
+            result_kind = _apply_completed_transaction(cursor, current_user["user_id"], credits_to_grant, subscription_id)
 
             connection.commit()
             logger.info(
-                "Payment verified & credited: user=%s, credits=%s, order=%s",
-                current_user["user_id"], credits_to_grant, request.razorpay_order_id
+                "Payment verified: user=%s, subscription=%s, order=%s",
+                current_user["user_id"], subscription_id, request.razorpay_order_id
             )
 
             return {
                 "success": True,
-                "message": f"{credits_to_grant} credits added successfully!",
-                "credits": credits_to_grant,
+                "message": "Membership activated successfully!" if subscription_id else "Purchase completed successfully!",
+                "interviews": credits_to_grant,
+                "kind": result_kind,
             }
 
         except HTTPException:
@@ -549,27 +660,24 @@ async def stripe_webhook(request: Request):
                 try:
                     conn.autocommit = False
                     cursor.execute(
-                        "SELECT status, credits_purchased, user_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
+                        "SELECT status, credits_purchased, user_id, subscription_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
                         (transaction_id,)
                     )
                     txn = cursor.fetchone()
                     if txn and txn[0] == 'pending':
                         credits_to_grant = txn[1]
                         user_id = txn[2]
+                        subscription_id = txn[3]
 
                         cursor.execute(
                             "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
                             (transaction_id,)
                         )
 
-                        if credits_to_grant is not None and credits_to_grant > 0:
-                            cursor.execute(
-                                "UPDATE UserInfo SET interviews_remaining = COALESCE(interviews_remaining, 0) + %s WHERE user_id = %s",
-                                (credits_to_grant, user_id)
-                            )
+                        result_kind = _apply_completed_transaction(cursor, user_id, credits_to_grant, subscription_id)
 
                         conn.commit()
-                        logger.info("Stripe webhook credited: user=%s, credits=%s, txn=%s", user_id, credits_to_grant, transaction_id)
+                        logger.info("Stripe webhook completed: user=%s, kind=%s, txn=%s", user_id, result_kind, transaction_id)
                     else:
                         conn.rollback()
                 except Exception:
@@ -630,27 +738,24 @@ async def razorpay_webhook(request: Request):
                 try:
                     conn.autocommit = False
                     cursor.execute(
-                        "SELECT status, credits_purchased, user_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
+                        "SELECT status, credits_purchased, user_id, subscription_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
                         (order_id,)
                     )
                     txn = cursor.fetchone()
                     if txn and txn[0] == 'pending':
                         credits_to_grant = txn[1]
                         user_id = txn[2]
+                        subscription_id = txn[3]
 
                         cursor.execute(
                             "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
                             (order_id,)
                         )
 
-                        if credits_to_grant is not None and credits_to_grant > 0:
-                            cursor.execute(
-                                "UPDATE UserInfo SET interviews_remaining = COALESCE(interviews_remaining, 0) + %s WHERE user_id = %s",
-                                (credits_to_grant, user_id)
-                            )
+                        result_kind = _apply_completed_transaction(cursor, user_id, credits_to_grant, subscription_id)
 
                         conn.commit()
-                        logger.info("Razorpay webhook credited: user=%s, credits=%s, order=%s", user_id, credits_to_grant, order_id)
+                        logger.info("Razorpay webhook completed: user=%s, kind=%s, order=%s", user_id, result_kind, order_id)
                     else:
                         conn.rollback()
                 except Exception:

@@ -16,14 +16,14 @@ const modes = [
   },
   {
     icon: Target,
-    title: "Practice Mode",
+    title: "Exercise Modes",
     description:
-      "Proceed question-by-question with immediate, targeted feedback. Ideal for refining specific communication skills in a low-pressure environment.",
+      "Use focused drills like Write it, Say it, Fix it, Chain it, Blind Start, and Best vs Worst to repair specific answer patterns.",
     features: [
-      "Immediate feedback following each response",
-      "Iterate and refine responses seamlessly",
-      "Focus on specific question categories",
-      "Build confidence at your own pace",
+      "Question-type answer builders",
+      "Weak-answer drill queue",
+      "Pattern-level fixes",
+      "Short reps between full mocks",
     ],
   },
 ]
@@ -68,7 +68,7 @@ export function ModesSection({ onGetStarted }: ModesSectionProps) {
           </div>
           <div className="flex flex-col">
             <span className="mb-4 text-sm font-medium uppercase tracking-[0.25em] text-muted-foreground">
-              Two Modes
+              Mock plus drills
             </span>
             <h2 className="font-serif text-3xl leading-[1.2] tracking-tight sm:text-4xl">
               <span className="text-shimmer">Tailored simulation modes.</span>
@@ -76,7 +76,7 @@ export function ModesSection({ onGetStarted }: ModesSectionProps) {
               <span className="text-shimmer-accent">Designed for optimal preparation.</span>
             </h2>
             <p className="mt-5 max-w-md text-base leading-relaxed text-muted-foreground">
-              Whether you require a complete, pressurized interview simulation or focused, step-by-step practice, our platform provides the tools necessary to confidently approach your next professional opportunity.
+              Use one full mock interview for realistic pressure, then repair weak answers with focused dashboard exercises.
             </p>
             <div className="mt-8">
               <Button

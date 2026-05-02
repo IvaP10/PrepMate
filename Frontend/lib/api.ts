@@ -351,7 +351,85 @@ export async function fetchRecentActivity(days: number = 30) {
   }
 }
 
-export async function startInterviewSession(mode: 'practice' | 'mock', type: string, jobId?: number) {
+export interface JobProfile {
+  profile_id: number
+  role: string
+  company: string | null
+  tech_stack: string[]
+  is_selected: boolean
+  created_at: string
+}
+
+export async function fetchJobProfiles(): Promise<JobProfile[]> {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.DASHBOARD.JOB_PROFILES}`,
+      {
+        method: 'GET',
+        headers: {
+          ...getAuthHeaders(),
+        },
+      }
+    )
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'GET_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to retrieve job profiles',
+    } as ApiError
+  }
+}
+
+export async function createJobProfile(payload: {
+  role: string
+  company?: string
+  tech_stack: string[]
+}): Promise<JobProfile> {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.DASHBOARD.JOB_PROFILES}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify(payload),
+      }
+    )
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'CREATE_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to create job profile',
+    } as ApiError
+  }
+}
+
+export async function selectJobProfile(profileId: number): Promise<JobProfile> {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.DASHBOARD.JOB_PROFILES}/${profileId}/select`,
+      {
+        method: 'POST',
+        headers: {
+          ...getAuthHeaders(),
+        },
+      }
+    )
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'SELECT_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to select job profile',
+    } as ApiError
+  }
+}
+
+export async function startInterviewSession(mode: 'practice' | 'mock', type: string, jobProfileId?: number, jobId?: number) {
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.START}`,
@@ -364,6 +442,7 @@ export async function startInterviewSession(mode: 'practice' | 'mock', type: str
         body: JSON.stringify({
           interview_mode: mode,
           interview_type: type,
+          job_profile_id: jobProfileId || null,
           job_id: jobId || null
         }),
       }
@@ -607,3 +686,234 @@ export async function verifyRazorpayPayment(orderId: string, paymentId: string, 
     } as ApiError
   }
 }
+
+export async function changePassword(currentPassword: string, newPassword: string) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.AUTH.CHANGE_PASSWORD}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to change password')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'CHANGE_PASSWORD_FAILED',
+      message: error instanceof Error ? error.message : 'Failed to change password',
+    } as ApiError
+  }
+}
+
+export async function deleteAccount(password?: string) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.AUTH.DELETE_ACCOUNT}`,
+      {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ password: password || null }),
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to delete account')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'DELETE_ACCOUNT_FAILED',
+      message: error instanceof Error ? error.message : 'Failed to delete account',
+    } as ApiError
+  }
+}
+
+export async function updateAccountInfo(fullName?: string, email?: string) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.UPDATE_ACCOUNT}`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ full_name: fullName || null, email: email || null }),
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to update account')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'UPDATE_ACCOUNT_FAILED',
+      message: error instanceof Error ? error.message : 'Failed to update account info',
+    } as ApiError
+  }
+}
+
+export async function uploadAvatar(base64Data: string) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.AVATAR}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify({ avatar_data: base64Data }),
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to upload avatar')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'AVATAR_UPLOAD_FAILED',
+      message: error instanceof Error ? error.message : 'Failed to upload avatar',
+    } as ApiError
+  }
+}
+
+export async function exportUserData() {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.EXPORT_DATA}`,
+      {
+        method: 'GET',
+        headers: {
+          ...getAuthHeaders(),
+        },
+      }
+    )
+
+    if (!response.ok) {
+      throw new Error('Failed to export data')
+    }
+
+    const data = await response.json()
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `interai-data-export-${new Date().toISOString().split('T')[0]}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+
+    return data
+  } catch (error) {
+    throw {
+      code: 'EXPORT_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to export data',
+    } as ApiError
+  }
+}
+
+export async function deleteSessionHistory() {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.DELETE_SESSION_HISTORY}`,
+      {
+        method: 'DELETE',
+        headers: {
+          ...getAuthHeaders(),
+        },
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to delete session history')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'DELETE_HISTORY_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to delete session history',
+    } as ApiError
+  }
+}
+
+export interface NotificationPrefs {
+  inactive_reminder_days: number | null
+  target_date: string | null
+  weekly_summary: boolean
+  streak_reminder: boolean
+}
+
+export async function getNotificationPrefs(): Promise<NotificationPrefs> {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.NOTIFICATION_PREFS}`,
+      {
+        method: 'GET',
+        headers: {
+          ...getAuthHeaders(),
+        },
+      }
+    )
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'GET_PREFS_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load notification preferences',
+    } as ApiError
+  }
+}
+
+export async function updateNotificationPrefs(prefs: NotificationPrefs) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.NOTIFICATION_PREFS}`,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeaders(),
+        },
+        body: JSON.stringify(prefs),
+      }
+    )
+
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || 'Failed to save notification preferences')
+    }
+
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'UPDATE_PREFS_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to save notification preferences',
+    } as ApiError
+  }
+}
+

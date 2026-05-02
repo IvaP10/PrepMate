@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 import re
 import logging
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
@@ -22,6 +23,45 @@ class JobResponse(BaseModel):
     location: Optional[str]
     salary_range: Optional[str]
     experience_level: Optional[str]
+    created_at: datetime
+
+
+class JobProfileCreate(BaseModel):
+    role: str = Field(min_length=2, max_length=255)
+    company: Optional[str] = Field(default=None, max_length=255)
+    tech_stack: List[str] = Field(default_factory=list)
+
+    @field_validator("role", "company")
+    @classmethod
+    def normalize_profile_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @field_validator("tech_stack")
+    @classmethod
+    def normalize_tech_stack(cls, value: List[str]) -> List[str]:
+        tags: List[str] = []
+        seen = set()
+        for item in value or []:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            tags.append(text[:40])
+        return tags[:12]
+
+
+class JobProfileResponse(BaseModel):
+    profile_id: int
+    role: str
+    company: Optional[str]
+    tech_stack: List[str]
+    is_selected: bool
     created_at: datetime
 
 
@@ -109,6 +149,87 @@ def _json_value(value: Any, fallback: Any) -> Any:
 
 def _text_tokens(value: str) -> List[str]:
     return re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{1,}", value.lower())
+
+
+METRIC_RE = re.compile(
+    r"(?i)(?:\b\d+(?:\.\d+)?\s?(?:%|x|k|m|ms|s|sec|secs|seconds|mins|minutes|hrs|hours|days|users|customers|requests|qps|rps|rows|records|tickets|bugs|issues|projects|models|apis|endpoints|features|revenue|cost|latency|uptime|accuracy|precision|recall)\b|(?:₹|\$)\s?\d+(?:[,.]\d+)*)"
+)
+
+
+def _contains_metric(value: str) -> bool:
+    return bool(METRIC_RE.search(value or ""))
+
+
+def _question_family(question_type: str, question: str) -> str:
+    text = f"{question_type or ''} {question or ''}".lower()
+    if any(token in text for token in ["tell me about yourself", "introduce yourself", "background"]):
+        return "Tell me about yourself"
+    if any(token in text for token in ["why this role", "why do you want", "why should", "company", "role"]):
+        return "Why this role"
+    if any(token in text for token in ["project", "built", "implemented", "portfolio"]):
+        return "Explain your project"
+    return "Technical deep-dive"
+
+
+def _drill_steps_for(question_type: str, question: str, topic: str, anchor: str) -> List[Dict[str, str]]:
+    family = _question_family(question_type, question)
+    topic_text = topic or "this topic"
+    if family == "Explain your project":
+        return [
+            {"title": "Outcome first", "instruction": f"Open with what {anchor} achieved and why it mattered."},
+            {"title": "Your ownership", "instruction": "State the exact part you designed, built, fixed, or measured."},
+            {"title": "Technical choice", "instruction": f"Name the stack or design decision that mattered most for {topic_text}."},
+            {"title": "Trade-off", "instruction": "Explain one constraint, alternative, or failure mode you considered."},
+            {"title": "Result", "instruction": "Close with a number, user impact, latency gain, accuracy change, or shipped outcome."},
+        ]
+    if family == "Why this role":
+        return [
+            {"title": "Role hook", "instruction": f"Name the specific part of the role that matches your work in {topic_text}."},
+            {"title": "Evidence", "instruction": f"Use {anchor} or one prior project as proof that you have done similar work."},
+            {"title": "Company fit", "instruction": "Connect one company need, product area, or user problem to your skills."},
+            {"title": "Contribution", "instruction": "Say what you can improve or own in the first few months."},
+            {"title": "Close", "instruction": "End with a concise reason the role is a logical next step, not a generic preference."},
+        ]
+    if family == "Tell me about yourself":
+        return [
+            {"title": "Present identity", "instruction": f"Start with who you are professionally and your focus in {topic_text}."},
+            {"title": "Proof story", "instruction": f"Use {anchor} as the concrete example that proves the claim."},
+            {"title": "Skill bridge", "instruction": "Name two skills or decisions from that story that map to the interview role."},
+            {"title": "Result", "instruction": "Include one measurable outcome or visible deliverable."},
+            {"title": "Forward link", "instruction": "Close by connecting your background to the role you are interviewing for."},
+        ]
+    return [
+        {"title": "Direct answer", "instruction": f"Answer the {topic_text} question in one sentence before explaining."},
+        {"title": "Mechanism", "instruction": "Describe the components, data flow, algorithm, or API boundary involved."},
+        {"title": "Trade-off", "instruction": "Compare the chosen approach with one alternative and say why yours fit."},
+        {"title": "Failure case", "instruction": "Mention one edge case, bottleneck, or debugging signal."},
+        {"title": "Proof", "instruction": "End with evidence: a metric, test result, production behavior, or project outcome."},
+    ]
+
+
+def _strong_answer_for(response: Dict[str, Any], anchor: str) -> str:
+    family = _question_family(response.get("question_type") or "", response.get("question") or "")
+    topic = response.get("topic") or "the topic"
+    if family == "Explain your project":
+        return (
+            f"In {anchor}, I owned the part related to {topic}. The key decision was to explain the problem, "
+            "the stack I used, the constraint I hit, and the measurable result. A strong version would name the "
+            "technical choice, the trade-off, and the outcome in one tight story."
+        )
+    if family == "Why this role":
+        return (
+            f"I would connect this role to my past work in {topic}, then prove the match with {anchor}. "
+            "A strong answer names the exact role requirement, one concrete example from my work, and the impact I can create next."
+        )
+    if family == "Tell me about yourself":
+        return (
+            f"I am a candidate focused on {topic}, with proof from {anchor}. A strong answer gives the current focus, "
+            "one relevant project or experience, a measurable outcome, and a direct bridge to this role."
+        )
+    return (
+        f"The direct answer is the first sentence. Then I would explain how {topic} works, the main trade-off, "
+        f"one edge case, and proof from {anchor} or a measurable result."
+    )
 
 
 def _profile_list(items: Any) -> List[Dict[str, Any]]:
@@ -265,7 +386,7 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
                ir.score, ir.response_time_seconds, ir.technical_accuracy,
                ir.communication, ir.problem_solving, ir.confidence, ir.relevance,
                ir.answer_quality_flags, ir.evidence_quotes, ir.ai_feedback,
-               ir.user_response
+               ir.user_response, ir.interview_id, ir.created_at
         FROM InterviewResponses ir
         JOIN InterviewQuestions iq ON ir.question_id = iq.question_id
         JOIN Interviews i ON ir.interview_id = i.interview_id
@@ -293,6 +414,8 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
             "evidence_quotes": row[12] or [],
             "feedback": row[13] or "",
             "response": row[14] or "",
+            "interview_id": row[15],
+            "created_at": row[16],
         })
     return items
 
@@ -345,6 +468,8 @@ def _build_coaching_snapshot(profile_context: Dict[str, Any], interviews: List[D
     profile_keywords = _profile_keywords(profile_context)
     aligned_answers = 0
     low_score_examples: List[Dict[str, Any]] = []
+    scored_responses: List[Dict[str, Any]] = []
+    quantified_answers = 0
 
     for response in responses:
         score = response.get("score")
@@ -354,6 +479,7 @@ def _build_coaching_snapshot(profile_context: Dict[str, Any], interviews: List[D
                 question_type_scores["followup"].append(score)
             else:
                 question_type_scores["main"].append(score)
+            scored_responses.append(response)
 
         if response.get("response_time") is not None:
             response_times.append(response["response_time"])
@@ -379,6 +505,8 @@ def _build_coaching_snapshot(profile_context: Dict[str, Any], interviews: List[D
             evidence_supported_answers += 1
 
         response_text = str(response.get("response") or "").lower()
+        if _contains_metric(response_text):
+            quantified_answers += 1
         if profile_keywords and any(keyword in response_text for keyword in profile_keywords):
             aligned_answers += 1
 
@@ -536,6 +664,113 @@ def _build_coaching_snapshot(profile_context: Dict[str, Any], interviews: List[D
         for item in sorted(low_score_examples, key=lambda row: row["score"])[:4]
     ]
 
+    worst_responses = sorted(
+        [item for item in scored_responses if item.get("question") and item.get("response")],
+        key=lambda row: float(row.get("score") or 0),
+    )
+    weakest_answer = worst_responses[0] if worst_responses else None
+
+    today_drill = None
+    if weakest_answer:
+        today_drill = {
+            "question": weakest_answer.get("question"),
+            "question_type": _question_family(weakest_answer.get("question_type") or "", weakest_answer.get("question") or ""),
+            "topic": weakest_answer.get("topic") or "General",
+            "score": round(float(weakest_answer.get("score") or 0), 1),
+            "user_answer": weakest_answer.get("response") or "",
+            "steps": _drill_steps_for(
+                weakest_answer.get("question_type") or "",
+                weakest_answer.get("question") or "",
+                weakest_answer.get("topic") or "General",
+                anchor,
+            ),
+        }
+
+    answer_comparisons = [
+        {
+            "question": item.get("question"),
+            "topic": item.get("topic") or "General",
+            "score": round(float(item.get("score") or 0), 1),
+            "their_answer": item.get("response") or "",
+            "strong_answer": _strong_answer_for(item, anchor),
+        }
+        for item in worst_responses[:3]
+    ]
+
+    now = datetime.utcnow()
+    best_answer_candidates = [
+        item for item in scored_responses
+        if item.get("response") and item.get("created_at")
+        and (now - item["created_at"]).days <= 7
+    ] or [item for item in scored_responses if item.get("response")]
+    best_answer = None
+    if best_answer_candidates:
+        item = max(best_answer_candidates, key=lambda row: float(row.get("score") or 0))
+        best_answer = {
+            "question": item.get("question"),
+            "topic": item.get("topic") or "General",
+            "score": round(float(item.get("score") or 0), 1),
+            "answer": item.get("response") or "",
+            "date": item.get("created_at").isoformat() if item.get("created_at") else None,
+        }
+
+    pattern_diagnoses: List[Dict[str, str]] = []
+    if quantified_answers == 0 and total_questions:
+        pattern_diagnoses.append({
+            "title": "You never give a number",
+            "diagnosis": f"Across {total_questions} answers you used a specific metric 0 times.",
+            "fix": "Add one measurable result, scale marker, latency change, accuracy change, or usage number to each proof story.",
+        })
+    elif total_questions and quantified_answers / total_questions < 0.35:
+        pattern_diagnoses.append({
+            "title": "Numbers are too rare",
+            "diagnosis": f"Only {quantified_answers} of {total_questions} answers contained a concrete metric or result.",
+            "fix": "Prepare three reusable metrics from your projects before the next mock.",
+        })
+
+    if quality_counter.get("off_topic", 0):
+        pattern_diagnoses.append({
+            "title": "You bury your point",
+            "diagnosis": f"{quality_counter.get('off_topic', 0)} answers made the interviewer search for the direct answer.",
+            "fix": "Make the first sentence the answer, then add context only after the point is clear.",
+        })
+    if quality_counter.get("no_evidence", 0):
+        pattern_diagnoses.append({
+            "title": "Your claims float",
+            "diagnosis": f"{quality_counter.get('no_evidence', 0)} answers made claims without a project, repo, internship, or result attached.",
+            "fix": f"Anchor claims to {anchor} or another named proof point before moving on.",
+        })
+    if followup_gap < -8 and question_type_scores["followup"]:
+        pattern_diagnoses.append({
+            "title": "Depth drops on follow-ups",
+            "diagnosis": f"You scored {main_avg:.1f} on main questions but {followup_avg:.1f} on follow-ups.",
+            "fix": "After the first answer, prepare one trade-off, one edge case, and one failure mode for the follow-up.",
+        })
+    if not pattern_diagnoses:
+        pattern_diagnoses.append({
+            "title": "Your next gains are structural",
+            "diagnosis": f"Across {total_questions} answers, the fastest improvement is consistency rather than more content.",
+            "fix": "Use the same structure every time: direct answer, proof, trade-off, result.",
+        })
+    pattern_diagnoses = pattern_diagnoses[:4]
+
+    weak_question_drill_queue = [
+        {
+            "question": item.get("question"),
+            "topic": item.get("topic") or "General",
+            "score": round(float(item.get("score") or 0), 1),
+            "question_type": _question_family(item.get("question_type") or "", item.get("question") or ""),
+            "interview_id": item.get("interview_id"),
+            "steps": _drill_steps_for(
+                item.get("question_type") or "",
+                item.get("question") or "",
+                item.get("topic") or "General",
+                anchor,
+            ),
+        }
+        for item in worst_responses[:3]
+    ]
+
     practice_priorities = [
         {
             "title": primary_focus["title"],
@@ -587,6 +822,15 @@ def _build_coaching_snapshot(profile_context: Dict[str, Any], interviews: List[D
         "pillar_scores": pillar_scores,
         "primary_focus": primary_focus,
         "student_summary": student_summary,
+        "today_drill": today_drill,
+        "answer_comparisons": answer_comparisons,
+        "pattern_diagnoses": pattern_diagnoses,
+        "weak_question_drill_queue": weak_question_drill_queue,
+        "best_answer_of_week": best_answer,
+        "quantification": {
+            "answers_with_metrics": quantified_answers,
+            "total_answers": total_questions,
+        },
         "followup_performance": {
             "main_avg": main_avg,
             "followup_avg": followup_avg,
@@ -660,7 +904,155 @@ async def get_dashboard_stats(
             "coaching_metrics": coaching["coaching_metrics"],
             "primary_focus": coaching["primary_focus"],
             "student_summary": coaching["student_summary"],
+            "today_drill": coaching["today_drill"],
+            "what_to_fix": coaching["pattern_diagnoses"][:2],
+            "quantification": coaching["quantification"],
         }
+
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+def _job_profile_from_row(row: Any) -> Dict[str, Any]:
+    tech_stack = row[3] or []
+    if isinstance(tech_stack, str):
+        try:
+            tech_stack = json.loads(tech_stack)
+        except Exception:
+            tech_stack = []
+    return {
+        "profile_id": row[0],
+        "role": row[1],
+        "company": row[2],
+        "tech_stack": tech_stack if isinstance(tech_stack, list) else [],
+        "is_selected": bool(row[4]),
+        "created_at": row[5],
+    }
+
+
+@router.get("/job-profiles", response_model=List[JobProfileResponse])
+async def get_job_profiles(
+    current_user: Dict = Depends(get_current_user)
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute(
+            """
+            SELECT profile_id, role, company, tech_stack, is_selected, created_at
+            FROM JobProfiles
+            WHERE user_id = %s
+            ORDER BY is_selected DESC, created_at DESC
+            """,
+            (current_user["user_id"],)
+        )
+        return [_job_profile_from_row(row) for row in cursor.fetchall()]
+
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+@router.post("/job-profiles", response_model=JobProfileResponse)
+async def create_job_profile(
+    request: JobProfileCreate,
+    current_user: Dict = Depends(get_current_user)
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM JobProfiles WHERE user_id = %s",
+            (current_user["user_id"],)
+        )
+        is_first = (cursor.fetchone()[0] or 0) == 0
+
+        if is_first:
+            cursor.execute(
+                "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s",
+                (current_user["user_id"],)
+            )
+
+        cursor.execute(
+            """
+            INSERT INTO JobProfiles (user_id, role, company, tech_stack, is_selected)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING profile_id, role, company, tech_stack, is_selected, created_at
+            """,
+            (
+                current_user["user_id"],
+                request.role,
+                request.company,
+                json.dumps(request.tech_stack),
+                is_first,
+            )
+        )
+        row = cursor.fetchone()
+        connection.commit()
+        return _job_profile_from_row(row)
+
+    except Exception:
+        connection.rollback()
+        logger.exception("Failed to create job profile")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create job profile"
+        )
+
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+@router.post("/job-profiles/{profile_id}/select", response_model=JobProfileResponse)
+async def select_job_profile(
+    profile_id: int,
+    current_user: Dict = Depends(get_current_user)
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+
+    try:
+        cursor.execute(
+            "SELECT 1 FROM JobProfiles WHERE profile_id = %s AND user_id = %s",
+            (profile_id, current_user["user_id"])
+        )
+        if not cursor.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job profile not found"
+            )
+
+        cursor.execute(
+            "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s",
+            (current_user["user_id"],)
+        )
+        cursor.execute(
+            """
+            UPDATE JobProfiles
+            SET is_selected = TRUE, updated_at = NOW()
+            WHERE profile_id = %s AND user_id = %s
+            RETURNING profile_id, role, company, tech_stack, is_selected, created_at
+            """,
+            (profile_id, current_user["user_id"])
+        )
+        row = cursor.fetchone()
+        connection.commit()
+        return _job_profile_from_row(row)
+
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        logger.exception("Failed to select job profile")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to select job profile"
+        )
 
     finally:
         cursor.close()

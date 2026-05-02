@@ -8,6 +8,8 @@ export interface AuthUser {
     name: string
     interviews_remaining: number
     is_admin?: boolean
+    avatar_url?: string
+    auth_provider?: string
 }
 
 export interface AuthResult {
