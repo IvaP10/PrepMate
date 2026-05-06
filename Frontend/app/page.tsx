@@ -49,7 +49,6 @@ export default function Home() {
       setCurrentView("auth")
       window.history.replaceState({}, "", window.location.pathname)
     }
-    // Read ?tab= param for deep-linking into dashboard sections
     const tab = params.get("tab")
     if (tab) {
       setInitialTab(tab)

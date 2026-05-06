@@ -22,12 +22,14 @@ from dashboard import router as dashboard_router
 from payment import router as payment_router
 from interview import router as interview_router
 from pre_interview import router as pre_interview_router
+from technical_mode import router as technical_router
 from websocket_manager import ConnectionManager
 from background_tasks import check_expired_subscriptions
+from observability import init_observability
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("interai")
 
@@ -36,6 +38,7 @@ _background_tasks = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
+    init_observability()
     init_connection_pool()
     ensure_runtime_schema()
     init_redis_client()
@@ -87,7 +90,7 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS.split(","),
+    allow_origins=[origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",") if origin.strip()],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
@@ -95,7 +98,7 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"Unhandled exception: {exc}")
+    logger.error("Unhandled request failure")
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An unexpected error occurred"}
@@ -107,6 +110,7 @@ app.include_router(dashboard_router, prefix="/api/dashboard")
 app.include_router(payment_router, prefix="/api/payment")
 app.include_router(interview_router, prefix="/api/interview")
 app.include_router(pre_interview_router)
+app.include_router(technical_router)
 
 @app.get("/health")
 async def health():
@@ -138,8 +142,29 @@ async def health():
         "checks": {
             "database": db_healthy,
             "redis": redis_healthy,
-            "websocket_connections": ws_manager.get_active_users_count()
+            "websocket_connections": len(ws_manager.active_connections),
+            "llm_primary": bool(settings.GEMINI_API_KEY),
+            "stt": bool(settings.GROQ_API_KEY),
+            "payments": bool(settings.RAZORPAY_KEY_ID and settings.RAZORPAY_KEY_SECRET),
         }
+    }
+
+
+@app.get("/api/status")
+async def public_status():
+    health_payload = await health()
+    return {
+        "service": "InterAI",
+        "status": health_payload["status"],
+        "updated_at": health_payload["time"],
+        "components": {
+            "api": "operational",
+            "database": "operational" if health_payload["checks"]["database"] else "degraded",
+            "redis": "operational" if health_payload["checks"]["redis"] else "degraded",
+            "llm_router": "operational" if health_payload["checks"]["llm_primary"] else "degraded",
+            "voice": "operational" if health_payload["checks"]["stt"] else "degraded",
+            "payments": "operational" if health_payload["checks"]["payments"] else "degraded",
+        },
     }
 
 @app.get("/")

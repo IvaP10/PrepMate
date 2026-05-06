@@ -7,6 +7,7 @@ import logging
 
 from auth import get_current_user
 from database import get_db_connection, return_db_connection
+from security_utils import stable_hash
 
 router = APIRouter(tags=["Profile"])
 logger = logging.getLogger("ai_interviewer.profile")
@@ -124,7 +125,7 @@ async def update_profile(
         )
 
         connection.commit()
-        logger.info("Profile updated for user: %s", current_user["user_id"])
+        logger.info("Profile updated for %s", stable_hash(current_user["user_id"], "user"))
 
         return {
             "message": "Profile updated successfully",
@@ -133,7 +134,7 @@ async def update_profile(
 
     except Exception:
         connection.rollback()
-        logger.exception("Failed to update profile")
+        logger.error("Failed to update profile")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update profile"
@@ -164,13 +165,13 @@ async def delete_resume(
         )
 
         connection.commit()
-        logger.info("Resume deleted for user: %s", current_user["user_id"])
+        logger.info("Resume deleted for %s", stable_hash(current_user["user_id"], "user"))
 
         return {"message": "Resume deleted successfully"}
 
     except Exception:
         connection.rollback()
-        logger.exception("Failed to delete resume")
+        logger.error("Failed to delete resume")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete resume"
@@ -379,7 +380,7 @@ async def update_account(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to update account")
+        logger.error("Failed to update account")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update account"
@@ -416,7 +417,7 @@ async def upload_avatar(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to upload avatar")
+        logger.error("Failed to upload avatar")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to upload avatar"
@@ -523,7 +524,7 @@ async def export_data(
 
         return export
     except Exception:
-        logger.exception("Failed to export data")
+        logger.error("Failed to export data")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to export data"
@@ -559,7 +560,7 @@ async def delete_session_history(
         return {"message": "All session history deleted"}
     except Exception:
         connection.rollback()
-        logger.exception("Failed to delete session history")
+        logger.error("Failed to delete session history")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete session history"
@@ -614,7 +615,7 @@ async def update_notification_prefs(
         return {"message": "Notification preferences saved"}
     except Exception:
         connection.rollback()
-        logger.exception("Failed to update notification prefs")
+        logger.error("Failed to update notification prefs")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update notification preferences"

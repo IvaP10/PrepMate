@@ -41,7 +41,6 @@ export function ResumeProvider({
   const [error, setError] = useState<string | null>(null)
   const [justParsed, setJustParsed] = useState(false)
 
-  // Auto-load saved resume from backend when user is authenticated
   useEffect(() => {
     if (!userId) return
     let cancelled = false
@@ -53,7 +52,6 @@ export function ResumeProvider({
           setResumeData(saved)
         }
       } catch {
-        // No resume saved yet — that's fine, don't show an error
       }
     }
 

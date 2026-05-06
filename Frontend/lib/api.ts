@@ -622,7 +622,7 @@ export async function fetchPaymentTransactions(limit: number = 20) {
   }
 }
 
-export async function createPaymentSession(planType: string, provider: string = 'stripe', paymentMethod: string = 'card', sessions?: number) {
+export async function createPaymentSession(planType: string, provider: string = 'razorpay', paymentMethod: string = 'card', sessions?: number) {
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.CREATE_SUBSCRIPTION}`,
@@ -916,4 +916,3 @@ export async function updateNotificationPrefs(prefs: NotificationPrefs) {
     } as ApiError
   }
 }
-

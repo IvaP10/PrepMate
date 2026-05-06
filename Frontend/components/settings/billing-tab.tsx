@@ -7,6 +7,23 @@ import { toast } from "sonner"
 import { fetchPaymentTransactions } from "@/lib/api"
 import type { AuthUser } from "@/lib/auth"
 
+const html = (value: unknown) =>
+  String(value ?? "—").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!))
+
+const invoiceMarkup = (txn: any) => {
+  const date = txn.created_at ? new Date(txn.created_at).toLocaleDateString() : "—"
+  const amount = `${txn.currency === "INR" ? "₹" : "$"}${txn.amount ?? "—"}`
+  const rows = [
+    ["Date", date],
+    ["Amount", amount],
+    ["Plan", txn.plan_type || "Starter"],
+    ["Status", txn.status || "pending"],
+    ["Transaction ID", txn.transaction_id],
+  ]
+
+  return `<html><head><title>Invoice</title><style>body{font-family:system-ui;padding:40px;max-width:600px;margin:auto}h1{font-size:20px}table{width:100%;border-collapse:collapse;margin-top:24px}td,th{text-align:left;padding:8px 0;border-bottom:1px solid #eee;font-size:14px}</style></head><body><h1>InterAI Invoice</h1><table>${rows.map(([label, value]) => `<tr><th>${html(label)}</th><td>${html(value)}</td></tr>`).join("")}</table></body></html>`
+}
+
 export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null; onOpenMembership: () => void }) {
   const router = useRouter()
   const [transactions, setTransactions] = useState<any[]>([])
@@ -27,7 +44,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
 
   return (
     <div className="space-y-6">
-      {/* Current Plan */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Current Plan</h3>
         <p className="mb-4 text-xs text-muted-foreground">Manage your subscription and plan.</p>
@@ -46,7 +63,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
         </div>
       </div>
 
-      {/* Payment Method */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Payment Method</h3>
         <p className="mb-4 text-xs text-muted-foreground">Your saved payment details.</p>
@@ -63,7 +80,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
         </div>
       </div>
 
-      {/* Billing History */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <div className="mb-4 flex items-center gap-2">
           <Receipt className="h-4 w-4 text-muted-foreground" />
@@ -113,10 +130,10 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-right">
                       <Button variant="ghost" size="sm" className="gap-1.5 text-primary text-xs"
-                        onClick={() => {
-                          const w = window.open("", "_blank")
-                          if (!w) return
-                          w.document.write(`<html><head><title>Invoice</title><style>body{font-family:system-ui;padding:40px;max-width:600px;margin:auto}h1{font-size:20px}table{width:100%;border-collapse:collapse;margin-top:24px}td,th{text-align:left;padding:8px 0;border-bottom:1px solid #eee;font-size:14px}</style></head><body><h1>InterAI Invoice</h1><table><tr><th>Date</th><td>${txn.created_at ? new Date(txn.created_at).toLocaleDateString() : "—"}</td></tr><tr><th>Amount</th><td>${txn.currency === "INR" ? "₹" : "$"}${txn.amount}</td></tr><tr><th>Plan</th><td>${txn.plan_type || "Starter"}</td></tr><tr><th>Status</th><td>${txn.status || "pending"}</td></tr><tr><th>Transaction ID</th><td>${txn.transaction_id || "—"}</td></tr></table></body></html>`)
+	                        onClick={() => {
+	                          const w = window.open("", "_blank")
+	                          if (!w) return
+	                          w.document.write(invoiceMarkup(txn))
                           w.document.close()
                           w.print()
                         }}>

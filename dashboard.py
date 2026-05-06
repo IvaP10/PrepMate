@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from auth import get_current_admin, get_current_user
 from database import get_db_connection, return_db_connection
+from security_utils import stable_hash
 
 router = APIRouter(tags=["Dashboard"])
 logger = logging.getLogger("ai_interviewer.dashboard")
@@ -914,6 +915,77 @@ async def get_dashboard_stats(
         return_db_connection(connection)
 
 
+@router.get("/coach/exercises")
+async def get_coach_exercises(
+    current_user: Dict = Depends(get_current_user),
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT exercise_id, interview_id, exercise_type, title, prompt,
+                   project_anchor, weakness_key, status, created_at, completed_at
+            FROM CoachExercises
+            WHERE user_id = %s
+            ORDER BY
+                CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+                created_at DESC
+            LIMIT 20
+            """,
+            (current_user["user_id"],)
+        )
+        return {
+            "exercises": [
+                {
+                    "exercise_id": row[0],
+                    "interview_id": row[1],
+                    "exercise_type": row[2],
+                    "title": row[3],
+                    "prompt": row[4],
+                    "project_anchor": row[5],
+                    "weakness_key": row[6],
+                    "status": row[7],
+                    "created_at": row[8].isoformat() if row[8] else None,
+                    "completed_at": row[9].isoformat() if row[9] else None,
+                }
+                for row in cursor.fetchall()
+            ]
+        }
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+@router.patch("/coach/exercises/{exercise_id}/complete")
+async def complete_coach_exercise(
+    exercise_id: str,
+    current_user: Dict = Depends(get_current_user),
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            UPDATE CoachExercises
+            SET status = 'completed', completed_at = NOW()
+            WHERE exercise_id = %s AND user_id = %s
+            RETURNING exercise_id
+            """,
+            (exercise_id, current_user["user_id"])
+        )
+        if not cursor.fetchone():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exercise not found")
+        connection.commit()
+        return {"success": True}
+    except HTTPException:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
 def _job_profile_from_row(row: Any) -> Dict[str, Any]:
     tech_stack = row[3] or []
     if isinstance(tech_stack, str):
@@ -996,7 +1068,7 @@ async def create_job_profile(
 
     except Exception:
         connection.rollback()
-        logger.exception("Failed to create job profile")
+        logger.error("Failed to create job profile")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create job profile"
@@ -1048,7 +1120,7 @@ async def select_job_profile(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to select job profile")
+        logger.error("Failed to select job profile")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to select job profile"
@@ -1167,7 +1239,7 @@ async def select_job(
         )
 
         connection.commit()
-        logger.info("User %s selected job %s", current_user["user_id"], job_id)
+        logger.info("User %s selected job %s", stable_hash(current_user["user_id"], "user"), stable_hash(job_id, "job"))
 
         return {
             "success": True,
@@ -1180,7 +1252,7 @@ async def select_job(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to select job")
+        logger.error("Failed to select job")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to select job"
@@ -1345,7 +1417,7 @@ async def create_support_submission(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to create support submission")
+        logger.error("Failed to create support submission")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to submit support request"
@@ -1469,7 +1541,7 @@ async def update_support_submission(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to update support submission")
+        logger.error("Failed to update support submission")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update support submission"

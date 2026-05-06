@@ -7,9 +7,11 @@ from collections import deque
 from datetime import datetime
 
 from config import settings
-from streaming_stt import create_stt
+from streaming_stt import GroqWhisperSTT
 from streaming_tts import create_tts
-from avatar_engine import create_avatar
+from avatar_engine import AudioOnlyAvatar
+from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
+from security_utils import redact_text
 
 logger = logging.getLogger("pipeline_orchestrator")
 
@@ -59,30 +61,23 @@ class StreamingPipeline:
     async def initialize(self) -> Dict:
         status = {"stt": False, "tts": False, "avatar": False}
 
-        self._stt = create_stt(
-            on_partial=self._handle_stt_partial,
-            on_final=self._handle_stt_final,
-        )
+        self._stt = GroqWhisperSTT(on_final=self._handle_stt_final)
         status["stt"] = await self._stt.connect()
 
         self._tts = create_tts(on_audio_chunk=self._handle_tts_audio)
         status["tts"] = await self._tts.connect()
 
-        self._avatar = create_avatar(
-            on_audio_chunk=self._handle_avatar_audio,
-        )
+        self._avatar = AudioOnlyAvatar()
         avatar_result = await self._avatar.create_session()
         status["avatar"] = avatar_result is not None
 
-        mode = "full"
-        if not status["avatar"]:
-            mode = "audio_only"
-        if not status["tts"]:
-            mode = "legacy"
-        if not status["stt"]:
-            mode = "legacy"
+        mode = (
+            "legacy" if not status["stt"] or not status["tts"]
+            else "audio_only" if not status["avatar"]
+            else "full"
+        )
 
-        logger.info(f"Pipeline initialized — mode: {mode}, status: {status}")
+        logger.info("Pipeline initialized: mode=%s status=%s", mode, status)
 
         self._state = PipelineState.IDLE
 
@@ -154,7 +149,7 @@ class StreamingPipeline:
         asyncio.create_task(self._run_llm_tts_pipeline(full_response))
 
     async def _handle_interruption(self):
-        logger.info("Interruption detected — flushing TTS and avatar buffers")
+        logger.info("Interruption detected - flushing TTS and avatar buffers")
         self._state = PipelineState.INTERRUPTED
 
         if self._speaking_task:
@@ -208,7 +203,8 @@ class StreamingPipeline:
             messages = [{"role": "system", "content": system_prompt}]
             for msg in self._conversation_history[-20:]:
                 role = "assistant" if msg.get("role") == "interviewer" else "user"
-                messages.append({"role": role, "content": msg["content"]})
+                content = msg["content"] if role == "assistant" else data_block("candidate_turn", msg["content"])
+                messages.append({"role": role, "content": content})
 
             token_buffer = []
             first_token = True
@@ -223,7 +219,7 @@ class StreamingPipeline:
                 if first_token and self._ttfb_start:
                     ttfb = (time() - self._ttfb_start) * 1000
                     self._ttfb_measurements.append(ttfb)
-                    logger.info(f"Pipeline TTFB (LLM first token): {ttfb:.0f}ms")
+                    logger.info("Pipeline TTFB: %.0fms", ttfb)
                     first_token = False
 
                 await self._send_ws({
@@ -263,11 +259,11 @@ class StreamingPipeline:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.exception(f"LLM-TTS pipeline error: {e}")
+            logger.error("LLM-TTS pipeline error: %s", redact_text(e))
             self._state = PipelineState.IDLE
             await self._send_ws({
                 "type": "error",
-                "message": "AI response generation failed — please try again",
+                "message": "AI response generation failed - please try again",
             })
 
     async def _run_parallel_evaluation(self, user_text: str, ai_response: str):
@@ -305,7 +301,7 @@ class StreamingPipeline:
                 })
 
         except Exception as e:
-            logger.error(f"Parallel evaluation failed: {e}")
+            logger.error("Parallel evaluation failed: %s", redact_text(e))
 
     def _build_system_prompt(self) -> str:
         persona_name = self._persona.get("name", "Dr. Aris")
@@ -344,7 +340,7 @@ class StreamingPipeline:
             f"{topic_context}"
             f"{mode_instructions}"
             f"\nKeep responses concise (2-4 sentences). Ask ONE clear follow-up question. "
-            f"Never break character. Never mention that you are an AI."
+            f"Never break character. Never mention that you are an AI. {SYSTEM_DATA_BOUNDARY}"
         )
 
     async def _handle_stt_partial(self, text: str, confidence: float):
@@ -385,10 +381,18 @@ class StreamingPipeline:
         if self._ttfb_measurements:
             avg_ttfb = sum(self._ttfb_measurements) / len(self._ttfb_measurements)
 
+        exchanges = 0
+        interruptions = 0
+        for message in self._conversation_history:
+            if message.get("role") == "candidate":
+                exchanges += 1
+            if message.get("interrupted"):
+                interruptions += 1
+
         return {
             "avg_ttfb_ms": round(avg_ttfb, 1),
-            "total_exchanges": len([m for m in self._conversation_history if m.get("role") == "candidate"]),
-            "interruptions": len([m for m in self._conversation_history if m.get("interrupted")]),
+            "total_exchanges": exchanges,
+            "interruptions": interruptions,
             "pipeline_state": self._state,
         }
 
@@ -405,4 +409,4 @@ class StreamingPipeline:
         if self._avatar:
             await self._avatar.close()
 
-        logger.info(f"Pipeline shutdown — metrics: {self.get_metrics()}")
+        logger.info("Pipeline shutdown: metrics=%s", self.get_metrics())

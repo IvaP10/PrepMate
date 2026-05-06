@@ -1,7 +1,28 @@
-/** @type {import('next').NextConfig} */
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const root = dirname(fileURLToPath(import.meta.url))
+
+
 const nextConfig = {
+  turbopack: {
+    root,
+  },
+  async headers() {
+    return [
+      {
+        source: '/(.*)',
+        headers: [
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+          { key: 'Permissions-Policy', value: 'camera=(self), microphone=(self), geolocation=()' },
+        ],
+      },
+    ]
+  },
   typescript: {
-    ignoreBuildErrors: true,
+    ignoreBuildErrors: false,
   },
   images: {
     unoptimized: true,

@@ -6,14 +6,14 @@ from config import settings
 logger = logging.getLogger("streaming_stt")
 
 
-class WhisperSTT:
+class GroqWhisperSTT:
 
     def __init__(self, on_final: Optional[Callable] = None):
         self._on_final = on_final
 
     @property
     def available(self) -> bool:
-        return bool(settings.OPENAI_API_KEY)
+        return bool(settings.GROQ_API_KEY)
 
     async def connect(self):
         return self.available
@@ -27,7 +27,3 @@ class WhisperSTT:
 
     async def close(self):
         pass
-
-
-def create_stt(on_partial=None, on_final=None):
-    return WhisperSTT(on_final=on_final)

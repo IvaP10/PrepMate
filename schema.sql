@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS UserInfo (
     profile_completed        BOOLEAN     NOT NULL DEFAULT FALSE,
     mock_interview_count     INTEGER     NOT NULL DEFAULT 0,
     practice_interview_count INTEGER     NOT NULL DEFAULT 0,
-    interviews_remaining     INTEGER     DEFAULT 1 CHECK (interviews_remaining >= 0),
+    interviews_remaining     INTEGER     DEFAULT 3 CHECK (interviews_remaining >= 0),
     is_unlimited             BOOLEAN     NOT NULL DEFAULT FALSE,
     is_admin                 BOOLEAN     NOT NULL DEFAULT FALSE,
     plan_type                VARCHAR(50) NOT NULL DEFAULT 'free',
@@ -128,6 +128,92 @@ CREATE TABLE IF NOT EXISTS InterviewResponses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ir_interview ON InterviewResponses (interview_id);
+
+CREATE TABLE IF NOT EXISTS AIEventLogs (
+    event_id       BIGSERIAL PRIMARY KEY,
+    user_id        VARCHAR(64),
+    interview_id   VARCHAR(64),
+    event_type     VARCHAR(80) NOT NULL,
+    provider       VARCHAR(40),
+    model          VARCHAR(120),
+    prompt_tokens  INTEGER,
+    output_tokens  INTEGER,
+    latency_ms     INTEGER,
+    success        BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_event_logs_created ON AIEventLogs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_event_logs_interview ON AIEventLogs (interview_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS CoachExercises (
+    exercise_id    VARCHAR(64) PRIMARY KEY,
+    user_id        VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    interview_id   VARCHAR(64) REFERENCES Interviews(interview_id) ON DELETE SET NULL,
+    exercise_type  VARCHAR(30) NOT NULL,
+    title          VARCHAR(255) NOT NULL,
+    prompt         TEXT NOT NULL,
+    project_anchor VARCHAR(255),
+    weakness_key   VARCHAR(80),
+    status         VARCHAR(20) NOT NULL DEFAULT 'pending',
+    completed_at   TIMESTAMP,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_coach_exercises_user_status ON CoachExercises (user_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS TechnicalInterviewRounds (
+    round_id       VARCHAR(64) PRIMARY KEY,
+    interview_id   VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+    user_id        VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    round_type     VARCHAR(30) NOT NULL,
+    language       VARCHAR(20),
+    prompt         TEXT NOT NULL,
+    starter_code   TEXT,
+    whiteboard_json JSONB,
+    status         VARCHAR(20) NOT NULL DEFAULT 'active',
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW(),
+    completed_at   TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_technical_rounds_interview ON TechnicalInterviewRounds (interview_id, round_type);
+
+CREATE TABLE IF NOT EXISTS TechnicalRunEvents (
+    run_id         VARCHAR(64) PRIMARY KEY,
+    round_id       VARCHAR(64) REFERENCES TechnicalInterviewRounds(round_id) ON DELETE CASCADE,
+    user_id        VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    language       VARCHAR(20) NOT NULL,
+    source_chars   INTEGER NOT NULL DEFAULT 0,
+    stdout         TEXT,
+    stderr         TEXT,
+    exit_code      INTEGER,
+    runtime_ms     INTEGER,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_technical_run_events_round ON TechnicalRunEvents (round_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS ClientBodyLanguageMetrics (
+    metric_id      BIGSERIAL PRIMARY KEY,
+    interview_id   VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+    user_id        VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    payload        JSONB NOT NULL,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_client_body_language_interview ON ClientBodyLanguageMetrics (interview_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS AntiCheatEvents (
+    event_id       BIGSERIAL PRIMARY KEY,
+    interview_id   VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+    user_id        VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+    event_type     VARCHAR(50) NOT NULL,
+    payload        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_anti_cheat_interview ON AntiCheatEvents (interview_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS Subscriptions (
     subscription_id VARCHAR(64)  PRIMARY KEY,

@@ -34,7 +34,7 @@ export function PrivacyTab() {
 
   return (
     <div className="space-y-6">
-      {/* Privacy Explanation */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <div className="mb-3 flex items-center gap-2">
           <Shield className="h-4 w-4 text-primary" />
@@ -48,7 +48,7 @@ export function PrivacyTab() {
         </p>
       </div>
 
-      {/* Download Data */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Download My Data</h3>
         <p className="mb-4 text-xs text-muted-foreground">
@@ -60,7 +60,7 @@ export function PrivacyTab() {
         </Button>
       </div>
 
-      {/* Delete Session History */}
+      
       <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-6">
         <h3 className="mb-1 text-sm font-semibold text-amber-600 dark:text-amber-400">Delete Session History</h3>
         <p className="mb-4 text-xs text-muted-foreground">

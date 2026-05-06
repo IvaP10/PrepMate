@@ -7,8 +7,7 @@ from typing import Dict
 class PricingConfig:
     CREDIT_PRICE_INR: Decimal = Decimal("199.00")
     PROCESSING_FEE_RAZORPAY: Decimal = Decimal("0.02")
-    PROCESSING_FEE_STRIPE: Decimal = Decimal("0.03")
-    FREE_CREDITS_ON_SIGNUP: int = 1
+    FREE_CREDITS_ON_SIGNUP: int = 3
     TRANSACTION_EXPIRY_MINUTES: int = 15
     SUBSCRIPTION_DURATION_DAYS: int = 30
     CURRENCY: str = "INR"
@@ -29,11 +28,9 @@ class PricingConfig:
         discount_rate = self.get_discount_percent(sessions)
         discount = base * discount_rate if discount_rate else Decimal("0")
         subtotal = base - discount
-        fee_rate = (
-            self.PROCESSING_FEE_RAZORPAY
-            if provider == "razorpay"
-            else self.PROCESSING_FEE_STRIPE
-        )
+        if provider != "razorpay":
+            raise ValueError("Only Razorpay pricing is supported")
+        fee_rate = self.PROCESSING_FEE_RAZORPAY
         fee = subtotal * fee_rate
         total = (subtotal + fee).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 

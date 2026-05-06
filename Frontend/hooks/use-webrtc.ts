@@ -110,8 +110,7 @@ export function useWebRTC(config: WebRTCConfig) {
         }
 
         return stream
-      } catch (err) {
-        console.error("Failed to get local media:", err)
+      } catch {
         return null
       }
     },

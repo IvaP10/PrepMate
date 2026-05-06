@@ -15,6 +15,7 @@ import { AnalyzingOverlay } from "@/components/interview/analyzing-overlay"
 import { useVAD } from "@/hooks/use-vad"
 import { useFaceCheck } from "@/hooks/use-face-check"
 import { useStreamingMetrics } from "@/hooks/use-streaming-metrics"
+import { API_CONFIG } from "@/lib/config"
 type SessionMode = "practice-ai" | "practice-voice" | "mock-ai" | "mock-voice"
 type InterviewState = "connecting" | "ready" | "active" | "ending" | "analyzing" | "complete"
 interface TranscriptMessage {
@@ -57,6 +58,7 @@ export default function InterviewRoom() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const aiTokenBufferRef = useRef("")
   const partialTranscriptRef = useRef("")
+  const lastFaceMetricSentRef = useRef(0)
   const getSupportedAudioMimeType = useCallback(() => {
     if (typeof MediaRecorder === "undefined") return ""
     const candidates = [
@@ -187,8 +189,20 @@ export default function InterviewRoom() {
         faceMetrics.engagementScore,
         faceMetrics.cameraContactLevel
       )
+      const now = Date.now()
+      if (
+        interviewState === "active" &&
+        wsRef.current?.readyState === WebSocket.OPEN &&
+        now - lastFaceMetricSentRef.current > 1200
+      ) {
+        lastFaceMetricSentRef.current = now
+        wsRef.current.send(JSON.stringify({
+          type: "body_language_metrics",
+          metrics: faceMetrics,
+        }))
+      }
     }
-  }, [faceMetrics, updateCameraContact])
+  }, [faceMetrics, interviewState, updateCameraContact])
   useEffect(() => {
     async function setupMedia() {
       try {
@@ -225,7 +239,6 @@ export default function InterviewRoom() {
             if (data.opening_audio) {
               playAudioBase64(data.opening_audio)
             }
-            // Practice mode: auto-start pipeline immediately (no manual "Begin" gate needed)
             if (mode.startsWith("practice")) {
               setTimeout(() => initPipeline(), 600)
             }
@@ -351,8 +364,8 @@ export default function InterviewRoom() {
             toast.error(data.message)
             break
         }
-      } catch (err) {
-        console.error("WS message parse error:", err)
+      } catch {
+        toast.error("Received an invalid interview message.")
       }
     },
     [mode, router, addTranscriptWords, resetSpeechTracking, updateEngagement, updateCameraContact, setDynamicTip]
@@ -361,8 +374,7 @@ export default function InterviewRoom() {
     let cancelled = false
 
     async function connectWebSocket() {
-      // Step 1: Fetch a one-time WS ticket via authenticated cookie-based request
-      const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api"
+      const apiBase = API_CONFIG.BASE_URL
       try {
         const ticketRes = await fetch(`${apiBase}/interview/ws-ticket`, {
           method: "POST",
@@ -377,7 +389,6 @@ export default function InterviewRoom() {
         const { ticket } = await ticketRes.json()
         if (cancelled || !ticket) return
 
-        // Step 2: Open WebSocket using the one-time ticket
         const wsBase = apiBase.replace(/^http/, "ws").replace(/\/api$/, "")
         const ws = new WebSocket(`${wsBase}/api/interview/ws/video/${ticket}`)
 
@@ -418,6 +429,44 @@ export default function InterviewRoom() {
       vad.stopListening()
     }
   }, [interviewState, isMicOn, stopSpeechRecording])
+  useEffect(() => {
+    if (!mode.startsWith("mock")) return
+    const sendAntiCheat = (eventType: string, payload: Record<string, unknown> = {}) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: "anti_cheat_event",
+          event_type: eventType,
+          payload,
+        }))
+      }
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        sendAntiCheat("tab_switch", { visibilityState: document.visibilityState })
+      }
+    }
+    const onBlur = () => sendAntiCheat("window_blur")
+    const onFullscreen = () => {
+      if (!document.fullscreenElement && interviewState === "active") {
+        sendAntiCheat("fullscreen_exit")
+      }
+    }
+    const onPaste = (event: ClipboardEvent) => {
+      event.preventDefault()
+      sendAntiCheat("paste_blocked")
+      toast.error("Paste is disabled during mock interviews.")
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    document.addEventListener("fullscreenchange", onFullscreen)
+    window.addEventListener("blur", onBlur)
+    document.addEventListener("paste", onPaste)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility)
+      document.removeEventListener("fullscreenchange", onFullscreen)
+      window.removeEventListener("blur", onBlur)
+      document.removeEventListener("paste", onPaste)
+    }
+  }, [mode, interviewState])
   const playAudioBase64 = useCallback((base64: string) => {
     audioQueueRef.current = audioQueueRef.current.then(() => new Promise<void>((resolve) => {
       try {
@@ -451,8 +500,7 @@ export default function InterviewRoom() {
           setAiSpeaking(activeAudioRef.current.length > 0)
           resolve()
         })
-      } catch (err) {
-        console.error("Audio playback error:", err)
+      } catch {
         resolve()
       }
     }))
@@ -469,10 +517,19 @@ export default function InterviewRoom() {
   }, [])
   const initPipeline = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
+      if (mode.startsWith("mock") && document.fullscreenEnabled && !document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {
+          wsRef.current?.send(JSON.stringify({
+            type: "anti_cheat_event",
+            event_type: "fullscreen_request_failed",
+            payload: {},
+          }))
+        })
+      }
       wsRef.current.send(JSON.stringify({ type: "init_pipeline" }))
       setIsMicOn(true)
     }
-  }, [])
+  }, [mode])
   const toggleMic = useCallback(() => {
     setIsMicOn((prev) => {
       const next = !prev
@@ -913,7 +970,7 @@ function PracticeVoiceLayout(props: LayoutProps) {
       {(props.interviewState === "connecting" || props.interviewState === "ready") && <MeetConnectingOverlay state={props.interviewState} />}
       <div className="flex-1 flex min-h-0">
         <div className="flex-1 p-2 flex gap-2">
-          {/* AI Voice tile — waveform instead of video */}
+          
           <div className="flex-[2] relative rounded-xl overflow-hidden bg-[#1a1a1c]">
             <div className="absolute inset-0 flex flex-col items-center justify-center">
               <div className={`w-24 h-24 rounded-full bg-gradient-to-br from-[#669df6] to-[#1a73e8] flex items-center justify-center text-3xl font-medium text-white shadow-xl transition-all duration-300 ${props.aiSpeaking ? "ring-[3px] ring-[#669df6]/60 scale-105" : ""}`}>A</div>

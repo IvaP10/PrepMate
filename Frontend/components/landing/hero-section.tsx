@@ -19,7 +19,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
     <section className="relative flex min-h-[100vh] flex-col items-center justify-center overflow-hidden px-6 pt-20">
 
       <div className="relative z-10 mx-auto flex max-w-4xl flex-col items-center text-center">
-        {/* Eyebrow badge */}
+        
         <button
           type="button"
           onClick={onGetStarted}
@@ -41,7 +41,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
           </span>
         </button>
 
-        {/* Main headline — line-by-line reveal */}
+        
         <h1 className="font-serif text-4xl leading-[1.1] tracking-tight sm:text-5xl md:text-6xl lg:text-7xl relative z-10">
           <span className="overflow-hidden block">
             <span
@@ -66,7 +66,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
           </span>
         </h1>
 
-        {/* Subtitle */}
+        
         <p
           className={`mt-8 max-w-xl text-pretty text-lg leading-relaxed text-muted-foreground sm:text-xl relative z-10 transition-all duration-700 ease-out ${
             loaded ? "opacity-100 translate-y-0 blur-0" : "opacity-0 translate-y-6 blur-sm"
@@ -76,7 +76,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
           Upload your resume, select your target industry, and engage in realistic, simulated interviews. Receive actionable, real-time feedback to secure your next role.
         </p>
 
-        {/* CTA */}
+        
         <div
           className={`mt-10 flex flex-wrap items-center justify-center gap-4 relative z-10 transition-all duration-700 ease-out ${
             loaded ? "opacity-100 translate-y-0" : "opacity-0 translate-y-6"
@@ -93,7 +93,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
           </Button>
         </div>
 
-        {/* Trust metrics */}
+        
         <div
           className={`mt-16 flex items-center gap-8 text-xs font-mono text-muted-foreground/50 uppercase tracking-widest transition-all duration-700 ${
             loaded ? "opacity-100" : "opacity-0"
@@ -108,7 +108,7 @@ export function HeroSection({ onGetStarted }: HeroSectionProps) {
         </div>
       </div>
 
-      {/* Scroll line indicator (no text) */}
+      
       <div
         className={`absolute bottom-8 left-1/2 -translate-x-1/2 transition-all duration-700 ${
           loaded ? "opacity-100" : "opacity-0"

@@ -7,17 +7,20 @@ PyJWT
 pydantic
 python-multipart
 google-auth
-stripe
 razorpay
 redis
 openai
 pymupdf
-docling
+paddlepaddle; python_version < "3.14"
+paddleocr>=3.0.0
+spacy
 python-docx
-opencv-python
-mediapipe
-deepface
 numpy
 cryptography
 websockets
-aiohttp
+aiohttp>=3.13.4
+requests>=2.33.0
+Pygments>=2.20.0
+kokoro
+soundfile
+sentry-sdk[fastapi]

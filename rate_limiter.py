@@ -29,7 +29,7 @@ class RateLimiter:
 
             if len(self.calls) >= self.max_calls:
                 wait_time = self.time_window - (now - self.calls[0])
-                logger.warning(f"Rate limit reached, waiting {wait_time:.1f}s")
+                logger.warning("Rate limit reached, waiting %.1fs", wait_time)
                 await asyncio.sleep(wait_time)
                 self.calls.popleft()
 
@@ -71,7 +71,7 @@ class UserRateLimiter:
 
             return True
         except Exception:
-            logger.exception("Redis rate limit check failed, falling back to memory")
+            logger.warning("Redis rate limit check failed, falling back to memory")
             return await self._check_memory(user_id)
 
     async def _check_memory(self, user_id: str) -> bool:

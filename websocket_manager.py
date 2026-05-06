@@ -1,9 +1,9 @@
 from fastapi import WebSocket
 from typing import Dict, Optional, List
-import json
 import logging
 import asyncio
 from datetime import datetime, timedelta
+from security_utils import stable_hash
 
 logger = logging.getLogger("websocket_manager")
 
@@ -19,7 +19,7 @@ class ConnectionManager:
 
         if user_id in self.connection_metadata:
             old_metadata = self.connection_metadata[user_id]
-            logger.info(f"Reconnection detected: user_id={user_id}")
+            logger.info("Reconnection detected: %s", stable_hash(user_id, "user"))
 
             await websocket.send_json({
                 "type": "reconnected",
@@ -36,7 +36,7 @@ class ConnectionManager:
         }
 
         self.heartbeat_tasks[user_id] = asyncio.create_task(self._heartbeat(user_id))
-        logger.info(f"WebSocket connected: user_id={user_id}")
+        logger.info("WebSocket connected: %s", stable_hash(user_id, "user"))
 
     async def _heartbeat(self, user_id: str):
         while user_id in self.active_connections:
@@ -44,7 +44,7 @@ class ConnectionManager:
                 await self.send_json({"type": "heartbeat", "timestamp": datetime.utcnow().isoformat()}, user_id)
                 await asyncio.sleep(30)
             except Exception:
-                logger.warning(f"Heartbeat failed for {user_id}")
+                logger.warning("Heartbeat failed for %s", stable_hash(user_id, "user"))
                 break
 
     def disconnect(self, user_id: str):
@@ -58,25 +58,21 @@ class ConnectionManager:
             self.heartbeat_tasks[user_id].cancel()
             del self.heartbeat_tasks[user_id]
 
-        logger.info(f"WebSocket disconnected: user_id={user_id}")
+        logger.info("WebSocket disconnected: %s", stable_hash(user_id, "user"))
 
-    async def send_personal_message(self, message: str, user_id: str):
+    async def send_json(self, data: dict, user_id: str):
         if user_id not in self.active_connections:
-            logger.warning(f"Cannot send message - user {user_id} not connected")
+            logger.warning("Cannot send message - %s not connected", stable_hash(user_id, "user"))
             return False
 
         try:
-            await self.active_connections[user_id].send_text(message)
+            await self.active_connections[user_id].send_json(data)
             self.connection_metadata[user_id]["last_activity"] = datetime.utcnow()
             return True
         except Exception as e:
-            logger.error(f"Failed to send message to {user_id}: {str(e)}")
+            logger.error("Failed to send message to %s: %s", stable_hash(user_id, "user"), type(e).__name__)
             self.disconnect(user_id)
             return False
-
-    async def send_json(self, data: dict, user_id: str):
-        message = json.dumps(data)
-        return await self.send_personal_message(message, user_id)
 
     def create_session(self, session_id: str, user_id: str, interview_data: dict):
         self.interview_sessions[session_id] = {
@@ -97,10 +93,7 @@ class ConnectionManager:
         if user_id in self.connection_metadata:
             self.connection_metadata[user_id]["session_id"] = session_id
 
-        logger.info(f"Session created: {session_id} for user {user_id}")
-
-    def get_session(self, session_id: str) -> Optional[Dict]:
-        return self.interview_sessions.get(session_id)
+        logger.info("Session created: %s for %s", stable_hash(session_id, "session"), stable_hash(user_id, "user"))
 
     def add_message_to_session(self, session_id: str, message: dict):
         if session_id in self.interview_sessions:
@@ -156,7 +149,7 @@ class ConnectionManager:
         limit = time_limits.get(difficulty, 150)
 
         if response_duration > limit:
-            logger.info(f"Response time ({response_duration}s) exceeded limit ({limit}s) for {difficulty}")
+            logger.info("Response time %.1fs exceeded limit %ss for %s", response_duration, limit, difficulty)
             return True
 
         return False
@@ -171,17 +164,11 @@ class ConnectionManager:
         if session_id in self.interview_sessions:
             session = self.interview_sessions[session_id]
             session["ended_at"] = datetime.utcnow()
-            logger.info(f"Session ended: {session_id}, duration: {session['time_tracking']['total_elapsed']}s")
+            logger.info("Session ended: %s, duration=%.1fs", stable_hash(session_id, "session"), session["time_tracking"]["total_elapsed"])
             del self.interview_sessions[session_id]
 
     def is_user_connected(self, user_id: str) -> bool:
         return user_id in self.active_connections
-
-    def get_active_users_count(self) -> int:
-        return len(self.active_connections)
-
-    def get_active_sessions_count(self) -> int:
-        return len(self.interview_sessions)
 
     def cleanup_stale_connections(self):
         stale_users = []
@@ -192,7 +179,7 @@ class ConnectionManager:
                 stale_users.append(user_id)
 
         for user_id in stale_users:
-            logger.info(f"Cleaning up stale connection: {user_id}")
+            logger.info("Cleaning up stale connection: %s", stable_hash(user_id, "user"))
             self.disconnect(user_id)
             if user_id in self.connection_metadata:
                 del self.connection_metadata[user_id]

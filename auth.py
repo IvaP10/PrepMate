@@ -12,6 +12,7 @@ import os
 import logging
 import asyncio
 import smtplib
+import secrets
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google.oauth2 import id_token as google_id_token
@@ -20,6 +21,7 @@ from google.auth.transport import requests as google_requests
 from database import get_db, transaction
 from config import settings
 from redis_client import get_redis_client
+from security_utils import stable_hash
 
 router = APIRouter(tags=["auth"])
 security = HTTPBearer(auto_error=False)
@@ -97,7 +99,7 @@ def send_verification_email(to_email: str, token: str) -> bool:
         server.quit()
         return True
     except Exception:
-        logger.exception("Failed to send verification email")
+        logger.error("Failed to send verification email")
         return False
 
 class SignupRequest(BaseModel):
@@ -288,7 +290,7 @@ def verify_google_token(google_token: str) -> Dict[str, Any]:
         raise
 
     except Exception:
-        logger.exception("Failed to verify Google ID token")
+        logger.warning("Failed to verify Google ID token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Google token"
@@ -378,7 +380,7 @@ def _check_login_rate_limit(email: str):
     except HTTPException:
         raise
     except Exception:
-        logger.exception("Failed to check login rate limit")
+                logger.warning("Failed to check login rate limit")
 
 def _record_failed_login(email: str):
     redis_client = get_redis_client()
@@ -392,7 +394,7 @@ def _record_failed_login(email: str):
         pipe.expire(key, settings.LOGIN_LOCKOUT_SECONDS)
         pipe.execute()
     except Exception:
-        logger.exception("Failed to record failed login attempt")
+        logger.warning("Failed to record failed login attempt")
 
 def _clear_login_attempts(email: str):
     redis_client = get_redis_client()
@@ -427,7 +429,7 @@ async def signup(request: SignupRequest, response: Response):
                     detail="Email already registered and verified"
                 )
 
-            verification_token = str(uuid.uuid4())
+            verification_token = secrets.token_urlsafe(32)
             token_expiry = datetime.now(timezone.utc) + timedelta(hours=VERIFICATION_LINK_EXPIRY_HOURS)
 
             if existing and not existing[1]:
@@ -439,7 +441,7 @@ async def signup(request: SignupRequest, response: Response):
                     )
 
                 send_verification_email(request.email, verification_token)
-                logger.info("Resent verification email: %s", request.email)
+                logger.info("Resent verification email for %s", stable_hash(request.email, "email"))
 
                 return AuthResponse(**{
                     "token": "",
@@ -489,7 +491,7 @@ async def signup(request: SignupRequest, response: Response):
                 )
 
             send_verification_email(request.email, verification_token)
-            logger.info("New user signed up, verification email sent: %s", request.email)
+            logger.info("New user signed up, verification email sent for %s", stable_hash(request.email, "email"))
 
             return AuthResponse(**{
                 "token": "",
@@ -504,8 +506,8 @@ async def signup(request: SignupRequest, response: Response):
         except HTTPException:
             raise
 
-        except Exception as e:
-            logger.exception("Signup failed")
+        except Exception:
+            logger.error("Signup failed")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Signup failed. Please try again later."
@@ -568,7 +570,7 @@ async def login(request: LoginRequest, response: Response):
             token = create_jwt_token(user_id, request.email)
             _set_auth_cookie(response, token)
 
-            logger.info("User logged in: %s", request.email)
+            logger.info("User logged in: %s", stable_hash(request.email, "email"))
 
             return AuthResponse(**{
                 "token": "",
@@ -618,7 +620,7 @@ async def google_auth(request: GoogleAuthRequest, response: Response):
                 is_admin = flags["is_admin"]
 
                 message = "Login successful"
-                logger.info("Google login: %s", email)
+                logger.info("Google login: %s", stable_hash(email, "email"))
 
             else:
                 user_id = str(uuid.uuid4())
@@ -658,7 +660,7 @@ async def google_auth(request: GoogleAuthRequest, response: Response):
                 interviews_remaining = settings.FREE_CREDITS_ON_SIGNUP
                 is_admin = False
                 message = "Google signup successful"
-                logger.info("Google signup: %s", email)
+                logger.info("Google signup: %s", stable_hash(email, "email"))
 
             token = create_jwt_token(user_id, email)
             _set_auth_cookie(response, token)
@@ -677,7 +679,7 @@ async def google_auth(request: GoogleAuthRequest, response: Response):
             raise
 
         except Exception:
-            logger.exception("Google auth failed for email=%s", email or 'unknown')
+            logger.error("Google auth failed for %s", stable_hash(email, "email") if email else "email:unknown")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Google authentication failed"
@@ -716,11 +718,11 @@ async def verify_email(token: str = Query(..., description="Email verification t
                     (email,)
                 )
 
-            logger.info("Email verified successfully: %s", email)
+            logger.info("Email verified successfully for %s", stable_hash(email, "email"))
             return RedirectResponse(url=f"{settings.APP_BASE_URL}?verified=true")
 
         except Exception:
-            logger.exception("Email verification failed")
+            logger.error("Email verification failed")
             return RedirectResponse(url=f"{settings.APP_BASE_URL}?verified=false&error=server_error")
 
         finally:
@@ -739,7 +741,7 @@ async def forgot_password(request: ForgotPasswordRequest):
             if user[1] == 'google':
                 return {"message": "If that email is registered, we have sent a password reset link."}
 
-            reset_token = str(uuid.uuid4())
+            reset_token = secrets.token_urlsafe(32)
             token_expiry = datetime.now(timezone.utc) + timedelta(hours=VERIFICATION_LINK_EXPIRY_HOURS)
 
             with transaction(connection):
@@ -798,16 +800,16 @@ async def forgot_password(request: ForgotPasswordRequest):
                         server.login(smtp_email, smtp_password)
                         server.send_message(msg)
                         server.quit()
-                    except Exception as e:
-                        logger.exception("Failed to send reset email")
+                    except Exception:
+                        logger.error("Failed to send reset email")
 
                 asyncio.create_task(asyncio.to_thread(send_email))
             else:
-                logger.warning("SMTP not configured — password reset email could not be sent for %s", request.email)
+                logger.warning("SMTP not configured - password reset email could not be sent for %s", stable_hash(request.email, "email"))
 
             return {"message": "If that email is registered, we have sent a password reset link."}
         except Exception:
-            logger.exception("Forgot password failed")
+            logger.error("Forgot password failed")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to process request")
         finally:
             cursor.close()
@@ -843,7 +845,7 @@ async def reset_password(request: ResetPasswordRequest):
         except HTTPException:
             raise
         except Exception:
-            logger.exception("Reset password failed")
+            logger.error("Reset password failed")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to reset password")
         finally:
             cursor.close()
@@ -926,7 +928,7 @@ async def change_password(
         except HTTPException:
             raise
         except Exception:
-            logger.exception("Change password failed")
+            logger.error("Change password failed")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to change password")
         finally:
             cursor.close()
@@ -982,13 +984,13 @@ async def delete_account(
 
             _increment_token_version(user_id)
             _clear_auth_cookie(response)
-            logger.info("Account deleted: %s", user_id)
+            logger.info("Account deleted: %s", stable_hash(user_id, "user"))
 
             return {"message": "Account deleted successfully"}
         except HTTPException:
             raise
         except Exception:
-            logger.exception("Delete account failed")
+            logger.error("Delete account failed")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to delete account")
         finally:
             cursor.close()

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from pydantic import BaseModel
 from typing import Dict, Optional
 from datetime import datetime, timedelta, timezone
@@ -6,19 +6,16 @@ import logging
 import uuid
 import hmac
 import hashlib
-import stripe
 import razorpay
 
 from auth import get_current_user
 from database import get_db
 from config import settings as app_settings
 from pricing import PRICING
+from security_utils import redact_text, stable_hash
 
 router = APIRouter(tags=["Payment"])
 logger = logging.getLogger("ai_interviewer.payment")
-
-stripe.api_key = app_settings.STRIPE_SECRET_KEY
-STRIPE_WEBHOOK_SECRET = app_settings.STRIPE_WEBHOOK_SECRET
 
 razorpay_client = None
 if app_settings.RAZORPAY_KEY_ID and app_settings.RAZORPAY_KEY_SECRET:
@@ -56,7 +53,7 @@ MEMBERSHIP_PLANS = {
 class CreateSubscriptionRequest(BaseModel):
     plan_type: str
     payment_method: str
-    provider: Optional[str] = 'stripe'
+    provider: Optional[str] = 'razorpay'
     sessions: Optional[int] = None
 
 class PaymentResponse(BaseModel):
@@ -128,8 +125,8 @@ async def get_pricing(
 ):
     if sessions < 1 or sessions > 100:
         raise HTTPException(status_code=400, detail="Sessions must be between 1 and 100")
-    if provider not in ("razorpay", "stripe"):
-        raise HTTPException(status_code=400, detail="Provider must be 'razorpay' or 'stripe'")
+    if provider != "razorpay":
+        raise HTTPException(status_code=400, detail="Provider must be 'razorpay'")
     return PRICING.calculate_total(sessions, provider)
 
 @router.post("/create-subscription", response_model=PaymentResponse)
@@ -152,10 +149,10 @@ async def create_subscription(
             detail="Sessions must be between 1 and 100"
         )
 
-    if request.provider not in ("razorpay", "stripe"):
+    if request.provider != "razorpay":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provider must be 'razorpay' or 'stripe'"
+            detail="Provider must be 'razorpay'"
         )
 
     if is_credit_purchase:
@@ -192,7 +189,7 @@ async def create_subscription(
                     "UPDATE Subscriptions SET status = 'cancelled', auto_renew = FALSE WHERE subscription_id = %s",
                     (existing[0],)
                 )
-                logger.info("Cancelled previous subscription %s for user %s", existing[0], current_user["user_id"])
+                logger.info("Cancelled previous subscription %s for %s", stable_hash(existing[0], "sub"), stable_hash(current_user["user_id"], "user"))
 
             transaction_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
@@ -224,32 +221,7 @@ async def create_subscription(
                     )
                 )
 
-            if request.provider == "stripe" and stripe.api_key:
-                try:
-                    checkout_session = stripe.checkout.Session.create(
-                        payment_method_types=["card"],
-                        line_items=[{
-                            "price_data": {
-                                "currency": currency.lower(),
-                                "product_data": {
-                                    "name": product_name,
-                                },
-                                "unit_amount": int(amount * 100),
-                            },
-                            "quantity": 1,
-                        }],
-                        mode="payment",
-                        success_url=f"{app_settings.APP_BASE_URL}/dashboard?session_id={{CHECKOUT_SESSION_ID}}",
-                        cancel_url=cancel_url,
-                        client_reference_id=transaction_id,
-                        expires_at=int(expires_at.timestamp()),
-                    )
-                    session_url = checkout_session.url
-                except Exception as e:
-                    logger.error("Stripe session creation failed: %s", e)
-                    raise HTTPException(status_code=500, detail="Failed to initialize Stripe session")
-
-            elif request.provider == "razorpay" and razorpay_client:
+            if request.provider == "razorpay" and razorpay_client:
                 try:
                     order = razorpay_client.order.create({
                         "amount": int(amount * 100),
@@ -260,10 +232,10 @@ async def create_subscription(
                     razorpay_order_id = order["id"]
                     session_url = razorpay_order_id
                 except Exception as e:
-                    logger.error("Razorpay order creation failed: %s", e)
+                    logger.error("Razorpay order creation failed: %s", redact_text(e))
                     raise HTTPException(status_code=500, detail="Failed to initialize Razorpay order")
             else:
-                raise HTTPException(status_code=400, detail="Payment provider not configured")
+                raise HTTPException(status_code=400, detail="Razorpay is not configured")
 
             effective_txn_id = razorpay_order_id if razorpay_order_id else transaction_id
 
@@ -289,7 +261,7 @@ async def create_subscription(
             connection.autocommit = True
             logger.info(
                 "Pending transaction created: txn=%s, user=%s, plan=%s, amount=%.2f %s",
-                effective_txn_id, current_user["user_id"], request.plan_type, amount, currency,
+                stable_hash(effective_txn_id, "txn"), stable_hash(current_user["user_id"], "user"), request.plan_type, amount, currency,
             )
 
             return {
@@ -304,7 +276,7 @@ async def create_subscription(
         except Exception as e:
             connection.rollback()
             connection.autocommit = True
-            logger.exception("Failed to create subscription")
+            logger.error("Failed to create subscription")
             if isinstance(e, HTTPException):
                 raise
             raise HTTPException(status_code=500, detail="Failed to create subscription")
@@ -322,11 +294,6 @@ async def verify_razorpay_payment(
     request: VerifyRazorpayRequest,
     current_user: Dict = Depends(get_current_user)
 ):
-    """
-    Verify Razorpay payment signature and credit the user.
-    Uses SELECT ... FOR UPDATE to prevent double-crediting from concurrent
-    calls with the webhook endpoint.
-    """
     key_secret = app_settings.RAZORPAY_KEY_SECRET
     if not key_secret:
         raise HTTPException(status_code=500, detail="Payment verification not configured")
@@ -341,7 +308,7 @@ async def verify_razorpay_payment(
     if not hmac.compare_digest(expected_signature, request.razorpay_signature):
         logger.warning(
             "Razorpay signature mismatch for order %s, user %s",
-            request.razorpay_order_id, current_user["user_id"]
+            stable_hash(request.razorpay_order_id, "order"), stable_hash(current_user["user_id"], "user")
         )
         raise HTTPException(status_code=400, detail="Payment verification failed. Invalid signature.")
 
@@ -394,7 +361,9 @@ async def verify_razorpay_payment(
             connection.commit()
             logger.info(
                 "Payment verified: user=%s, subscription=%s, order=%s",
-                current_user["user_id"], subscription_id, request.razorpay_order_id
+                stable_hash(current_user["user_id"], "user"),
+                stable_hash(subscription_id, "sub") if subscription_id else "sub:none",
+                stable_hash(request.razorpay_order_id, "order"),
             )
 
             return {
@@ -408,7 +377,7 @@ async def verify_razorpay_payment(
             raise
         except Exception:
             connection.rollback()
-            logger.exception("Payment verification error")
+            logger.error("Payment verification error")
             raise HTTPException(status_code=500, detail="Payment verification failed")
         finally:
             connection.autocommit = True
@@ -513,7 +482,7 @@ async def cancel_subscription(current_user: Dict = Depends(get_current_user)):
                 )
 
             connection.commit()
-            logger.info(f"Subscription cancelled: user={current_user['user_id']}")
+            logger.info("Subscription cancelled: %s", stable_hash(current_user["user_id"], "user"))
 
             return {
                 "success": True,
@@ -525,7 +494,7 @@ async def cancel_subscription(current_user: Dict = Depends(get_current_user)):
             raise
         except Exception:
             connection.rollback()
-            logger.exception("Failed to cancel subscription")
+            logger.error("Failed to cancel subscription")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to cancel subscription"
@@ -537,7 +506,7 @@ async def cancel_subscription(current_user: Dict = Depends(get_current_user)):
 @router.get("/transactions")
 async def get_transactions(
     current_user: Dict = Depends(get_current_user),
-    limit: int = 10
+    limit: int = Query(10, ge=1, le=100)
 ):
     with get_db() as connection:
         cursor = connection.cursor()
@@ -611,7 +580,7 @@ async def toggle_auto_renew(current_user: Dict = Depends(get_current_user)):
             )
 
             connection.commit()
-            logger.info(f"Auto-renew toggled: user={current_user['user_id']}, value={new_auto_renew}")
+            logger.info("Auto-renew toggled: user=%s, value=%s", stable_hash(current_user["user_id"], "user"), new_auto_renew)
 
             return {
                 "success": True,
@@ -624,7 +593,7 @@ async def toggle_auto_renew(current_user: Dict = Depends(get_current_user)):
             raise
         except Exception:
             connection.rollback()
-            logger.exception("Failed to toggle auto-renew")
+            logger.error("Failed to toggle auto-renew")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to toggle auto-renew"
@@ -632,78 +601,6 @@ async def toggle_auto_renew(current_user: Dict = Depends(get_current_user)):
 
         finally:
             cursor.close()
-
-@router.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
-    if not sig_header or not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=400, detail="Missing signature or secret")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        transaction_id = session.get('client_reference_id')
-
-        if transaction_id:
-            with get_db() as conn:
-                cursor = conn.cursor()
-                try:
-                    conn.autocommit = False
-                    cursor.execute(
-                        "SELECT status, credits_purchased, user_id, subscription_id FROM Transactions WHERE transaction_id = %s FOR UPDATE",
-                        (transaction_id,)
-                    )
-                    txn = cursor.fetchone()
-                    if txn and txn[0] == 'pending':
-                        credits_to_grant = txn[1]
-                        user_id = txn[2]
-                        subscription_id = txn[3]
-
-                        cursor.execute(
-                            "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
-                            (transaction_id,)
-                        )
-
-                        result_kind = _apply_completed_transaction(cursor, user_id, credits_to_grant, subscription_id)
-
-                        conn.commit()
-                        logger.info("Stripe webhook completed: user=%s, kind=%s, txn=%s", user_id, result_kind, transaction_id)
-                    else:
-                        conn.rollback()
-                except Exception:
-                    conn.rollback()
-                    logger.exception("Stripe webhook DB error for txn=%s", transaction_id)
-                    raise HTTPException(status_code=500, detail="Webhook processing failed")
-                finally:
-                    conn.autocommit = True
-                    cursor.close()
-
-    elif event['type'] == 'checkout.session.expired':
-        session = event['data']['object']
-        transaction_id = session.get('client_reference_id')
-        if transaction_id:
-            with get_db() as conn:
-                cursor = conn.cursor()
-                try:
-                    cursor.execute(
-                        "UPDATE Transactions SET status = 'failed' WHERE transaction_id = %s AND status = 'pending'",
-                        (transaction_id,)
-                    )
-                    conn.commit()
-                finally:
-                    cursor.close()
-
-    return {"status": "success"}
 
 @router.post("/razorpay/webhook")
 async def razorpay_webhook(request: Request):
@@ -755,12 +652,17 @@ async def razorpay_webhook(request: Request):
                         result_kind = _apply_completed_transaction(cursor, user_id, credits_to_grant, subscription_id)
 
                         conn.commit()
-                        logger.info("Razorpay webhook completed: user=%s, kind=%s, order=%s", user_id, result_kind, order_id)
+                        logger.info(
+                            "Razorpay webhook completed: user=%s, kind=%s, order=%s",
+                            stable_hash(user_id, "user"),
+                            result_kind,
+                            stable_hash(order_id, "order"),
+                        )
                     else:
                         conn.rollback()
                 except Exception:
                     conn.rollback()
-                    logger.exception("Razorpay webhook DB error for order=%s", order_id)
+                    logger.error("Razorpay webhook DB error for order=%s", stable_hash(order_id, "order"))
                     raise HTTPException(status_code=500, detail="Webhook processing failed")
                 finally:
                     conn.autocommit = True

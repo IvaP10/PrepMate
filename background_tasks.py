@@ -17,7 +17,7 @@ async def check_expired_subscriptions():
             logger.info("Subscription checker task cancelled")
             break
         except Exception:
-            logger.exception("Error in subscription expiry background task")
+            logger.error("Error in subscription expiry background task")
             await asyncio.sleep(60)
 
 async def _expire_subscriptions():

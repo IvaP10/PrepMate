@@ -26,7 +26,7 @@ def init_connection_pool():
         )
         logger.info("PostgreSQL connection pool created (min=%d, max=%d)", settings.DB_POOL_MIN, settings.DB_POOL_MAX)
     except Exception:
-        logger.exception("Failed to create PostgreSQL connection pool")
+        logger.error("Failed to create PostgreSQL connection pool")
         raise
 
 def get_db_connection():
@@ -35,7 +35,7 @@ def get_db_connection():
     try:
         return _connection_pool.getconn()
     except Exception:
-        logger.exception("Failed to get connection from pool")
+        logger.error("Failed to get connection from pool")
         raise
 
 def return_db_connection(connection):
@@ -45,7 +45,7 @@ def return_db_connection(connection):
                 connection.rollback()
             _connection_pool.putconn(connection)
         except Exception:
-            logger.exception("Failed to return connection to pool")
+            logger.error("Failed to return connection to pool")
 
 def close_connection_pool():
     global _connection_pool
@@ -108,6 +108,93 @@ def ensure_runtime_schema():
             "CREATE INDEX IF NOT EXISTS idx_support_status_created ON SupportSubmissions (status, created_at DESC)",
             "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS avatar_url TEXT",
             "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS notification_prefs JSONB NOT NULL DEFAULT '{}'::jsonb",
+            f"ALTER TABLE UserInfo ALTER COLUMN interviews_remaining SET DEFAULT {settings.FREE_CREDITS_ON_SIGNUP}",
+            """
+            CREATE TABLE IF NOT EXISTS AIEventLogs (
+                event_id BIGSERIAL PRIMARY KEY,
+                user_id VARCHAR(64),
+                interview_id VARCHAR(64),
+                event_type VARCHAR(80) NOT NULL,
+                provider VARCHAR(40),
+                model VARCHAR(120),
+                prompt_tokens INTEGER,
+                output_tokens INTEGER,
+                latency_ms INTEGER,
+                success BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_ai_event_logs_created ON AIEventLogs (created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ai_event_logs_interview ON AIEventLogs (interview_id, created_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS CoachExercises (
+                exercise_id VARCHAR(64) PRIMARY KEY,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                interview_id VARCHAR(64) REFERENCES Interviews(interview_id) ON DELETE SET NULL,
+                exercise_type VARCHAR(30) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                prompt TEXT NOT NULL,
+                project_anchor VARCHAR(255),
+                weakness_key VARCHAR(80),
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                completed_at TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_coach_exercises_user_status ON CoachExercises (user_id, status, created_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS TechnicalInterviewRounds (
+                round_id VARCHAR(64) PRIMARY KEY,
+                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                round_type VARCHAR(30) NOT NULL,
+                language VARCHAR(20),
+                prompt TEXT NOT NULL,
+                starter_code TEXT,
+                whiteboard_json JSONB,
+                status VARCHAR(20) NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMP
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_technical_rounds_interview ON TechnicalInterviewRounds (interview_id, round_type)",
+            """
+            CREATE TABLE IF NOT EXISTS TechnicalRunEvents (
+                run_id VARCHAR(64) PRIMARY KEY,
+                round_id VARCHAR(64) REFERENCES TechnicalInterviewRounds(round_id) ON DELETE CASCADE,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                language VARCHAR(20) NOT NULL,
+                source_chars INTEGER NOT NULL DEFAULT 0,
+                stdout TEXT,
+                stderr TEXT,
+                exit_code INTEGER,
+                runtime_ms INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_technical_run_events_round ON TechnicalRunEvents (round_id, created_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS ClientBodyLanguageMetrics (
+                metric_id BIGSERIAL PRIMARY KEY,
+                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_client_body_language_interview ON ClientBodyLanguageMetrics (interview_id, created_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS AntiCheatEvents (
+                event_id BIGSERIAL PRIMARY KEY,
+                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
+                event_type VARCHAR(50) NOT NULL,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_anti_cheat_interview ON AntiCheatEvents (interview_id, created_at DESC)",
         ]
         for statement in statements:
             cursor.execute(statement)
@@ -115,7 +202,7 @@ def ensure_runtime_schema():
         logger.info("Runtime schema upgrades verified")
     except Exception:
         conn.rollback()
-        logger.exception("Failed to apply runtime schema upgrades")
+        logger.error("Failed to apply runtime schema upgrades")
         raise
     finally:
         cursor.close()

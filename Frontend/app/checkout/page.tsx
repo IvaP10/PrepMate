@@ -9,10 +9,11 @@ import {
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { createPaymentSession, verifyRazorpayPayment } from "@/lib/api"
+import { API_CONFIG } from "@/lib/config"
 
-/* ─────────────────────── Types ─────────────────────── */
+
 type PaymentMethod = "upi" | "card" | "netbanking"
-type UpiMode = "id" | "qr"  // whether user wants to type ID or scan QR
+type UpiMode = "id" | "qr"
 
 const MEMBERSHIP_PLANS: Record<string, {
     name: string
@@ -58,7 +59,7 @@ const MEMBERSHIP_PLANS: Record<string, {
     },
 }
 
-/* ─────────────────────── Component ─────────────────────── */
+
 function CheckoutContent() {
     const searchParams = useSearchParams()
     const router = useRouter()
@@ -68,32 +69,32 @@ function CheckoutContent() {
     const sessionCount = sessionsParam ? parseInt(sessionsParam) : 5
     const isMembershipCheckout = Boolean(membershipPlan && planParam)
 
-    /* ── payment method ── */
+    
     const [selectedMethod, setSelectedMethod] = useState<PaymentMethod>("upi")
     const [expandedMethod, setExpandedMethod] = useState<PaymentMethod>("upi")
 
-    /* ── processing / loading ── */
+    
     const [isProcessing, setIsProcessing] = useState(false)
     const [processingLabel, setProcessingLabel] = useState("")
 
-    /* ── UPI state ── */
+    
     const [upiMode, setUpiMode] = useState<UpiMode>("id")
     const [upiId, setUpiId] = useState("")
     const [upiVerified, setUpiVerified] = useState(false)
     const [verifyingUpi, setVerifyingUpi] = useState(false)
     const [upiError, setUpiError] = useState("")
 
-    /* ── Card state ── */
+    
     const [cardNumber, setCardNumber] = useState("")
     const [cardExpiry, setCardExpiry] = useState("")
     const [cardCvv, setCardCvv] = useState("")
     const [cardName, setCardName] = useState("")
     const [cardErrors, setCardErrors] = useState<Record<string, string>>({})
 
-    /* ── Netbanking state ── */
+    
     const [selectedBank, setSelectedBank] = useState("")
 
-    /* ── Pricing (fetched from backend — single source of truth) ── */
+    
     const [pricing, setPricing] = useState<{
         sessions: number; price_per_credit: number; base_price: number;
         discount: number; discount_percent: number; subtotal: number;
@@ -122,7 +123,7 @@ function CheckoutContent() {
                 return
             }
             try {
-                const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api"
+                const apiBase = API_CONFIG.BASE_URL
                 const res = await fetch(
                     `${apiBase}/payment/pricing?sessions=${sessionCount}&provider=razorpay`,
                     { credentials: "include" }
@@ -144,7 +145,7 @@ function CheckoutContent() {
     const fmtPrice = (n: number) =>
         `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 
-    /* ── helpers ── */
+    
     const formatCardNumber = (v: string) => {
         const d = v.replace(/\D/g, "").slice(0, 16)
         return d.replace(/(.{4})/g, "$1 ").trim()
@@ -167,20 +168,19 @@ function CheckoutContent() {
         return Object.keys(errs).length === 0
     }
 
-    /* ── UPI verification (format + simulated VPA check) ── */
+    
     const handleVerifyUpi = async () => {
         if (!upiId) { setUpiError("Please enter your UPI ID"); return }
         if (!validateUpiFormat(upiId)) { setUpiError("Invalid format. Use name@bank (e.g. name@okicici)"); return }
         setUpiError("")
         setVerifyingUpi(true)
-        // Simulate backend VPA verification (Razorpay's validate VPA API in production)
         await new Promise(r => setTimeout(r, 1200))
         setVerifyingUpi(false)
         setUpiVerified(true)
         toast.success(`UPI ID ${upiId} verified!`)
     }
 
-    /* ── Load Razorpay SDK ── */
+    
     const loadRazorpay = (): Promise<boolean> =>
         new Promise((resolve) => {
             if ((window as any).Razorpay) { resolve(true); return }
@@ -191,14 +191,13 @@ function CheckoutContent() {
             document.body.appendChild(s)
         })
 
-    /* ── Open Razorpay modal ── */
+    
     const openRazorpay = async (order: any) => {
         const loaded = await loadRazorpay()
         if (!loaded) throw new Error("Payment gateway failed to load.")
         const key = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID
         if (!key) throw new Error("Payment gateway not configured.")
 
-        // Build hide list — hide everything except selected method
         const allMethods = ["upi", "card", "netbanking", "wallet", "paylater", "emi"]
         const hideList = allMethods.filter(m => m !== selectedMethod).map(m => ({ method: m }))
 
@@ -208,7 +207,7 @@ function CheckoutContent() {
             currency: "INR",
             name: "InterAI",
             description: membershipPlan ? `${membershipPlan.name} Membership` : `${sessionCount} Interview Sessions`,
-            order_id: order.session_url,  // razorpay order_id from backend
+            order_id: order.session_url,
             prefill: {} as any,
             handler: async (resp: any) => {
                 setProcessingLabel("Verifying payment…")
@@ -240,7 +239,6 @@ function CheckoutContent() {
             theme: { color: "#2563eb" },
         }
 
-        // pre-fill based on method
         if (selectedMethod === "upi" && upiId) opts.prefill.vpa = upiId
         if (selectedMethod === "card") opts.prefill.name = cardName
 
@@ -253,9 +251,8 @@ function CheckoutContent() {
         rzp.open()
     }
 
-    /* ── Main pay handler ── */
+    
     const handlePay = async () => {
-        // validations per method
         if (selectedMethod === "upi" && upiMode === "id") {
             if (!upiId) { setUpiError("Enter your UPI ID first"); return }
             if (!validateUpiFormat(upiId)) { setUpiError("Invalid UPI ID format"); return }
@@ -280,18 +277,17 @@ function CheckoutContent() {
         }
     }
 
-    /* ── toggle payment method accordion ── */
+    
     const selectMethod = (m: PaymentMethod) => {
         setSelectedMethod(m)
         setExpandedMethod(m)
-        // reset verification when switching
         if (m !== "upi") { setUpiVerified(false); setUpiError("") }
     }
 
-    /* ─────────── UPI inline form ─────────── */
+    
     const renderUpiForm = () => (
         <div className="px-6 pb-6 space-y-4" style={{ animation: "fadeSlide .25s ease" }}>
-            {/* Mode tabs */}
+            
             <div className="flex rounded-lg border border-border/50 overflow-hidden">
                 <button
                     onClick={() => { setUpiMode("id"); setUpiVerified(false) }}
@@ -317,7 +313,7 @@ function CheckoutContent() {
 
             {upiMode === "id" ? (
                 <div className="space-y-3">
-                    {/* UPI ID input row */}
+                    
                     <div className="space-y-1.5">
                         <label className="text-xs font-medium text-muted-foreground">UPI ID</label>
                         <div className="flex gap-2">
@@ -373,7 +369,7 @@ function CheckoutContent() {
                         )}
                     </div>
 
-                    {/* Pay Now button — only after verification */}
+                    
                     {upiVerified && (
                         <Button
                             className="w-full h-11 text-sm font-semibold rounded-lg gap-2"
@@ -389,7 +385,7 @@ function CheckoutContent() {
                         </Button>
                     )}
 
-                    {/* Supported apps */}
+                    
                     <div className="flex items-center gap-2 pt-1 flex-wrap">
                         <span className="text-[10px] text-muted-foreground/50 font-medium shrink-0">Works with:</span>
                         {["Google Pay", "PhonePe", "Paytm", "BHIM", "Amazon Pay"].map(a => (
@@ -398,7 +394,7 @@ function CheckoutContent() {
                     </div>
                 </div>
             ) : (
-                /* QR Code mode */
+                
                 <div className="space-y-3">
                     <div className="rounded-xl border border-border/40 bg-card p-5 text-center">
                         <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10">
@@ -426,7 +422,7 @@ function CheckoutContent() {
         </div>
     )
 
-    /* ─────────── Card inline form ─────────── */
+    
     const renderCardForm = () => (
         <div className="px-6 pb-6" style={{ animation: "fadeSlide .25s ease" }}>
             <div className="rounded-xl border border-border/50 bg-secondary/20 p-5 space-y-4">
@@ -435,7 +431,7 @@ function CheckoutContent() {
                     <span className="text-[11px] font-medium">Card details are encrypted & secured</span>
                 </div>
 
-                {/* Card Number */}
+                
                 <div className="space-y-1.5">
                     <label className="text-xs font-medium text-muted-foreground">Card Number</label>
                     <div className="relative">
@@ -452,7 +448,7 @@ function CheckoutContent() {
                     {cardErrors.number && <p className="text-[11px] text-red-500 flex items-center gap-1"><AlertCircle className="h-3 w-3" />{cardErrors.number}</p>}
                 </div>
 
-                {/* Expiry + CVV */}
+                
                 <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1.5">
                         <label className="text-xs font-medium text-muted-foreground">Valid Thru</label>
@@ -480,7 +476,7 @@ function CheckoutContent() {
                     </div>
                 </div>
 
-                {/* Cardholder Name */}
+                
                 <div className="space-y-1.5">
                     <label className="text-xs font-medium text-muted-foreground">Name on Card</label>
                     <input
@@ -493,7 +489,7 @@ function CheckoutContent() {
                     {cardErrors.name && <p className="text-[11px] text-red-500 flex items-center gap-1"><AlertCircle className="h-3 w-3" />{cardErrors.name}</p>}
                 </div>
 
-                {/* Accepted cards */}
+                
                 <div className="flex items-center gap-2 pt-1">
                     <span className="text-[10px] text-muted-foreground/50 font-medium">Accepted:</span>
                     {["Visa", "Mastercard", "RuPay", "Amex"].map(c => (
@@ -502,7 +498,7 @@ function CheckoutContent() {
                 </div>
             </div>
 
-            {/* Pay button */}
+            
             <Button
                 className="w-full h-11 mt-4 text-sm font-semibold rounded-lg gap-2"
                 onClick={handlePay}
@@ -517,7 +513,7 @@ function CheckoutContent() {
         </div>
     )
 
-    /* ─────────── Netbanking inline form ─────────── */
+    
     const popularBanks = [
         { id: "SBIN", name: "State Bank of India" },
         { id: "HDFC", name: "HDFC Bank" },
@@ -569,7 +565,7 @@ function CheckoutContent() {
         </div>
     )
 
-    /* ─────────── Payment method configs ─────────── */
+    
     const methods: { id: PaymentMethod; name: string; desc: string; icon: any; tag?: string }[] = [
         { id: "upi",        name: "UPI",                   desc: "Google Pay, PhonePe, Paytm & more", icon: Smartphone,  tag: "Recommended" },
         { id: "card",       name: "Credit / Debit Card",   desc: "Visa, Mastercard, RuPay, Amex",     icon: CreditCard },
@@ -582,16 +578,16 @@ function CheckoutContent() {
         { label: "Confirmation" },
     ]
 
-    /* ─────────── Render ─────────── */
+    
     return (
         <>
-            {/* inline animation keyframe */}
+            
             <style>{`
                 @keyframes fadeSlide { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:translateY(0) } }
             `}</style>
 
             <div className="min-h-screen bg-[#f1f3f6] dark:bg-background">
-                {/* Header */}
+                
                 <header className="sticky top-0 z-40 border-b border-border/40 bg-card shadow-sm">
                     <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4 sm:px-6">
                         <div className="flex items-center gap-4">
@@ -607,7 +603,7 @@ function CheckoutContent() {
                     </div>
                 </header>
 
-                {/* Step indicator */}
+                
                 <div className="mx-auto max-w-6xl px-4 sm:px-6 pt-6 pb-2">
                     <div className="flex items-center justify-center">
                         {steps.map((step, i) => (
@@ -627,14 +623,14 @@ function CheckoutContent() {
                     </div>
                 </div>
 
-                {/* Main — 2 columns */}
+                
                 <div className="mx-auto max-w-6xl px-4 sm:px-6 py-6">
                     <div className="flex flex-col gap-6 lg:flex-row">
 
-                        {/* ── Left Column ── */}
+                        
                         <div className="flex-1 space-y-5">
 
-                            {/* Order review card */}
+                            
                             <div className="rounded-lg border border-border/40 bg-card shadow-sm overflow-hidden">
                                 <div className="border-b border-border/40 bg-secondary/30 px-6 py-3 flex items-center gap-2">
                                     <BadgeCheck className="h-4 w-4 text-primary" />
@@ -672,7 +668,7 @@ function CheckoutContent() {
                                 </div>
                             </div>
 
-                            {/* Payment methods — accordion style like Flipkart */}
+                            
                             <div className="rounded-lg border border-border/40 bg-card shadow-sm overflow-hidden">
                                 <div className="border-b border-border/40 bg-secondary/30 px-6 py-3">
                                     <h2 className="text-sm font-bold text-foreground uppercase tracking-wide">Payment Options</h2>
@@ -684,7 +680,7 @@ function CheckoutContent() {
                                         const Icon = m.icon
                                         return (
                                             <div key={m.id} className={isSelected ? "bg-primary/[0.02]" : ""}>
-                                                {/* Method header */}
+                                                
                                                 <button
                                                     className="flex w-full items-center gap-4 px-6 py-5 text-left transition-colors hover:bg-secondary/20"
                                                     onClick={() => selectMethod(m.id)}
@@ -707,7 +703,7 @@ function CheckoutContent() {
                                                     <ChevronDown className={`h-4 w-4 text-muted-foreground/50 transition-transform duration-200 ${isExpanded ? "rotate-180" : ""}`} />
                                                 </button>
 
-                                                {/* Expanded form */}
+                                                
                                                 {isExpanded && (
                                                     <>
                                                         {m.id === "upi" && renderUpiForm()}
@@ -722,11 +718,11 @@ function CheckoutContent() {
                             </div>
                         </div>
 
-                        {/* ── Right Column — sticky price summary ── */}
+                        
                         <div className="w-full lg:w-[340px] shrink-0">
                             <div className="lg:sticky lg:top-20 space-y-4">
 
-                                {/* Price breakdown */}
+                                
                                 <div className="rounded-lg border border-border/40 bg-card shadow-sm overflow-hidden">
                                     <div className="border-b border-border/40 bg-secondary/30 px-6 py-3">
                                         <h2 className="text-sm font-bold text-foreground uppercase tracking-wide">Price Details</h2>
@@ -764,7 +760,7 @@ function CheckoutContent() {
                                     </div>
                                 </div>
 
-                                {/* Payment method badge */}
+                                
                                 <div className="rounded-lg border border-border/40 bg-card shadow-sm px-5 py-4">
                                     <div className="flex items-center gap-3">
                                         {selectedMethod === "upi" && <Smartphone className="h-4 w-4 text-primary shrink-0" />}
@@ -786,7 +782,7 @@ function CheckoutContent() {
                                     </div>
                                 </div>
 
-                                {/* Trust badges */}
+                                
                                 <div className="rounded-lg border border-border/30 bg-card px-4 py-3">
                                     <div className="flex items-center justify-center gap-4">
                                         <div className="flex items-center gap-1.5 text-muted-foreground/60">

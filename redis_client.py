@@ -3,6 +3,7 @@ import json
 import logging
 from typing import Optional, Dict, Any
 from config import settings
+from security_utils import redact_text, stable_hash
 
 logger = logging.getLogger("redis_client")
 
@@ -31,11 +32,11 @@ def init_redis_client():
             settings.REDIS_MAX_CONNECTIONS,
         )
     except redis.ConnectionError as e:
-        logger.warning(f"Redis not available: {e}. Session recovery will be disabled.")
+        logger.warning("Redis not available: %s. Session recovery will be disabled.", redact_text(e))
         _redis_pool = None
         _redis_client = None
     except Exception:
-        logger.exception("Failed to initialize Redis client")
+        logger.error("Failed to initialize Redis client")
         _redis_pool = None
         _redis_client = None
 
@@ -57,7 +58,7 @@ def save_session(session_id: str, session_data: Dict[str, Any], ttl: int = None)
 
         return True
     except Exception as e:
-        logger.error(f"Failed to save session {session_id}: {e}")
+        logger.error("Failed to save session %s: %s", stable_hash(session_id, "session"), redact_text(e))
         return False
 
 def get_session(session_id: str) -> Optional[Dict[str, Any]]:
@@ -72,7 +73,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
             return json.loads(data)
         return None
     except Exception as e:
-        logger.error(f"Failed to get session {session_id}: {e}")
+        logger.error("Failed to get session %s: %s", stable_hash(session_id, "session"), redact_text(e))
         return None
 
 def delete_session(session_id: str) -> bool:
@@ -84,7 +85,7 @@ def delete_session(session_id: str) -> bool:
         _redis_client.delete(key)
         return True
     except Exception as e:
-        logger.error(f"Failed to delete session {session_id}: {e}")
+        logger.error("Failed to delete session %s: %s", stable_hash(session_id, "session"), redact_text(e))
         return False
 
 def extend_session_ttl(session_id: str, ttl: int) -> bool:
@@ -96,7 +97,7 @@ def extend_session_ttl(session_id: str, ttl: int) -> bool:
         _redis_client.expire(key, ttl)
         return True
     except Exception as e:
-        logger.error(f"Failed to extend session TTL {session_id}: {e}")
+        logger.error("Failed to extend session TTL %s: %s", stable_hash(session_id, "session"), redact_text(e))
         return False
 
 def close_redis():

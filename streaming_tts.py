@@ -26,7 +26,7 @@ def _load_kokoro():
         _kokoro_loaded = True
         logger.info("Kokoro TTS loaded")
     except Exception:
-        logger.exception("Failed to load Kokoro — will fall back to OpenAI TTS")
+        logger.error("Failed to load Kokoro")
         _kokoro_loaded = True
     return _kokoro_pipeline
 
@@ -73,7 +73,7 @@ class KokoroTTS:
             if not self._first_byte_time and self._send_start_time:
                 self._first_byte_time = time()
                 ttfb = (self._first_byte_time - self._send_start_time) * 1000
-                logger.info(f"Kokoro TTS TTFB: {ttfb:.0f}ms")
+                logger.info("Kokoro TTS TTFB: %.0fms", ttfb)
 
             if self._on_audio_chunk:
                 await self._on_audio_chunk(audio_b64)
@@ -110,44 +110,47 @@ def _generate_audio(pipeline, text: str, voice: str, speed: float) -> Optional[s
         return base64.b64encode(buf.read()).decode("ascii")
 
     except Exception:
-        logger.exception("Kokoro audio generation failed")
+        logger.error("Kokoro audio generation failed")
         return None
 
 
-class FallbackTTS:
-
+class UnavailableTTS:
     def __init__(self, on_audio_chunk: Optional[Callable] = None):
         self._on_audio_chunk = on_audio_chunk
-        self._text_buffer: list[str] = []
 
     @property
     def available(self) -> bool:
-        return bool(settings.OPENAI_API_KEY)
+        return False
 
     async def connect(self):
-        return self.available
+        return False
 
     async def send_text_chunk(self, text: str):
-        self._text_buffer.append(text)
+        return None
 
     async def flush_and_close_stream(self):
-        full_text = "".join(self._text_buffer).strip()
-        self._text_buffer = []
-        if full_text:
-            from ai_services import generate_speech
-            audio_b64 = await generate_speech(full_text)
-            if audio_b64 and self._on_audio_chunk:
-                await self._on_audio_chunk(audio_b64)
+        return None
 
     async def interrupt(self):
-        self._text_buffer = []
-        logger.info("Fallback TTS interrupted")
+        logger.info("Kokoro TTS unavailable; interrupt ignored")
 
     async def close(self):
-        pass
+        return None
 
     def get_ttfb_ms(self):
         return None
+
+
+async def synthesize_text_to_base64(text: str) -> Optional[str]:
+    pipeline = _load_kokoro()
+    if not pipeline:
+        return None
+    voice = getattr(settings, "KOKORO_VOICE", "af_heart")
+    speed = getattr(settings, "KOKORO_SPEED", 1.0)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: _generate_audio(pipeline, text, voice, speed)
+    )
 
 
 def create_tts(on_audio_chunk=None):
@@ -155,5 +158,5 @@ def create_tts(on_audio_chunk=None):
     if kokoro.available:
         logger.info("Using Kokoro-82M for TTS")
         return kokoro
-    logger.info("Kokoro unavailable — falling back to OpenAI TTS")
-    return FallbackTTS(on_audio_chunk=on_audio_chunk)
+    logger.warning("Kokoro unavailable — TTS disabled")
+    return UnavailableTTS(on_audio_chunk=on_audio_chunk)

@@ -50,11 +50,7 @@ export function clearAuth(): void {
     localStorage.removeItem(USER_KEY)
 }
 
-/**
- * Returns empty headers intentionally — auth uses HttpOnly cookies via `credentials: 'include'`.
- * This function exists for backward compatibility with existing API call sites.
- * DO NOT add a Bearer token here; the cookie handles auth automatically.
- */
+
 export function getAuthHeaders(): Record<string, string> {
     return {}
 }

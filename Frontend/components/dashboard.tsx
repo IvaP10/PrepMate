@@ -453,6 +453,7 @@ function InterviewContent({
 }) {
   const router = useRouter()
   const [isStartingMock, setIsStartingMock] = useState(false)
+  const [isStartingTechnical, setIsStartingTechnical] = useState(false)
   const [profiles, setProfiles] = useState<JobProfile[]>([])
   const [selectedProfileId, setSelectedProfileId] = useState<number | null>(null)
   const [loadingProfiles, setLoadingProfiles] = useState(true)
@@ -541,6 +542,30 @@ function InterviewContent({
     }
   }
 
+  const startTechnicalInterview = async () => {
+    if (!selectedProfileId) {
+      toast.error("Create or select a job profile first.")
+      setShowProfileDialog(true)
+      return
+    }
+    setIsStartingTechnical(true)
+    try {
+      const response = await startInterviewSession("mock", "Technical Interview", selectedProfileId)
+      const interviewId = response.interview_id || response.session_id
+      router.push(`/interview/${interviewId}/technical`)
+    } catch (error: any) {
+      const msg = error?.message || "Failed to start technical interview."
+      if (msg.toLowerCase().includes("no interviews remaining") || msg.toLowerCase().includes("no credits")) {
+        toast.error("Your current plan cannot start another interview right now.")
+        setActiveNav("membership")
+      } else {
+        toast.error(msg)
+      }
+    } finally {
+      setIsStartingTechnical(false)
+    }
+  }
+
   return (
     <div className="flex-1 overflow-y-auto p-6 md:p-8 animate-fade-in-up">
       <div className="mb-6 rounded-xl border border-border/40 bg-card p-6 shadow-sm">
@@ -552,10 +577,16 @@ function InterviewContent({
               Profiles are saved once with role, company, and stack tags. You can switch the interview target with one tap.
             </p>
           </div>
-          <Button onClick={startMockInterview} disabled={isStartingMock || loadingProfiles} className="gap-2 rounded-lg px-6">
-            {isStartingMock ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-            {isStartingMock ? "Starting..." : "Start Mock Interview"}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={startMockInterview} disabled={isStartingMock || loadingProfiles} className="gap-2 rounded-lg px-6">
+              {isStartingMock ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              {isStartingMock ? "Starting..." : "Start Mock Interview"}
+            </Button>
+            <Button variant="outline" onClick={startTechnicalInterview} disabled={isStartingTechnical || loadingProfiles} className="gap-2 rounded-lg px-6">
+              {isStartingTechnical ? <Loader2 className="h-4 w-4 animate-spin" /> : <Code className="h-4 w-4" />}
+              {isStartingTechnical ? "Starting..." : "Technical Mode"}
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -1542,7 +1573,6 @@ function SettingsContent({
     }
   }
 
-  // Lazy-import the tab components to avoid bloating this file
   const [AccountTab, setAccountTab] = useState<any>(null)
   const [NotificationsTab, setNotificationsTab] = useState<any>(null)
   const [BillingTab, setBillingTab] = useState<any>(null)
@@ -1711,7 +1741,7 @@ function MembershipContent() {
         </div>
       </div>
 
-      {/* ── Billing Toggle ── */}
+      
       <div className="mb-6 flex items-center justify-center gap-3">
         <span className={`text-sm font-medium transition-colors ${!isAnnual ? "text-foreground" : "text-muted-foreground"}`}>Monthly</span>
         <button
@@ -1729,7 +1759,7 @@ function MembershipContent() {
 
       <div className="grid gap-4 lg:grid-cols-3">
 
-        {/* ─── Starter Column ─── */}
+        
         <div className="flex flex-col rounded-xl border border-border/40 bg-card p-6 shadow-sm">
           <div className="mb-5">
             <h3 className="text-lg font-semibold text-foreground">Starter</h3>
@@ -1762,7 +1792,7 @@ function MembershipContent() {
           </Button>
         </div>
 
-        {/* ─── Pro Column (Featured) ─── */}
+        
         <div className="flex flex-col rounded-xl border border-primary/40 bg-primary/5 ring-1 ring-primary/20 p-6 shadow-sm">
           <div className="mb-5 flex items-start justify-between gap-3">
             <div>
@@ -1792,7 +1822,7 @@ function MembershipContent() {
           </Button>
         </div>
 
-        {/* ─── Premium Column ─── */}
+        
         <div className="flex flex-col rounded-xl border border-border/40 bg-card p-6 shadow-sm">
           <div className="mb-5 flex items-start justify-between gap-3">
             <div>
@@ -1869,7 +1899,6 @@ function LogoutModal({
 }
 export function Dashboard({ onLogout, theme = "dark", onToggleTheme, onUploadResume, user, initialTab }: DashboardProps) {
   const [activeNav, _setActiveNav] = useState<ActiveNav>(() => {
-    // Priority: URL param > sessionStorage > default
     if (initialTab) return initialTab
     if (typeof window !== "undefined") {
       const stored = sessionStorage.getItem("dashboard_tab") as ActiveNav | null

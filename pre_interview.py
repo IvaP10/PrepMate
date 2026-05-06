@@ -2,18 +2,20 @@ from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status,
 from typing import Any
 import json
 import os
-import uuid
 import logging
 import re
 import asyncio
-
-from ai_services import _get_openai_client
+import tempfile
 
 from auth import get_current_user
 from database import get_db, transaction
 from resume_parser import parse_resume_structured
+from resume_rules import extract_rule_based_profile
 from profile_enrichment import enrich_profile_for_user
 from config import settings
+from llm_router import complete_json_sync
+from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
+from security_utils import redact_text, stable_hash
 
 router = APIRouter(prefix="/api/pre-interview", tags=["Pre-Interview"])
 logger = logging.getLogger("pre_interview")
@@ -28,13 +30,13 @@ UPLOAD_COOLDOWN_MINUTES = settings.UPLOAD_COOLDOWN_MINUTES
 AI_MAX_RETRIES = settings.AI_MAX_RETRIES
 AI_RETRY_DELAY_SECONDS = settings.AI_RETRY_DELAY_SECONDS
 
-ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx"}
+ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 
 async def _run_profile_enrichment(user_id: str, profile: dict[str, Any]) -> None:
     try:
         await enrich_profile_for_user(user_id, profile)
     except Exception:
-        logger.exception("Profile enrichment failed for user %s", user_id)
+        logger.error("Profile enrichment failed for %s", stable_hash(user_id, "user"))
 
 def schedule_profile_enrichment(user_id: str, profile: dict[str, Any]) -> None:
     asyncio.create_task(_run_profile_enrichment(user_id, profile))
@@ -293,46 +295,41 @@ Resume Text:
 
 
 async def extract_with_ai(resume_text: str) -> dict[str, Any]:
-    def _call_openai(prompt_text: str) -> str:
-        client = _get_openai_client()
-        response = client.chat.completions.create(
-            model=settings.OPENAI_RESUME_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert resume parser. Extract all structured data "
-                        "from the resume. Return only valid JSON — no markdown, no code blocks."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt_text,
-                },
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            max_completion_tokens=4096,
-        )
-        content = response.choices[0].message.content
-        return content.strip() if content else "{}"
-
-    prompt = EXTRACTION_PROMPT.format(resume_text=resume_text)
+    prompt = EXTRACTION_PROMPT.format(resume_text=data_block("resume_text", resume_text))
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are the low-confidence fallback for a deterministic resume parser. "
+                "Extract structured resume data only from the provided text. Return valid JSON only. "
+                f"{SYSTEM_DATA_BOUNDARY}"
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
 
     for attempt in range(AI_MAX_RETRIES + 1):
         try:
             loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, _call_openai, prompt)
-            parsed = json.loads(raw)
+            parsed = await loop.run_in_executor(
+                None,
+                lambda: complete_json_sync(
+                    messages,
+                    event_type="resume_ai_fallback",
+                    temperature=0.0,
+                    max_tokens=4096,
+                    metadata={"reason": "low_rule_confidence"},
+                ),
+            )
             return validate_resume_json(parsed)
 
         except HTTPException:
             raise
 
         except Exception as exc:
-            logger.error("AI extraction attempt %d failed: [%s] %s", attempt + 1, type(exc).__name__, exc)
+            logger.error("AI extraction attempt %d failed: [%s] %s", attempt + 1, type(exc).__name__, redact_text(exc))
             if attempt >= AI_MAX_RETRIES:
-                logger.error("All AI extraction attempts exhausted. Last error: [%s] %s", type(exc).__name__, exc)
+                logger.error("All AI extraction attempts exhausted. Last error: [%s] %s", type(exc).__name__, redact_text(exc))
                 raise HTTPException(
                     status.HTTP_500_INTERNAL_SERVER_ERROR,
                     "Failed to process resume. Please try again.",
@@ -340,6 +337,35 @@ async def extract_with_ai(resume_text: str) -> dict[str, Any]:
             await asyncio.sleep(AI_RETRY_DELAY_SECONDS * (2 ** attempt))
 
     raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to process resume with AI")
+
+
+def _merge_profile_data(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary or {})
+    for key, value in (fallback or {}).items():
+        if key == "confidence":
+            continue
+        if value in (None, "", [], {}):
+            continue
+        if not merged.get(key):
+            merged[key] = value
+        elif key in {"skills", "education", "experience", "projects", "languages", "certifications", "profile_sources"}:
+            existing = merged.get(key) if isinstance(merged.get(key), list) else []
+            incoming = value if isinstance(value, list) else []
+            combined = []
+            seen = set()
+            for item in existing + incoming:
+                marker = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item).lower()
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                combined.append(item)
+            merged[key] = combined
+    confidence = dict(primary.get("confidence") or {})
+    if fallback.get("confidence"):
+        confidence["ai_fallback"] = fallback["confidence"]
+    confidence["fallback_used"] = True
+    merged["confidence"] = confidence
+    return merged
 
 def check_rate_limit(user_id: str, conn: Any) -> None:
     cur = conn.cursor()
@@ -371,7 +397,7 @@ async def upload_resume(
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid file type. Allowed: PDF, DOC, DOCX")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid file type. Allowed: PDF, DOCX")
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE_BYTES:
@@ -381,8 +407,8 @@ async def upload_resume(
 
     try:
 
-        temp_path = f"/tmp/{uuid.uuid4()}_{file.filename}"
-        with open(temp_path, "wb") as out_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as out_file:
+            temp_path = out_file.name
             out_file.write(content)
 
         loop = asyncio.get_running_loop()
@@ -390,7 +416,7 @@ async def upload_resume(
             parsed_resume = await loop.run_in_executor(None, parse_resume_structured, temp_path)
             resume_text = parsed_resume.get("text", "")
         except Exception:
-            logger.exception("Resume parsing failed")
+            logger.error("Resume parsing failed")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to read resume. Ensure it's a valid PDF or DOCX.")
 
         contact = extract_contact_info(resume_text)
@@ -400,7 +426,19 @@ async def upload_resume(
         if len(redacted_text) > MAX_RESUME_TEXT_LENGTH:
             redacted_text = redacted_text[:MAX_RESUME_TEXT_LENGTH]
 
-        resume_json = await extract_with_ai(redacted_text)
+        resume_json = extract_rule_based_profile(
+            redacted_text,
+            links=parsed_resume.get("links", []),
+            parser_name=parsed_resume.get("parser", "resume_parser"),
+        )
+
+        confidence = (resume_json.get("confidence") or {}).get("overall", 0)
+        if confidence < settings.RESUME_AI_FALLBACK_CONFIDENCE:
+            logger.info("Rule resume confidence %.2f below threshold; using AI fallback", confidence)
+            fallback_profile = await extract_with_ai(redacted_text)
+            resume_json = _merge_profile_data(resume_json, fallback_profile)
+        else:
+            resume_json.setdefault("confidence", {})["fallback_used"] = False
 
         resume_json["email"] = contact["email"] or current_user.get("email")
         resume_json["phone"] = contact["phone"]
@@ -428,7 +466,7 @@ async def upload_resume(
     except HTTPException:
         raise
     except Exception:
-        logger.exception("Unexpected error during resume upload")
+        logger.error("Unexpected error during resume upload")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "An error occurred while processing your resume")
     finally:
         if temp_path and os.path.exists(temp_path):
@@ -487,7 +525,7 @@ async def confirm_profile(
                     (current_user["user_id"],),
                 )
 
-            logger.info("Profile confirmed for user %s", current_user["user_id"])
+            logger.info("Profile confirmed for %s", stable_hash(current_user["user_id"], "user"))
             schedule_profile_enrichment(current_user["user_id"], validated)
 
             return {
@@ -498,7 +536,7 @@ async def confirm_profile(
         except HTTPException:
             raise
         except Exception:
-            logger.exception("Failed to confirm profile")
+            logger.error("Failed to confirm profile")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to save profile")
         finally:
             cur.close()
@@ -571,7 +609,7 @@ async def submit_form(
         except HTTPException:
             raise
         except Exception:
-            logger.exception("Error in submit_form")
+            logger.error("Error in submit_form")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to save profile")
         finally:
             cur.close()
@@ -635,7 +673,7 @@ async def reset_profile(current_user: dict[str, Any] = Depends(get_current_user)
             return {"success": True, "message": "Profile reset. You can now upload a new resume."}
 
         except Exception:
-            logger.exception("Error in reset_profile")
+            logger.error("Error in reset_profile")
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to reset profile")
         finally:
             cur.close()

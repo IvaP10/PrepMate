@@ -1,9 +1,3 @@
-import logging
-from typing import Callable, Dict, Optional
-
-logger = logging.getLogger("avatar_engine")
-
-
 class AudioOnlyAvatar:
 
     @property
@@ -30,7 +24,3 @@ class AudioOnlyAvatar:
 
     async def close(self):
         pass
-
-
-def create_avatar(on_video_frame=None, on_audio_chunk=None):
-    return AudioOnlyAvatar()

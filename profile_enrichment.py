@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -23,9 +24,12 @@ def _github_username(url: Optional[str]) -> Optional[str]:
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Any:
+    parsed = urlparse(url or "")
+    if parsed.scheme != "https" or parsed.netloc != "api.github.com":
+        return None
     async with session.get(url, headers={"Accept": "application/vnd.github+json"}) as response:
         if response.status >= 400:
-            logger.warning("GitHub enrichment request failed: %s %s", response.status, url)
+            logger.warning("GitHub enrichment request failed: %s", response.status)
             return None
         return await response.json()
 
@@ -110,4 +114,3 @@ async def enrich_profile_for_user(user_id: str, profile: Dict[str, Any]) -> None
                 )
         finally:
             cur.close()
-

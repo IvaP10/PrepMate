@@ -68,7 +68,7 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
           </p>
         </div>
 
-        {/* ── Billing Toggle ── */}
+        
         <div className="mx-auto mb-10 flex items-center justify-center gap-3">
           <span className={`text-sm font-medium transition-colors ${!isAnnual ? "text-foreground" : "text-muted-foreground"}`}>
             Monthly
@@ -96,10 +96,10 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
           </span>
         </div>
 
-        {/* ── Cards Grid ── */}
+        
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
 
-          {/* ─── Column 1 — Starter ─── */}
+          
           <div className="group flex flex-col overflow-hidden rounded-xl border border-border bg-card transition-all duration-500 ease-out hover:-translate-y-1.5 hover:border-accent-indigo/30 hover:shadow-[0_8px_30px_-12px_rgba(37,99,235,0.15)]">
             <div className="flex flex-1 flex-col p-8">
               <div>
@@ -116,7 +116,7 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
                 Enough practice to build real confidence
               </p>
 
-              {/* Included features */}
+              
               <div className="mt-8 flex flex-col gap-3">
                 {starterFeatures.map((f) => (
                   <div key={f} className="flex items-center gap-3">
@@ -147,7 +147,7 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
             </div>
           </div>
 
-          {/* ─── Column 2 — Pro (Featured) ─── */}
+          
           <div className="group flex flex-col overflow-hidden rounded-xl border border-accent-indigo/40 ring-1 ring-accent-indigo/20 bg-card transition-all duration-500 ease-out hover:-translate-y-1.5 hover:border-accent-indigo/50 hover:shadow-[0_8px_30px_-12px_rgba(37,99,235,0.2)]">
             <div className="flex flex-1 flex-col p-8">
               <div className="flex items-start justify-between gap-3">
@@ -197,7 +197,7 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
             </div>
           </div>
 
-          {/* ─── Column 3 — Premium ─── */}
+          
           <div className="group flex flex-col overflow-hidden rounded-xl border border-accent-indigo/25 bg-card transition-all duration-500 ease-out hover:-translate-y-1.5 hover:border-accent-indigo/40 hover:shadow-[0_8px_30px_-12px_rgba(37,99,235,0.15)]">
             <div className="flex flex-1 flex-col p-8">
               <div className="flex items-start justify-between gap-3">

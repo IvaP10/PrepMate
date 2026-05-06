@@ -1,4 +1,4 @@
-import random
+import hashlib
 from typing import Dict, List, Optional
 from strictness_config import get_strictness_config
 
@@ -63,24 +63,28 @@ ROLE_TITLES = {
 
 def generate_persona(strictness_level: str, job_title: str, company_name: Optional[str] = None) -> Dict:
     config = get_strictness_config(strictness_level)
-    interviewer_name = random.choice(INTERVIEWER_NAMES.get(strictness_level, INTERVIEWER_NAMES["medium"]))
-    role_title = random.choice(ROLE_TITLES.get(strictness_level, ROLE_TITLES["medium"]))
-    company_type = company_name if company_name else random.choice(COMPANY_TYPES)
-    persona = {
+    seed = (strictness_level, job_title, company_name or "")
+    interviewer_name = _pick(INTERVIEWER_NAMES.get(strictness_level, INTERVIEWER_NAMES["medium"]), "name", *seed)
+    role_title = _pick(ROLE_TITLES.get(strictness_level, ROLE_TITLES["medium"]), "role", *seed)
+    company = company_name or _pick(COMPANY_TYPES, "company", *seed)
+    return {
         "name": interviewer_name,
         "role": role_title,
-        "company": company_type,
+        "company": company,
         "strictness_level": strictness_level,
         "personality_traits": config["personality_traits"],
         "interview_style": config["interview_style"],
         "job_title": job_title,
-        "background": generate_background(strictness_level, role_title),
+        "background": generate_background(strictness_level, role_title, job_title, company),
         "expectations": generate_expectations(strictness_level),
         "communication_style": generate_communication_style(strictness_level)
     }
-    return persona
 
-def generate_background(strictness_level: str, role_title: str) -> str:
+def _pick(options: List[str], *parts: str) -> str:
+    idx = int(hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest(), 16) % len(options)
+    return options[idx]
+
+def generate_background(strictness_level: str, role_title: str, job_title: str = "", company: str = "") -> str:
     backgrounds = {
         "easy": [
             f"I'm a {role_title} with 3-5 years of experience in recruitment and talent acquisition.",
@@ -103,7 +107,7 @@ def generate_background(strictness_level: str, role_title: str) -> str:
             f"I'm a {role_title} with a reputation for the most rigorous technical interviews in the industry."
         ]
     }
-    return random.choice(backgrounds.get(strictness_level, backgrounds["medium"]))
+    return _pick(backgrounds.get(strictness_level, backgrounds["medium"]), "background", strictness_level, role_title, job_title, company)
 
 def generate_expectations(strictness_level: str) -> List[str]:
     expectations = {

@@ -83,7 +83,7 @@ export function AccountTab({ user, onAccountDeleted }: { user?: AuthUser | null;
 
   return (
     <div className="space-y-6">
-      {/* Avatar */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <h3 className="mb-4 text-sm font-semibold text-foreground">Profile Photo</h3>
         <div className="flex items-center gap-5">
@@ -107,7 +107,7 @@ export function AccountTab({ user, onAccountDeleted }: { user?: AuthUser | null;
         </div>
       </div>
 
-      {/* Name & Email */}
+      
       <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
         <h3 className="mb-4 text-sm font-semibold text-foreground">Account Information</h3>
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -126,7 +126,7 @@ export function AccountTab({ user, onAccountDeleted }: { user?: AuthUser | null;
         </Button>
       </div>
 
-      {/* Password */}
+      
       {!isGoogle && (
         <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
           <div className="mb-1 flex items-center gap-2">
@@ -165,7 +165,7 @@ export function AccountTab({ user, onAccountDeleted }: { user?: AuthUser | null;
         </div>
       )}
 
-      {/* Danger Zone */}
+      
       <div className="rounded-xl border border-red-500/20 bg-red-500/5 p-6">
         <h3 className="mb-1 text-sm font-semibold text-red-400">Danger Zone</h3>
         <p className="mb-4 text-xs text-muted-foreground">This action is irreversible. All your data will be permanently deleted.</p>

@@ -3,46 +3,46 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* ===== LIGHT MODE (default) - Warm Off-White ===== */
+
 :root {
-  /* Core backgrounds - warm off-white with subtle cream tint */
+  
   --background: #FAFAF8;
   --background-secondary: #F5F5F2;
   --foreground: #1A1A1A;
 
-  /* Card/Surface - soft warm white cards */
+  
   --card: #FFFFFF;
   --card-foreground: #1A1A1A;
 
   --popover: #FFFFFF;
   --popover-foreground: #1A1A1A;
 
-  /* Primary - refined blue */
+  
   --primary: #2563EB;
   --primary-foreground: #FFFFFF;
 
-  /* Secondary - warm light gray surfaces */
+  
   --secondary: #F0F0EC;
   --secondary-foreground: #404040;
 
-  /* Muted - warm grays */
+  
   --muted: #F0F0EC;
   --muted-foreground: #6B6B6B;
 
-  /* Accent */
+  
   --accent: #EEF4FF;
   --accent-foreground: #2563EB;
 
-  /* Destructive */
+  
   --destructive: #dc2626;
   --destructive-foreground: #FFFFFF;
 
-  /* Borders - warm subtle borders */
+  
   --border: #E8E8E4;
   --input: #E8E8E4;
   --ring: #2563EB;
 
-  /* Charts */
+  
   --chart-1: #2563EB;
   --chart-2: #3B82F6;
   --chart-3: #60A5FA;
@@ -51,7 +51,7 @@
 
   --radius: 0.75rem;
 
-  /* Sidebar - warm off-white */
+  
   --sidebar: #FAFAF8;
   --sidebar-foreground: #1A1A1A;
   --sidebar-primary: #2563EB;
@@ -61,7 +61,7 @@
   --sidebar-border: #E8E8E4;
   --sidebar-ring: #2563EB;
 
-  /* Decorative accent colors */
+  
   --accent-indigo: #2563EB;
   --accent-violet: #3B82F6;
   --accent-rose: #ef4444;
@@ -69,46 +69,46 @@
   --accent-amber: #d97706;
 }
 
-/* ===== DARK MODE - Softer Premium Editorial Palette ===== */
+
 .dark {
-  /* Core backgrounds - softer charcoal instead of pure black */
+  
   --background: #0F0F0F;
   --background-secondary: #141414;
   --foreground: #E8E8E8;
 
-  /* Card/Surface - subtle elevation without harsh borders */
+  
   --card: #1A1A1A;
   --card-foreground: #E8E8E8;
 
   --popover: #1C1C1C;
   --popover-foreground: #E8E8E8;
 
-  /* Primary CTA - off-white for softer contrast */
+  
   --primary: #F0F0F2;
   --primary-foreground: #0F0F0F;
 
-  /* Secondary - subtle dark surface */
+  
   --secondary: #1F1F1F;
   --secondary-foreground: #CFCFCF;
 
-  /* Muted - refined grays */
+  
   --muted: #1F1F1F;
   --muted-foreground: #8A8A8A;
 
-  /* Accent - subtle elevated surface */
+  
   --accent: #1F1F1F;
   --accent-foreground: #E8E8E8;
 
-  /* Destructive */
+  
   --destructive: #ef4444;
   --destructive-foreground: #E8E8E8;
 
-  /* Borders - very subtle, rely on negative space */
+  
   --border: #2A2A2A;
   --input: #2A2A2A;
   --ring: #F0F0F2;
 
-  /* Charts - teal scale for data */
+  
   --chart-1: #2DD4BF;
   --chart-2: #5EEAD4;
   --chart-3: #99F6E4;
@@ -117,7 +117,7 @@
 
   --radius: 0.75rem;
 
-  /* Sidebar */
+  
   --sidebar: #121212;
   --sidebar-foreground: #E8E8E8;
   --sidebar-primary: #F0F0F2;
@@ -127,7 +127,7 @@
   --sidebar-border: #2A2A2A;
   --sidebar-ring: #F0F0F2;
 
-  /* Decorative accent colors - sophisticated deep teal */
+  
   --accent-indigo: #2DD4BF;
   --accent-violet: #5EEAD4;
   --accent-rose: #f87171;
@@ -193,9 +193,9 @@
   }
 }
 
-/* ===== Global Micro-Animations ===== */
 
-/* Subtle press effect on all interactive elements */
+
+
 button, a, [role="button"], [role="tab"], [role="listitem"] {
   transition: transform 0.15s cubic-bezier(0.2, 0, 0, 1), 
               box-shadow 0.2s ease,
@@ -209,7 +209,7 @@ a:active,
   transform: scale(0.97);
 }
 
-/* Card hover lift */
+
 .hover-lift {
   transition: transform 0.3s cubic-bezier(0.2, 0, 0, 1), 
               box-shadow 0.3s ease;
@@ -219,7 +219,7 @@ a:active,
   box-shadow: 0 8px 25px -8px rgba(0, 0, 0, 0.12);
 }
 
-/* Smooth page section fades */
+
 section {
   animation: sectionEntry 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
@@ -229,7 +229,7 @@ section {
   to { opacity: 1; }
 }
 
-/* Nav link underline animation */
+
 .nav-link-animated {
   position: relative;
 }
@@ -247,7 +247,7 @@ section {
   width: 100%;
 }
 
-/* Smooth light/dark mode transition on all elements */
+
 html.theme-transition,
 html.theme-transition *,
 html.theme-transition *::before,
@@ -265,7 +265,7 @@ html {
   scroll-behavior: smooth;
 }
 
-/* Custom range slider */
+
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
@@ -296,7 +296,7 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 0 0 2px var(--accent-indigo);
 }
 
-/* ===== Text Shimmer / Gradient Animation ===== */
+
 @keyframes text-shimmer {
   0% {
     background-position: -200% center;
@@ -368,13 +368,13 @@ input[type="range"]::-moz-range-thumb {
   animation: text-reveal 0.8s ease-out 0.45s forwards;
 }
 
-/* ===== Orbital Dot Animation ===== */
+
 @keyframes orbitDot {
   0% { transform: rotate(0deg) translateX(80px) rotate(0deg); }
   100% { transform: rotate(360deg) translateX(80px) rotate(-360deg); }
 }
 
-/* ===== Section Scroll Reveal ===== */
+
 .section-reveal {
   opacity: 0;
   transform: translateY(40px);
@@ -387,7 +387,7 @@ input[type="range"]::-moz-range-thumb {
   transform: translateY(0);
 }
 
-/* Stagger children */
+
 .section-reveal-stagger > * {
   opacity: 0;
   transform: translateY(20px);
@@ -401,7 +401,7 @@ input[type="range"]::-moz-range-thumb {
 .section-reveal-stagger.revealed > *:nth-child(5) { opacity: 1; transform: translateY(0); transition-delay: 400ms; }
 .section-reveal-stagger.revealed > *:nth-child(6) { opacity: 1; transform: translateY(0); transition-delay: 500ms; }
 
-/* ===== Scroll Progress Bar ===== */
+
 .scroll-progress {
   position: fixed;
   top: 0;
@@ -412,7 +412,7 @@ input[type="range"]::-moz-range-thumb {
   transition: width 50ms linear;
 }
 
-/* ===== Custom Page Transitions ===== */
+
 @keyframes fade-in-up {
   0% {
     opacity: 0;
@@ -429,9 +429,9 @@ input[type="range"]::-moz-range-thumb {
   animation: fade-in-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-/* ===== Premium ElevenLabs-Style Animations ===== */
 
-/* Blur Entrance for Typography */
+
+
 @keyframes blur-in {
   0% {
     opacity: 0;
@@ -451,7 +451,7 @@ input[type="range"]::-moz-range-thumb {
   animation: blur-in 1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
 }
 
-/* Floating Elements */
+
 @keyframes float {
 
   0%,
@@ -468,7 +468,7 @@ input[type="range"]::-moz-range-thumb {
   animation: float 6s ease-in-out infinite;
 }
 
-/* Gentle Glowing Pulse */
+
 @keyframes glow-pulse {
 
   0%,
@@ -487,7 +487,7 @@ input[type="range"]::-moz-range-thumb {
   animation: glow-pulse 4s ease-in-out infinite;
 }
 
-/* Cascading Delays */
+
 .delay-100 {
   animation-delay: 100ms !important;
 }
@@ -508,7 +508,7 @@ input[type="range"]::-moz-range-thumb {
   animation-delay: 500ms !important;
 }
 
-/* Interactive Hover Borders Reveal (Pseudo-element approach) */
+
 .hover-border-reveal {
   position: relative;
 }
@@ -532,7 +532,7 @@ input[type="range"]::-moz-range-thumb {
   opacity: 1;
 }
 
-/* ===== Interview Session Design System ===== */
+
 .dark {
   --iv-surface: #0e0e0e;
   --iv-surface-container-low: #131313;
@@ -554,14 +554,14 @@ input[type="range"]::-moz-range-thumb {
   --iv-on-error: #490106;
 }
 
-/* Interview glass panel */
+
 .iv-glass {
   background: rgba(31, 32, 32, 0.4);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
 }
 
-/* Interview waveform bar */
+
 .iv-waveform-bar {
   border-radius: 9999px;
   transition: height 0.3s ease;
@@ -576,21 +576,21 @@ input[type="range"]::-moz-range-thumb {
   animation: iv-waveform-pulse 1.5s ease-in-out infinite;
 }
 
-/* Interview scrollbar hide */
+
 .iv-hide-scrollbar::-webkit-scrollbar { display: none; }
 .iv-hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
-/* Interview thin scrollbar */
+
 .iv-thin-scrollbar::-webkit-scrollbar { width: 4px; }
 .iv-thin-scrollbar::-webkit-scrollbar-track { background: var(--iv-surface); }
 .iv-thin-scrollbar::-webkit-scrollbar-thumb { background: var(--iv-outline-variant); border-radius: 10px; }
 
-/* Interview video gradient overlay */
+
 .iv-video-gradient {
   background: linear-gradient(0deg, rgba(14,14,14,0.8) 0%, rgba(14,14,14,0) 40%);
 }
 
-/* Interview background texture */
+
 .iv-bg-glow::before {
   content: '';
   position: fixed;
@@ -602,4 +602,3 @@ input[type="range"]::-moz-range-thumb {
     radial-gradient(circle at 90% 90%, rgba(0, 68, 61, 0.05) 0%, transparent 50%);
 }
 
-/* Resume parsing step animations - removed glowing variants */

@@ -67,7 +67,6 @@ function roundRect(
   ctx.closePath()
 }
 
-// ── Entities stored outside the effect so they survive theme changes ──
 
 interface CardEntity {
   text: string; w: number; h: number
@@ -81,7 +80,6 @@ interface IconEntity {
 }
 
 function createCard(W: number, H: number, init: boolean, existing?: CardEntity[]): CardEntity {
-  // Pick a question not already shown by any existing card
   const usedTexts = new Set(existing?.map(c => c.text) ?? [])
   let text: string
   const available = QUESTIONS.filter(q => !usedTexts.has(q))
@@ -93,7 +91,6 @@ function createCard(W: number, H: number, init: boolean, existing?: CardEntity[]
   let x: number, y: number
   let attempts = 0
 
-  // Place with collision avoidance
   do {
     x = init ? Math.random() * W : -w - 20
     y = init ? (Math.random() * (H - 60)) + 30 : (Math.random() * (H - 60)) + 30
@@ -135,10 +132,8 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
   const themeRef = useRef(theme)
   const entitiesRef = useRef<{ cards: CardEntity[]; icons: IconEntity[] } | null>(null)
 
-  // Keep theme ref in sync — NO effect dependency on theme
   themeRef.current = theme
 
-  // Single effect that runs once — reads theme from ref
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -158,7 +153,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
     }
     window.addEventListener("resize", resize)
 
-    // ── Create entities only once ──
     if (!entitiesRef.current) {
       const cards: CardEntity[] = []
       for (let i = 0; i < 18; i++) {
@@ -171,7 +165,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
     const { cards, icons } = entitiesRef.current
     const CONNECT_DIST = 180
 
-    // ── Helper: get theme-aware colors (read from ref each frame) ──
     function getColors() {
       const dark = themeRef.current === "dark"
       return {
@@ -187,7 +180,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       }
     }
 
-    // ── Card update with soft repulsion ──
     function updateCards() {
       for (let i = 0; i < cards.length; i++) {
         const c = cards[i]
@@ -195,14 +187,12 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
         c.x += c.vx
         c.y += c.vy
 
-        // Soft repulsion from other cards
         for (let j = 0; j < cards.length; j++) {
           if (i === j) continue
           const other = cards[j]
           const overlapX = c.x < other.x + other.w + 6 && c.x + c.w + 6 > other.x
           const overlapY = c.y < other.y + other.h + 6 && c.y + c.h + 6 > other.y
           if (overlapX && overlapY) {
-            // Push apart vertically
             const myCenter = c.y + c.h / 2
             const otherCenter = other.y + other.h / 2
             if (myCenter < otherCenter) {
@@ -213,10 +203,8 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
           }
         }
 
-        // Clamp vy to prevent runaway
         c.vy = Math.max(-0.3, Math.min(0.3, c.vy))
 
-        // Soft vertical bounds
         if (c.y < 10) c.vy += 0.01
         if (c.y + c.h > H - 10) c.vy -= 0.01
 
@@ -227,7 +215,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       }
     }
 
-    // ── Icon update ──
     function updateIcons() {
       icons.forEach((ic) => {
         ic.x += ic.vx
@@ -239,7 +226,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       })
     }
 
-    // ── Draw connections ──
     function drawConnections(colors: ReturnType<typeof getColors>) {
       const nodes = [
         ...cards.map((c) => ({ x: c.x + c.w / 2, y: c.y + c.h / 2, alpha: c.alpha })),
@@ -263,7 +249,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       }
     }
 
-    // ── Draw cards ──
     function drawCards(colors: ReturnType<typeof getColors>) {
       cards.forEach((c) => {
         ctx!.save()
@@ -282,7 +267,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       })
     }
 
-    // ── Draw icons ──
     function drawIcons(colors: ReturnType<typeof getColors>) {
       icons.forEach((ic) => {
         ctx!.save()
@@ -296,7 +280,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       })
     }
 
-    // ── Draw checkmarks ──
     function drawCheckmarks(colors: ReturnType<typeof getColors>) {
       const positions = [
         { x: W * 0.08, y: H * 0.18 },
@@ -323,7 +306,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       })
     }
 
-    // ── Draw speech bubbles ──
     function drawSpeechBubbles(colors: ReturnType<typeof getColors>) {
       const bs = [
         { x: W * 0.05, y: H * 0.42, w: 60, h: 28 },
@@ -340,7 +322,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
         roundRect(ctx!, b.x, b.y, b.w, b.h, 8)
         ctx!.fill()
         ctx!.stroke()
-        // tail
         ctx!.beginPath()
         ctx!.moveTo(b.x + 14, b.y + b.h)
         ctx!.lineTo(b.x + 8, b.y + b.h + 8)
@@ -352,7 +333,6 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       })
     }
 
-    // ── Animation loop ──
     function animate() {
       ctx!.clearRect(0, 0, W, H)
       const colors = getColors()
@@ -374,26 +354,25 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
       cancelAnimationFrame(animRef.current)
       window.removeEventListener("resize", resize)
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []) // Run once — theme read from ref
+  }, [])
 
   const isDark = theme === "dark"
 
   return (
     <>
-      {/* Base background color */}
+      
       <div
         className="pointer-events-none fixed inset-0 -z-[11] transition-colors duration-500"
         aria-hidden="true"
         style={{ background: isDark ? "#0F0F0F" : "#FAFAF8" }}
       />
-      {/* Animation canvas */}
+      
       <canvas
         ref={canvasRef}
         className="pointer-events-none fixed inset-0 -z-10"
         aria-hidden="true"
       />
-      {/* Subtle noise texture */}
+      
       <div
         className="pointer-events-none fixed inset-0 -z-[9] opacity-[0.015]"
         aria-hidden="true"

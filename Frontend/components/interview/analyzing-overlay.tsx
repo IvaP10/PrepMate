@@ -1,5 +1,6 @@
 "use client"
 import { useEffect, useState } from "react"
+import { API_CONFIG } from "@/lib/config"
 interface AnalyzingOverlayProps {
   isVisible: boolean
   interviewId?: string
@@ -47,7 +48,7 @@ export function AnalyzingOverlay({
     const pollInterval = setInterval(async () => {
       try {
         const resp = await fetch(
-          `${process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api"}/interview/status/${interviewId}`,
+          `${API_CONFIG.BASE_URL}/interview/status/${interviewId}`,
           {
             credentials: "include",
           }

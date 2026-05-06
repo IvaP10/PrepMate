@@ -160,7 +160,6 @@ function ParsingStep({
   const [completedSteps, setCompletedSteps] = useState<number[]>([])
   const [progress, setProgress] = useState(0)
 
-  // When real data arrives, instantly complete everything and exit
   useEffect(() => {
     if (!parsedData) return
     setProgress(100)
@@ -170,7 +169,6 @@ function ParsingStep({
     return () => clearTimeout(t)
   }, [parsedData]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Fake progress animation while waiting
   useEffect(() => {
     const progressInterval = setInterval(() => {
       setProgress((prev) => {
@@ -296,7 +294,6 @@ export function ResumeModal({ open, onClose }: ResumeModalProps) {
   }
   const handleParsingComplete = () => {
     if (!parsedData) return
-    // Set context data and flag so dashboard opens directly in edit mode
     setContextResumeData(parsedData)
     setJustParsed(true)
     toast.success("Resume parsed!", {

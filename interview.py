@@ -19,10 +19,11 @@ from ai_services import (
     generate_speech,
     generate_coaching_hint
 )
-from body_language import analyze_frame
+from body_language import normalize_client_metrics
 from persona_generator import generate_persona, generate_opening_statement
 import strictness_config
 from report_generator import build_report_v2
+from coach import create_next_cycle_exercises
 from knowledge_map import (
     build_knowledge_map,
     get_next_battleground,
@@ -32,6 +33,7 @@ from knowledge_map import (
     get_transition_to_next,
     generate_contextual_followup
 )
+from security_utils import redact_text, stable_hash
 
 router = APIRouter(tags=["Interview"])
 logger = logging.getLogger("ai_interviewer.interview")
@@ -144,7 +146,7 @@ def _build_safe_report(interview_meta: Dict[str, Any], turns: List[Dict[str, Any
     try:
         return build_report_v2(interview_meta, turns, profile_context=profile_context)
     except Exception:
-        logger.exception("Structured report build failed for interview_id=%s", interview_meta.get("interview_id"))
+        logger.error("Structured report build failed for %s", stable_hash(interview_meta.get("interview_id"), "interview"))
         question_count = len(turns)
         avg_score = round(sum(float(turn.get("score") or 0) for turn in turns) / question_count, 1) if question_count else 0.0
         weakest_turn = min(turns, key=lambda turn: float(turn.get("score") or 0), default={})
@@ -402,6 +404,27 @@ async def start_interview(
                         detail=f"Starter cooldown active. You can start another mock in about {hours_left} hour(s), or upgrade to Pro for no cooldown."
                     )
 
+        if plan_type == "free" and not is_unlimited:
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM Interviews
+                WHERE user_id = %s
+                  AND created_at >= NOW()::date
+                """,
+                (current_user["user_id"],)
+            )
+            today_count_row = cursor.fetchone()
+            today_count = today_count_row[0] if today_count_row else 0
+            if today_count >= settings.FREE_INTERVIEW_DAILY_CAP:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=(
+                        f"Daily free interview cap reached ({settings.FREE_INTERVIEW_DAILY_CAP}/day). "
+                        "Try again tomorrow or upgrade your plan."
+                    )
+                )
+
         if not is_unlimited:
             cursor.execute(
                 """
@@ -483,6 +506,12 @@ async def start_interview(
         interview_id = str(uuid.uuid4())
         session_id = str(uuid.uuid4())
 
+        is_technical_mode = request.interview_type.strip().lower() in {
+            "technical",
+            "technical interview",
+            "technical mode",
+        }
+
         interview_settings = {
             "mode": request.interview_mode,
             "interview_type": request.interview_type,
@@ -493,7 +522,9 @@ async def start_interview(
             "hints_enabled": request.interview_mode == "practice",
             "immediate_feedback": request.interview_mode == "practice",
             "time_limit_per_question": None if request.interview_mode == "practice" else 300,
-            "nonverbal_analysis": True
+            "nonverbal_analysis": "browser_mediapipe",
+            "technical_mode": is_technical_mode,
+            "technical_rounds": ["dsa", "system_design", "debugging"] if is_technical_mode else []
         }
 
         cursor.execute(
@@ -527,8 +558,10 @@ async def start_interview(
         connection.commit()
 
         logger.info(
-            f"{request.interview_mode.upper()} interview started: {interview_id} — "
-            f"interviews_remaining: {'unlimited' if is_unlimited else interviews_remaining}"
+            "%s interview started: %s, interviews_remaining=%s",
+            request.interview_mode.upper(),
+            stable_hash(interview_id, "interview"),
+            "unlimited" if is_unlimited else interviews_remaining,
         )
 
         return InterviewResponse(**{
@@ -546,7 +579,7 @@ async def start_interview(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to start interview")
+        logger.error("Failed to start interview")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to start interview. Please try again."
@@ -575,7 +608,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
 
     try:
         await websocket.accept()
-        logger.info(f"Video WebSocket connected: user_id={user_id}")
+        logger.info("Video WebSocket connected: %s", stable_hash(user_id, "user"))
 
         interview_id: Optional[str] = None
         interview_mode: Optional[str] = None
@@ -600,7 +633,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
             try:
                 await websocket.send_json(data)
             except Exception as e:
-                logger.error(f"Failed to send WS message: {e}")
+                logger.error("Failed to send WS message: %s", redact_text(e))
 
         def get_topic_number(battleground_id: Any) -> int:
             if not knowledge_map:
@@ -682,6 +715,16 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 ),
                 commit=True
             )
+
+            try:
+                await create_next_cycle_exercises(
+                    user_id=user_id,
+                    interview_id=interview_id,
+                    turns=turns,
+                    profile_context=report_profile_context,
+                )
+            except Exception:
+                logger.error("Failed to create adaptive coaching exercises for %s", stable_hash(interview_id, "interview"))
 
             payload = {
                 "type": "interview_complete",
@@ -796,7 +839,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             interview_mode=interview_mode or "practice"
                         )
                     except Exception as e:
-                        logger.error(f"Coaching hint generation failed: {e}")
+                        logger.error("Coaching hint generation failed: %s", redact_text(e))
                         coaching_hint = ""
 
                 await asyncio.to_thread(
@@ -1121,8 +1164,8 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     await websocket.send_json({
                         "type": "pipeline_ready",
                         "pipeline_mode": "legacy",
-                        "stt_connected": bool(settings.OPENAI_API_KEY),
-                        "tts_connected": bool(settings.OPENAI_API_KEY),
+                        "stt_connected": bool(settings.GROQ_API_KEY),
+                        "tts_connected": True,
                         "avatar_connected": False,
                         "avatar_session": None,
                     })
@@ -1157,26 +1200,51 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     await process_candidate_response(transcribed_text)
 
                 elif msg_type == "video_frame":
-                    server_frame_counter += 1
-                    if server_frame_counter % 5 != 0:
-                        continue
+                    continue
 
-                    frame_data = message.get("frame")
-                    analysis = await analyze_frame(
-                        frame_data,
-                        server_frame_counter,
-                        interview_mode or "mock"
+                elif msg_type == "body_language_metrics":
+                    if not interview_id:
+                        continue
+                    analysis = normalize_client_metrics(
+                        message.get("metrics") or {},
+                        interview_mode or "mock",
                     )
                     nonverbal_data.append(analysis)
-
+                    await asyncio.to_thread(
+                        _db_execute,
+                        """
+                        INSERT INTO ClientBodyLanguageMetrics (interview_id, user_id, payload)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (interview_id, user_id, json.dumps(analysis)),
+                        commit=True,
+                    )
                     await websocket.send_json({
                         "type": "body_language",
                         "confidence_score": analysis.get("confidence", 0),
-                        "emotion": analysis.get("emotion", "neutral"),
+                        "emotion": analysis.get("emotion", "not_tracked"),
                         "eye_contact": analysis.get("eye_contact", False),
                         "posture": analysis.get("posture", "unknown"),
-                        "facial_expression": analysis.get("facial_expression", "neutral")
+                        "analysis_method": analysis.get("analysis_method"),
                     })
+
+                elif msg_type == "anti_cheat_event":
+                    if not interview_id:
+                        continue
+                    await asyncio.to_thread(
+                        _db_execute,
+                        """
+                        INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (
+                            interview_id,
+                            user_id,
+                            str(message.get("event_type") or "unknown")[:50],
+                            json.dumps(message.get("payload") or {}),
+                        ),
+                        commit=True,
+                    )
 
                 elif msg_type == "response_complete":
                     await process_candidate_response(message.get("response", ""))
@@ -1205,16 +1273,16 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     "message": "Invalid message format"
                 })
             except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
+                logger.error("Error processing message: %s", redact_text(e))
                 await websocket.send_json({
                     "type": "error",
                     "message": "An error occurred processing your request"
                 })
 
     except WebSocketDisconnect:
-        logger.info(f"Video WebSocket disconnected: user_id={user_id}")
+        logger.info("Video WebSocket disconnected: %s", stable_hash(user_id, "user"))
     except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
+        logger.error("WebSocket error: %s", redact_text(e))
     finally:
         if pipeline:
             await pipeline.shutdown()
@@ -1417,7 +1485,7 @@ async def cancel_interview(
         raise
     except Exception:
         connection.rollback()
-        logger.exception("Failed to cancel interview")
+        logger.error("Failed to cancel interview")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to cancel interview"

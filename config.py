@@ -1,6 +1,7 @@
 import os
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger("config")
 
@@ -8,6 +9,8 @@ PLACEHOLDER_PREFIXES = ("change_this", "your_secret", "replace_me", "xxx")
 
 class Settings:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
     PG_HOST: str = os.getenv("PG_HOST", "localhost")
     PG_DBNAME: str = os.getenv("PG_DBNAME", "ai_interviewer")
@@ -27,10 +30,6 @@ class Settings:
     SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
     SMTP_HOST: str = os.getenv("SMTP_HOST", "smtp.gmail.com")
     SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
-
-    STRIPE_SECRET_KEY: Optional[str] = os.getenv("STRIPE_SECRET_KEY")
-    STRIPE_PUBLISHABLE_KEY: Optional[str] = os.getenv("STRIPE_PUBLISHABLE_KEY")
-    STRIPE_WEBHOOK_SECRET: Optional[str] = os.getenv("STRIPE_WEBHOOK_SECRET")
 
     RAZORPAY_KEY_ID: Optional[str] = os.getenv("RAZORPAY_KEY_ID")
     RAZORPAY_KEY_SECRET: Optional[str] = os.getenv("RAZORPAY_KEY_SECRET")
@@ -52,13 +51,12 @@ class Settings:
     KOKORO_VOICE: str = os.getenv("KOKORO_VOICE", "af_heart")
     KOKORO_SPEED: float = float(os.getenv("KOKORO_SPEED", "1.0"))
 
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    GROQ_CHAT_MODEL: str = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
+    GROQ_WHISPER_MODEL: str = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
     OPENAI_CHAT_MODEL: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
     OPENAI_RESUME_MODEL: str = os.getenv("OPENAI_RESUME_MODEL", "gpt-4o-mini")
-    OPENAI_WHISPER_MODEL: str = os.getenv("OPENAI_WHISPER_MODEL", "gpt-4o-mini-transcribe")
-    OPENAI_TTS_MODEL: str = os.getenv("OPENAI_TTS_MODEL", "tts-1")
-    OPENAI_TTS_VOICE: str = os.getenv("OPENAI_TTS_VOICE", "alloy")
-    STT_PROVIDER: str = os.getenv("STT_PROVIDER", "openai")
-    LOCAL_STT_MODEL: str = os.getenv("LOCAL_STT_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
+    STT_PROVIDER: str = os.getenv("STT_PROVIDER", "groq")
 
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
@@ -78,7 +76,18 @@ class Settings:
 
     ENCRYPTION_SALT: str = os.getenv("ENCRYPTION_SALT", "interai-field-encryption-v1")
 
-    FREE_CREDITS_ON_SIGNUP: int = int(os.getenv("FREE_CREDITS_ON_SIGNUP", "1"))
+    FREE_CREDITS_ON_SIGNUP: int = int(os.getenv("FREE_CREDITS_ON_SIGNUP", "3"))
+    FREE_INTERVIEW_DAILY_CAP: int = int(os.getenv("FREE_INTERVIEW_DAILY_CAP", "3"))
+    RESUME_AI_FALLBACK_CONFIDENCE: float = float(os.getenv("RESUME_AI_FALLBACK_CONFIDENCE", "0.72"))
+    PISTON_API_URL: str = os.getenv("PISTON_API_URL", "https://emkc.org/api/v2/piston")
+    PISTON_TIMEOUT_SECONDS: int = int(os.getenv("PISTON_TIMEOUT_SECONDS", "12"))
+
+    SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+    POSTHOG_API_KEY: str = os.getenv("POSTHOG_API_KEY", "")
+    POSTHOG_HOST: str = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
+    LANGFUSE_PUBLIC_KEY: str = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    LANGFUSE_SECRET_KEY: str = os.getenv("LANGFUSE_SECRET_KEY", "")
+    LANGFUSE_HOST: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
 
     AI_MAX_RETRIES: int = 2
     AI_RETRY_DELAY_SECONDS: int = 1
@@ -106,8 +115,19 @@ class Settings:
         return any(lower.startswith(p) for p in PLACEHOLDER_PREFIXES)
 
     @classmethod
+    def _is_local_url(cls, value: str) -> bool:
+        parsed = urlparse(value)
+        return parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+
+    @classmethod
+    def _require_https(cls, field: str, value: str) -> None:
+        parsed = urlparse(value)
+        if parsed.scheme != "https" and not cls._is_local_url(value):
+            raise RuntimeError(f"{field} must use https outside localhost")
+
+    @classmethod
     def validate(cls):
-        required = ["OPENAI_API_KEY", "JWT_SECRET"]
+        required = ["JWT_SECRET"]
         missing = []
         for field in required:
             val = getattr(cls, field, "")
@@ -123,6 +143,23 @@ class Settings:
         if len(cls.JWT_SECRET) < 32:
             raise RuntimeError("JWT_SECRET must be at least 32 characters long")
 
+        origins = [origin.strip() for origin in cls.ALLOWED_ORIGINS.split(",") if origin.strip()]
+        if not origins:
+            raise RuntimeError("ALLOWED_ORIGINS must include at least one origin")
+        if "*" in origins:
+            raise RuntimeError("ALLOWED_ORIGINS cannot include * when credentials are enabled")
+
+        for origin in origins:
+            cls._require_https("ALLOWED_ORIGINS", origin)
+
+        for field in ("APP_BASE_URL", "API_BASE_URL", "PISTON_API_URL", "POSTHOG_HOST", "LANGFUSE_HOST"):
+            value = getattr(cls, field)
+            if value:
+                cls._require_https(field, value)
+
+        if cls.ENVIRONMENT == "production" and not cls.COOKIE_SECURE:
+            raise RuntimeError("COOKIE_SECURE must be true in production")
+
         if cls.ENCRYPTION_MASTER_KEY:
             if cls._is_placeholder(cls.ENCRYPTION_MASTER_KEY):
                 raise RuntimeError("ENCRYPTION_MASTER_KEY is still a placeholder — set a real key or remove it")
@@ -130,10 +167,17 @@ class Settings:
                 raise RuntimeError("ENCRYPTION_MASTER_KEY must be at least 32 characters long")
 
         if not cls.GOOGLE_CLIENT_ID:
-            logger.warning("GOOGLE_CLIENT_ID not set — Google OAuth will be disabled")
+            logger.warning("GOOGLE_CLIENT_ID not set - Google OAuth will be disabled")
 
         if not cls.SMTP_EMAIL or not cls.SMTP_PASSWORD:
-            logger.warning("SMTP credentials not set — email verification will not work")
+            logger.warning("SMTP credentials not set - email verification will not work")
+
+        if not cls.GEMINI_API_KEY:
+            logger.warning("GEMINI_API_KEY not set - Gemini primary LLM routing will be skipped")
+        if not cls.GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY not set - Groq LLM fallback and Whisper STT will be unavailable")
+        if not cls.RAZORPAY_KEY_ID or not cls.RAZORPAY_KEY_SECRET:
+            logger.warning("Razorpay credentials not set - paid checkout will be disabled")
 
 settings = Settings()
 
