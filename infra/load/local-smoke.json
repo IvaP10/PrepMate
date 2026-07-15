@@ -1,0 +1,18 @@
+{
+  "operations": [
+    {
+      "name": "liveness",
+      "method": "GET",
+      "path": "/live",
+      "expected_statuses": [200],
+      "weight": 3
+    },
+    {
+      "name": "unauthenticated-ownership-boundary",
+      "method": "GET",
+      "path": "/api/workspace/performance?mode=mock",
+      "expected_statuses": [401],
+      "weight": 1
+    }
+  ]
+}

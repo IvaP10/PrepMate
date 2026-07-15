@@ -1,5 +1,6 @@
 "use client"
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
+import Link from "next/link"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
@@ -17,6 +18,8 @@ declare global {
         }
       }
     }
+    __interaiGoogleInitialized?: boolean
+    __interaiHandleGoogleCredential?: (response: any) => void
   }
 }
 interface AuthScreenProps {
@@ -24,18 +27,60 @@ interface AuthScreenProps {
   onBack: () => void
   theme?: "light" | "dark"
   verified?: boolean
+  initialMode?: "login" | "signup"
 }
 const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || ""
-export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }: AuthScreenProps) {
+export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false, initialMode = "login" }: AuthScreenProps) {
   const [isLoading, setIsLoading] = useState(false)
   const [name, setName] = useState("")
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
+  const [confirmPassword, setConfirmPassword] = useState("")
   const [showPassword, setShowPassword] = useState(false)
-  const [mode, setMode] = useState<"login" | "signup" | "forgot_password">("login")
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false)
+  const [mode, setMode] = useState<"login" | "signup" | "forgot_password">(initialMode)
   const [error, setError] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const googleBtnRef = useRef<HTMLDivElement>(null)
+  const passwordRequirementMessage = "Use at least 8 characters with uppercase, lowercase, a number, and a special character."
+  const isSignupPasswordValid = (value: string) =>
+    value.length >= 8 &&
+    /[a-z]/.test(value) &&
+    /[A-Z]/.test(value) &&
+    /\d/.test(value) &&
+    /[!@#$%^&*()_+\-=[\]{}|;:'",.<>?/`~\\]/.test(value)
+  const inputClassName = "h-12 rounded-md border-border/80 bg-background/75 text-foreground shadow-none placeholder:text-muted-foreground/45 focus-visible:border-primary focus-visible:ring-primary/20"
+  const labelClassName = "text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground"
+
+  const handleGoogleCredentialResponse = useCallback(async (response: any) => {
+    if (!response.credential) {
+      setError("Google authentication failed: no credential received")
+      return
+    }
+    setIsLoading(true)
+    setError(null)
+    setSuccessMessage(null)
+    try {
+      const result = await googleAuth(response.credential)
+      onLogin(result.user)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Google authentication failed"
+      setError(message)
+    } finally {
+      setIsLoading(false)
+    }
+  }, [onLogin])
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return
+    window.__interaiHandleGoogleCredential = handleGoogleCredentialResponse
+    return () => {
+      if (window.__interaiHandleGoogleCredential === handleGoogleCredentialResponse) {
+        window.__interaiHandleGoogleCredential = undefined
+      }
+    }
+  }, [handleGoogleCredentialResponse])
+
   useEffect(() => {
     if (!GOOGLE_CLIENT_ID) return
     const scriptId = "google-gsi-script"
@@ -51,12 +96,9 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
     script.onload = () => initializeGoogleAuth()
     document.head.appendChild(script)
   }, [])
-  const initializeGoogleAuth = () => {
+  const renderGoogleButton = () => {
     if (!window.google || !googleBtnRef.current) return
-    window.google.accounts.id.initialize({
-      client_id: GOOGLE_CLIENT_ID,
-      callback: handleGoogleCredentialResponse,
-    })
+    googleBtnRef.current.innerHTML = ""
     window.google.accounts.id.renderButton(googleBtnRef.current, {
       theme: theme === "dark" ? "filled_black" : "outline",
       size: "large",
@@ -65,29 +107,25 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
       shape: "rectangular",
     })
   }
+
+  const initializeGoogleAuth = () => {
+    if (!window.google) return
+    if (!window.__interaiGoogleInitialized) {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: (response: any) => window.__interaiHandleGoogleCredential?.(response),
+      })
+      window.__interaiGoogleInitialized = true
+    }
+    renderGoogleButton()
+  }
+
   useEffect(() => {
     if (window.google && googleBtnRef.current) {
-      initializeGoogleAuth()
+      renderGoogleButton()
     }
   }, [theme])
-  const handleGoogleCredentialResponse = async (response: any) => {
-    if (!response.credential) {
-      setError("Google authentication failed — no credential received")
-      return
-    }
-    setIsLoading(true)
-    setError(null)
-    setSuccessMessage(null)
-    try {
-      const result = await googleAuth(response.credential)
-      onLogin(result.user)
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Google authentication failed"
-      setError(message)
-    } finally {
-      setIsLoading(false)
-    }
-  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setIsLoading(true)
@@ -97,6 +135,16 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
       if (mode === "signup") {
         if (!name.trim()) {
           setError("Please enter your name")
+          setIsLoading(false)
+          return
+        }
+        if (!isSignupPasswordValid(password)) {
+          setError(passwordRequirementMessage)
+          setIsLoading(false)
+          return
+        }
+        if (password !== confirmPassword) {
+          setError("Passwords do not match.")
           setIsLoading(false)
           return
         }
@@ -125,67 +173,64 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
     }
   }
   return (
-    <div className="relative flex min-h-screen bg-background">
-      <div className="relative hidden flex-1 items-center justify-center overflow-hidden border-r border-border bg-card lg:flex">
+    <div className="relative flex min-h-screen overflow-hidden bg-transparent text-foreground">
+      <div className="absolute top-6 left-6 z-20">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onBack}
+          className="text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="mr-1.5 h-4 w-4" />
+          Back
+        </Button>
+      </div>
+      <div className="relative hidden flex-1 items-center justify-center overflow-hidden border-r border-border/80 bg-card/65 backdrop-blur-xl lg:flex">
         <div
           className="pointer-events-none absolute inset-0"
           style={{
-            opacity: theme === "dark" ? 0.02 : 0.06,
-            backgroundImage:
-              theme === "dark"
-                ? "linear-gradient(rgba(255,255,255,0.4) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.4) 1px, transparent 1px)"
-                : "radial-gradient(circle at 1px 1px, rgba(0,0,0,0.06) 1px, transparent 0)",
-            backgroundSize: theme === "dark" ? "80px 80px" : "32px 32px",
+            backgroundImage: `
+              linear-gradient(${theme === "dark" ? "rgba(255,255,255,0.045)" : "rgba(15,23,42,0.075)"} 1px, transparent 1px),
+              linear-gradient(90deg, ${theme === "dark" ? "rgba(255,255,255,0.045)" : "rgba(15,23,42,0.075)"} 1px, transparent 1px),
+              linear-gradient(135deg, transparent 0 48%, ${theme === "dark" ? "rgba(129,140,248,0.12)" : "rgba(79,70,229,0.13)"} 48.1%, transparent 48.6% 100%)
+            `,
+            backgroundSize: "72px 72px, 72px 72px, 100% 100%",
           }}
         />
         <div
-          className="pointer-events-none absolute top-1/2 left-1/2 h-[500px] w-[500px] -translate-x-1/2 -translate-y-1/2 rounded-full"
+          className="pointer-events-none absolute top-1/2 left-1/2 h-[560px] w-[560px] -translate-x-1/2 -translate-y-1/2 rounded-full"
           style={{
             background:
               theme === "dark"
-                ? "radial-gradient(circle, rgba(37,99,235,0.06) 0%, rgba(59,130,246,0.03) 50%, transparent 70%)"
-                : "radial-gradient(circle, rgba(37,99,235,0.06) 0%, transparent 70%)",
+                ? "radial-gradient(circle, rgba(129,140,248,0.08) 0%, rgba(129,140,248,0.03) 46%, transparent 72%)"
+                : "radial-gradient(circle, rgba(79,70,229,0.1) 0%, rgba(15,23,42,0.035) 48%, transparent 72%)",
           }}
         />
         <div className="relative z-10 flex max-w-md flex-col items-center px-12 text-center">
-          <div className="mb-6 flex items-center gap-1.5">
+          <div className="mb-8 flex items-center gap-1.5">
             <ThemeLogo size={40} />
-            <span className="text-shimmer text-2xl font-bold">InterAI</span>
+            <span className="text-2xl font-bold text-foreground">InterAI</span>
           </div>
-          <p className="mt-4 leading-relaxed text-muted-foreground">
+          <div className="mb-8 grid w-full grid-cols-2 gap-3 text-left">
+            {["Signal Map", "Question Model", "Score Trace", "Prep Loop"].map((item) => (
+              <div key={item} className="rounded-md border border-border/80 bg-background/55 p-3">
+                <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-primary">
+                  {item}
+                </span>
+              </div>
+            ))}
+          </div>
+          <p className="leading-relaxed text-muted-foreground">
             Upload your professional resume, conduct simulated interviews at your convenience,
             and receive actionable insights to refine your performance before your next opportunity.
           </p>
-          <div className="mt-10 flex flex-wrap justify-center gap-2">
-            {["Resume Parsing", "Personalized Questions", "Score Tracking"].map(
-              (item) => (
-                <span
-                  key={item}
-                  className="rounded-full border border-border bg-secondary px-3 py-1.5 text-xs font-medium text-muted-foreground"
-                >
-                  {item}
-                </span>
-              )
-            )}
-          </div>
         </div>
       </div>
-      <div className="flex flex-1 flex-col items-center justify-center px-6 py-12">
-        <div className="absolute top-6 left-6">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={onBack}
-            className="text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeft className="mr-1.5 h-4 w-4" />
-            Back
-          </Button>
-        </div>
-        <div className="w-full max-w-sm">
+      <div className="relative z-10 flex flex-1 flex-col items-center justify-center px-6 py-12">
+        <div className="w-full max-w-[420px] rounded-xl border border-border/70 bg-card/72 p-6 backdrop-blur-xl sm:p-8">
           <div className="mb-8 flex items-center justify-center gap-1.5 lg:hidden">
             <ThemeLogo size={36} />
-            <span className="text-shimmer text-xl font-bold">InterAI</span>
+            <span className="text-xl font-bold text-foreground">InterAI</span>
           </div>
           <div className="mb-8 text-center lg:text-left">
             <h1 className="text-2xl font-bold tracking-tight text-foreground">
@@ -195,7 +240,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
               {mode === "login"
                 ? "Sign in to continue your professional interview preparation"
                 : mode === "signup"
-                  ? "Start your journey with our advanced AI interview platform"
+                  ? "Create your account by 30 July 2026 to get Premium free for 1 month"
                   : "Enter your email to receive a secure password reset link"}
             </p>
           </div>
@@ -216,49 +261,23 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
               <p>Email verified successfully! You can now sign in.</p>
             </div>
           )}
-          <div className="mb-6">
+          {GOOGLE_CLIENT_ID && (
             <div
               ref={googleBtnRef}
-              className="flex h-11 w-full items-center justify-center"
+              className="mb-6 flex min-h-11 w-full items-center justify-center"
             />
-            {!GOOGLE_CLIENT_ID && (
-              <Button
-                type="button"
-                variant="outline"
-                className="h-11 w-full border-border bg-card text-foreground hover:bg-secondary"
-                disabled
-              >
-                <svg className="mr-2 h-4 w-4" viewBox="0 0 24 24">
-                  <path
-                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
-                    fill="#4285F4"
-                  />
-                  <path
-                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                    fill="#34A853"
-                  />
-                  <path
-                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                    fill="#FBBC05"
-                  />
-                  <path
-                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                    fill="#EA4335"
-                  />
-                </svg>
-                Google OAuth not configured
-              </Button>
-            )}
-          </div>
-          <div className="relative mb-6 flex items-center gap-4">
-            <div className="h-px flex-1 bg-border" />
-            <span className="text-xs text-muted-foreground">or continue with email</span>
-            <div className="h-px flex-1 bg-border" />
-          </div>
+          )}
+          {GOOGLE_CLIENT_ID && (
+            <div className="relative mb-6 flex items-center gap-4">
+              <div className="h-px flex-1 bg-border" />
+              <span className="text-xs text-muted-foreground">or continue with email</span>
+              <div className="h-px flex-1 bg-border" />
+            </div>
+          )}
           <form onSubmit={handleSubmit} className="flex flex-col gap-5">
             {mode === "signup" && (
               <div className="flex flex-col gap-2">
-                <Label htmlFor="name" className="text-xs font-medium text-muted-foreground">
+                <Label htmlFor="name" className={labelClassName}>
                   Full Name
                 </Label>
                 <Input
@@ -267,14 +286,14 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
                   placeholder="Your full name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
-                  className="h-11 border-border bg-card text-foreground placeholder:text-muted-foreground/60 focus-visible:border-primary focus-visible:ring-primary/20"
+                  className={inputClassName}
                   required
                   disabled={isLoading}
                 />
               </div>
             )}
             <div className="flex flex-col gap-2">
-              <Label htmlFor="email" className="text-xs font-medium text-muted-foreground">
+              <Label htmlFor="email" className={labelClassName}>
                 Email address
               </Label>
               <Input
@@ -283,7 +302,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
                 placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                className="h-11 border-border bg-card text-foreground placeholder:text-muted-foreground/60 focus-visible:border-primary focus-visible:ring-primary/20"
+                className={inputClassName}
                 required
                 disabled={isLoading}
               />
@@ -291,7 +310,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
             {mode !== "forgot_password" && (
               <div className="flex flex-col gap-2">
                 <div className="flex items-center justify-between">
-                  <Label htmlFor="password" className="text-xs font-medium text-muted-foreground">
+                  <Label htmlFor="password" className={labelClassName}>
                     Password
                   </Label>
                   {mode === "login" && (
@@ -315,7 +334,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
                     placeholder="Enter your password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    className="h-11 border-border bg-card pr-10 text-foreground placeholder:text-muted-foreground/60 focus-visible:border-primary focus-visible:ring-primary/20"
+                    className={`${inputClassName} pr-10`}
                     required
                     disabled={isLoading}
                   />
@@ -332,12 +351,48 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
                     )}
                   </button>
                 </div>
+                {mode === "signup" && (
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {passwordRequirementMessage}
+                  </p>
+                )}
+              </div>
+            )}
+            {mode === "signup" && (
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="confirm-password" className={labelClassName}>
+                  Confirm password
+                </Label>
+                <div className="relative">
+                  <Input
+                    id="confirm-password"
+                    type={showConfirmPassword ? "text" : "password"}
+                    placeholder="Re-enter your password"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    className={`${inputClassName} pr-10`}
+                    required
+                    disabled={isLoading}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                    className="absolute top-1/2 right-3 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    aria-label={showConfirmPassword ? "Hide confirm password" : "Show confirm password"}
+                  >
+                    {showConfirmPassword ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
               </div>
             )}
             <Button
               type="submit"
               disabled={isLoading}
-              className="h-11 w-full bg-primary font-semibold text-primary-foreground hover:bg-primary/90"
+              className="h-12 w-full rounded-md bg-primary font-semibold text-primary-foreground shadow-none hover:bg-primary/90"
             >
               {isLoading ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
@@ -363,6 +418,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
                   setMode(mode === "login" ? "signup" : "login")
                   setError(null)
                   setSuccessMessage(null)
+                  setConfirmPassword("")
                 }}
                 className="font-medium text-primary hover:text-primary/80"
               >
@@ -370,8 +426,32 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false }
               </button>
             </p>
           </div>
-          <p className="mt-6 text-center text-[11px] text-muted-foreground/60">
-            {"By continuing, you agree to InterAI's Terms of Service & Privacy Policy."}
+          <p className="mt-6 text-center text-xs leading-relaxed text-muted-foreground">
+            {mode === "signup" ? (
+              <>
+                By creating an account, you agree to our{" "}
+                <Link href="/terms" className="font-medium text-primary hover:underline">
+                  Terms of Service
+                </Link>{" "}
+                and{" "}
+                <Link href="/privacy" className="font-medium text-primary hover:underline">
+                  Privacy Policy
+                </Link>
+                .
+              </>
+            ) : mode === "login" ? (
+              <>
+                By signing in, you agree to our{" "}
+                <Link href="/terms" className="font-medium text-primary hover:underline">
+                  Terms of Service
+                </Link>{" "}
+                and{" "}
+                <Link href="/privacy" className="font-medium text-primary hover:underline">
+                  Privacy Policy
+                </Link>
+                .
+              </>
+            ) : null}
           </p>
         </div>
       </div>

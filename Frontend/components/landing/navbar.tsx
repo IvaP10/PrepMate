@@ -1,5 +1,6 @@
 "use client"
 import { useState, useEffect } from "react"
+import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Menu, X, Sun, Moon } from "lucide-react"
 import { ThemeLogo } from "@/components/theme-logo"
@@ -8,43 +9,62 @@ interface NavbarProps {
   onSignUp: () => void
   theme: "light" | "dark"
   onToggleTheme: () => void
+  announcementVisible?: boolean
 }
-export function Navbar({ onLogin, onSignUp, theme, onToggleTheme }: NavbarProps) {
+export function Navbar({ onLogin, onSignUp, theme, onToggleTheme, announcementVisible = false }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   useEffect(() => {
-    const handler = () => setScrolled(window.scrollY > 20)
+    const handler = () => setScrolled(window.scrollY > 60)
     window.addEventListener("scroll", handler)
     return () => window.removeEventListener("scroll", handler)
   }, [])
+  const handleScroll = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+    e.preventDefault()
+    const id = href.replace("#", "")
+    const element = document.getElementById(id)
+    if (element) {
+      const fixedHeader = document.querySelector("[data-landing-header]")
+      const headerHeight = fixedHeader?.getBoundingClientRect().height ?? (announcementVisible ? 104 : 64)
+      const top = element.getBoundingClientRect().top + window.scrollY - headerHeight - 12
+
+      window.scrollTo({
+        behavior: "smooth",
+        left: 0,
+        top: Math.max(0, top),
+      })
+      window.history.replaceState(null, "", href)
+    }
+  }
   const navLinks = [
-    { label: "Features", href: "#features" },
     { label: "How It Works", href: "#how-it-works" },
+    { label: "Practice Modes", href: "#modes" },
+    { label: "Performance", href: "#performance" },
     { label: "Pricing", href: "#pricing" },
   ]
   return (
     <nav
-      className={`fixed top-0 left-0 right-0 z-50 transition-all duration-300 ${
+      className={`w-full transition-all duration-300 border-b ${
         scrolled
-          ? "border-b border-border bg-background/60 backdrop-blur-xl dark:bg-[rgba(0,0,0,0.6)]"
-          : "bg-transparent"
+          ? "border-border bg-background/80 backdrop-blur-[20px]"
+          : "border-border/40 bg-background/60 backdrop-blur-[12px] dark:bg-background/70"
       }`}
     >
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
-        <a
+        <Link
           href="/"
-          onClick={(e) => { e.preventDefault(); window.location.reload(); }}
-          className="flex items-center gap-1.5 transition-opacity hover:opacity-80"
+          className="flex items-center gap-1.5 premium-transition hover:opacity-85"
         >
           <ThemeLogo size={36} />
-          <span className="text-shimmer text-base font-semibold">InterAI</span>
-        </a>
+          <span className="text-foreground text-base font-semibold">InterAI</span>
+        </Link>
         <div className="hidden items-center gap-8 md:flex">
           {navLinks.map((link) => (
             <a
               key={link.label}
               href={link.href}
-              className="text-base text-muted-foreground transition-colors hover:text-foreground"
+              onClick={(e) => handleScroll(e, link.href)}
+              className="text-sm text-muted-foreground premium-transition hover:text-foreground hover:-translate-y-[1px]"
             >
               {link.label}
             </a>
@@ -55,7 +75,7 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme }: NavbarProps)
             variant="ghost"
             size="icon"
             onClick={onToggleTheme}
-            className="h-8 w-8 text-muted-foreground hover:text-foreground"
+            className="h-8 w-8 text-muted-foreground hover:text-foreground premium-transition"
             aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
           >
             {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -64,7 +84,7 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme }: NavbarProps)
             variant="ghost"
             size="sm"
             onClick={onLogin}
-            className="text-base text-muted-foreground hover:text-foreground hover:bg-transparent"
+            className="text-sm text-muted-foreground hover:text-foreground hover:bg-transparent premium-transition hover:scale-[1.01]"
           >
             Log In
           </Button>
@@ -72,7 +92,7 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme }: NavbarProps)
             variant="outline"
             size="sm"
             onClick={onSignUp}
-            className="rounded-full border-border bg-transparent text-base text-foreground hover:bg-secondary"
+            className="rounded-md border-border bg-transparent text-sm text-foreground hover:bg-secondary premium-transition hover:scale-[1.015] active:scale-[0.985]"
           >
             Sign Up
           </Button>
@@ -106,7 +126,10 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme }: NavbarProps)
                 key={link.label}
                 href={link.href}
                 className="rounded-lg px-3 py-2.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-                onClick={() => setMobileOpen(false)}
+                onClick={(e) => {
+                  setMobileOpen(false)
+                  handleScroll(e, link.href)
+                }}
               >
                 {link.label}
               </a>

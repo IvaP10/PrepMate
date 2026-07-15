@@ -1,12 +1,15 @@
 import { API_CONFIG, API_ENDPOINTS } from './config'
+import { safeStorageGet, safeStorageRemove, safeStorageSet } from './safe-storage'
 
 const USER_KEY = 'interai-user'
+const CSRF_COOKIE_NAME = 'interai_csrf'
 
 export interface AuthUser {
     user_id: string
     email: string
     name: string
     interviews_remaining: number
+    plan_type?: string
     is_admin?: boolean
     avatar_url?: string
     auth_provider?: string
@@ -18,41 +21,64 @@ export interface AuthResult {
     message: string
 }
 
+function cleanValidationMessage(message: string): string {
+    return message.replace(/^value error,\s*/i, '').trim()
+}
+
 function extractErrorMessage(err: any, fallback: string): string {
     if (!err) return fallback
     const detail = err.detail
-    if (typeof detail === 'string') return detail
+    if (typeof detail === 'string') return cleanValidationMessage(detail)
     if (Array.isArray(detail)) {
-        const messages = detail.map((d: any) => d.msg || d.message || JSON.stringify(d))
+        const messages = detail.map((d: any) => cleanValidationMessage(d.msg || d.message || JSON.stringify(d)))
         return messages.join(', ')
     }
-    if (detail && typeof detail === 'object') return detail.msg || detail.message || fallback
-    if (err.message && typeof err.message === 'string') return err.message
+    if (detail && typeof detail === 'object') return cleanValidationMessage(detail.msg || detail.message || fallback)
+    if (err.message && typeof err.message === 'string') return cleanValidationMessage(err.message)
     return fallback
 }
 
 export function getStoredUser(): AuthUser | null {
     if (typeof window === 'undefined') return null
-    const raw = localStorage.getItem(USER_KEY)
+    const raw = safeStorageGet('local', USER_KEY)
     if (!raw) return null
     try {
-        return JSON.parse(raw)
+        const user = JSON.parse(raw)
+        return {
+            ...user,
+            // Keep the last verified entitlement while the session check is
+            // in flight.  Replacing every cached plan with Starter made a
+            // valid Pro/Premium session briefly (and sometimes permanently
+            // after a transient API failure) look like a free account.
+            plan_type: typeof user.plan_type === 'string' && user.plan_type.trim()
+                ? user.plan_type
+                : 'starter',
+            is_admin: false,
+        }
     } catch {
         return null
     }
 }
 
 function storeUser(user: AuthUser): void {
-    localStorage.setItem(USER_KEY, JSON.stringify(user))
+    safeStorageSet('local', USER_KEY, JSON.stringify(user))
 }
 
 export function clearAuth(): void {
-    localStorage.removeItem(USER_KEY)
+    safeStorageRemove('local', USER_KEY)
 }
 
+function readCookie(name: string): string {
+    if (typeof document === 'undefined') return ''
+    const match = document.cookie
+        .split('; ')
+        .find((part) => part.startsWith(`${name}=`))
+    return match ? decodeURIComponent(match.slice(name.length + 1)) : ''
+}
 
 export function getAuthHeaders(): Record<string, string> {
-    return {}
+    const csrfToken = readCookie(CSRF_COOKIE_NAME)
+    return csrfToken ? { 'X-CSRF-Token': csrfToken } : {}
 }
 
 export async function login(email: string, password: string): Promise<AuthResult> {
@@ -75,6 +101,7 @@ export async function login(email: string, password: string): Promise<AuthResult
             email: data.email,
             name: data.name,
             interviews_remaining: data.interviews_remaining || 0,
+            plan_type: data.plan_type || 'starter',
             is_admin: Boolean(data.is_admin),
         }
         storeUser(user)
@@ -107,9 +134,9 @@ export async function signup(name: string, email: string, password: string): Pro
             email: data.email,
             name: data.name,
             interviews_remaining: data.interviews_remaining || 0,
+            plan_type: data.plan_type || 'starter',
             is_admin: Boolean(data.is_admin),
         }
-        storeUser(user)
         return { token: '', user, message: data.message }
     } catch (error) {
         if (error instanceof TypeError && error.message.includes('fetch')) {
@@ -139,6 +166,7 @@ export async function googleAuth(googleToken: string): Promise<AuthResult> {
             email: data.email,
             name: data.name,
             interviews_remaining: data.interviews_remaining || 0,
+            plan_type: data.plan_type || 'starter',
             is_admin: Boolean(data.is_admin),
         }
         storeUser(user)
@@ -170,6 +198,7 @@ export async function verifyToken(): Promise<AuthUser | null> {
                 email: data.email,
                 name: data.name || getStoredUser()?.name || "User",
                 interviews_remaining: data.interviews_remaining || 0,
+                plan_type: data.plan_type || 'starter',
                 is_admin: Boolean(data.is_admin),
             }
             storeUser(user)
@@ -179,8 +208,8 @@ export async function verifyToken(): Promise<AuthUser | null> {
         clearAuth()
         return null
     } catch {
-        clearAuth()
-        return null
+        // Network blip — keep cached profile; don't wipe a valid session locally.
+        return getStoredUser()
     }
 }
 
@@ -236,6 +265,9 @@ export async function logout(): Promise<void> {
     try {
         await fetch(`${API_CONFIG.BASE_URL}${API_ENDPOINTS.AUTH.LOGOUT}`, {
             method: 'POST',
+            headers: {
+                ...getAuthHeaders(),
+            },
             credentials: 'include',
         })
     } catch {

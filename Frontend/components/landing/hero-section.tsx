@@ -1,121 +1,242 @@
 "use client"
-import { useEffect, useState } from "react"
-import { Button } from "@/components/ui/button"
-import { ArrowRight } from "lucide-react"
+import { useState, useRef } from "react"
 
 interface HeroSectionProps {
   onGetStarted: () => void
+  theme: "light" | "dark"
 }
 
-export function HeroSection({ onGetStarted }: HeroSectionProps) {
-  const [loaded, setLoaded] = useState(false)
+function IntegratedRealityGraphic() {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [coords, setCoords] = useState({ x: 0, y: 0 })
+  const [isHovered, setIsHovered] = useState(false)
 
-  useEffect(() => {
-    const t = setTimeout(() => setLoaded(true), 100)
-    return () => clearTimeout(t)
-  }, [])
+  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const container = containerRef.current
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const x = (e.clientX - rect.left) / rect.width
+    const y = (e.clientY - rect.top) / rect.height
+    setCoords({ x: x - 0.5, y: y - 0.5 })
+    setIsHovered(true)
+  }
+
+  const handleMouseLeave = () => {
+    setCoords({ x: 0, y: 0 })
+    setIsHovered(false)
+  }
+
+  const rotateX = -coords.y * 8
+  const rotateY = coords.x * 8
+  const shadowX = -coords.x * 20
+  const shadowY = -coords.y * 20
+
+  const containerStyle = {
+    transform: `perspective(2000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg)`,
+    transition: isHovered ? "none" : "transform 1.2s cubic-bezier(0.16, 1, 0.3, 1)",
+    transformStyle: "preserve-3d" as const,
+  }
 
   return (
-    <section className="relative flex min-h-[100vh] flex-col items-center justify-center overflow-hidden px-6 pt-20">
-
-      <div className="relative z-10 mx-auto flex max-w-4xl flex-col items-center text-center">
-        
-        <button
-          type="button"
-          onClick={onGetStarted}
-          className={`group mb-12 inline-flex cursor-pointer items-center gap-2.5 rounded-full border border-border bg-card/80 px-5 py-2.5 backdrop-blur-sm transition-all duration-500 hover:border-primary/50 hover:bg-card hover:shadow-[0_0_25px_rgba(37,99,235,0.15)] ${
-            loaded ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"
-          }`}
-          style={{ transitionDelay: "200ms" }}
+    <div className="w-full flex items-center justify-center overflow-visible h-[280px] sm:h-[340px] md:h-[400px]">
+      <div
+        ref={containerRef}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
+        className="relative w-[540px] h-[400px] select-none scale-[0.65] sm:scale-[0.85] md:scale-100 origin-center shrink-0 overflow-visible"
+        style={containerStyle}
+      >
+        {/* SVG Connecting Lines */}
+        <svg
+          className="absolute inset-0 w-full h-full pointer-events-none z-0 overflow-visible opacity-55"
+          viewBox="0 0 540 400"
+          fill="none"
         >
-          <span className="relative flex h-2 w-2">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary/60 opacity-75" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
-          </span>
-          <span className="text-sm text-muted-foreground">
-            AI-Powered Interview Coaching
-          </span>
-          <span className="inline-flex items-center gap-1 text-sm font-medium text-primary transition-transform duration-200 group-hover:translate-x-0.5">
-            Get started
-            <ArrowRight className="h-3.5 w-3.5" />
-          </span>
-        </button>
+          <path d="M 160,90 C 200,90 200,165 225,165" stroke="var(--color-primary, #3B82F6)" strokeWidth="2.5" strokeDasharray="4 4" className="animate-pulse" />
+          <path d="M 270,240 C 220,240 180,310 160,310" stroke="var(--color-primary, #3B82F6)" strokeWidth="2.5" strokeDasharray="4 4" className="animate-pulse" />
+          <path d="M 330,240 C 370,240 405,290 425,290" stroke="var(--color-primary, #3B82F6)" strokeWidth="2.5" strokeDasharray="4 4" className="animate-pulse" />
+        </svg>
 
-        
-        <h1 className="font-serif text-4xl leading-[1.1] tracking-tight sm:text-5xl md:text-6xl lg:text-7xl relative z-10">
-          <span className="overflow-hidden block">
-            <span
-              className={`block transition-all duration-700 ease-out ${
-                loaded ? "translate-y-0 opacity-100" : "translate-y-full opacity-0"
-              }`}
-              style={{ transitionDelay: "400ms" }}
-            >
-              <span className="text-shimmer">Master your interviews</span>
-            </span>
-          </span>
-          <span className="overflow-hidden block">
-            <span
-              className={`block transition-all duration-700 ease-out ${
-                loaded ? "translate-y-0 opacity-100" : "translate-y-full opacity-0"
-              }`}
-              style={{ transitionDelay: "550ms" }}
-            >
-              <span className="text-shimmer">with AI-driven </span>
-              <span className="text-shimmer-accent">practice.</span>
-            </span>
-          </span>
-        </h1>
-
-        
-        <p
-          className={`mt-8 max-w-xl text-pretty text-lg leading-relaxed text-muted-foreground sm:text-xl relative z-10 transition-all duration-700 ease-out ${
-            loaded ? "opacity-100 translate-y-0 blur-0" : "opacity-0 translate-y-6 blur-sm"
-          }`}
-          style={{ transitionDelay: "700ms" }}
-        >
-          Upload your resume, select your target industry, and engage in realistic, simulated interviews. Receive actionable, real-time feedback to secure your next role.
-        </p>
-
-        
+        {/* 1. Input Card (Top-Left) */}
         <div
-          className={`mt-10 flex flex-wrap items-center justify-center gap-4 relative z-10 transition-all duration-700 ease-out ${
-            loaded ? "opacity-100 translate-y-0" : "opacity-0 translate-y-6"
-          }`}
-          style={{ transitionDelay: "900ms" }}
+          className="landing-solid-card absolute top-[40px] left-[10px] w-[170px] shadow-lg border border-border/80 p-4 rounded-xl flex flex-col z-10 transition-all duration-300"
+          style={{
+            transform: `translateZ(${isHovered ? "45px" : "0px"})`,
+            boxShadow: isHovered
+              ? `${shadowX}px ${shadowY}px 40px -10px rgba(0, 0, 0, 0.15), 0 0 0 1px rgba(var(--foreground), 0.05)`
+              : "0 10px 20px -10px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(var(--foreground), 0.03)",
+          }}
         >
-          <Button
-            size="lg"
-            onClick={onGetStarted}
-            className="h-13 rounded-full bg-primary px-8 text-base font-semibold text-primary-foreground transition-all duration-300 hover:scale-105 hover:shadow-[0_0_30px_rgba(37,99,235,0.3)] relative overflow-hidden group"
-          >
-            <span className="relative z-10">Start Your Free Mock Interview</span>
-            <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent translate-x-[-200%] group-hover:translate-x-[200%] transition-transform duration-700" />
-          </Button>
+          <div className="text-[8px] font-bold uppercase tracking-[0.1em] text-muted-foreground mb-2">
+            Role profile
+          </div>
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-primary/10 text-primary border border-primary/20 text-[9.5px] font-bold w-fit mb-3.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+            Top-Tier
+          </div>
+          <div className="flex items-center gap-2 text-[9.5px] font-semibold text-primary">
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="3">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+            </svg>
+            Resume Uploaded
+          </div>
         </div>
 
-        
+        {/* 2. The Engine (Center) */}
         <div
-          className={`mt-16 flex items-center gap-8 text-xs font-mono text-muted-foreground/50 uppercase tracking-widest transition-all duration-700 ${
-            loaded ? "opacity-100" : "opacity-0"
-          }`}
-          style={{ transitionDelay: "1100ms" }}
+          className="landing-solid-card absolute top-[100px] left-[200px] w-[310px] shadow-2xl border border-border bg-white rounded-xl overflow-hidden z-20 transition-all duration-300"
+          style={{
+            transform: `translateZ(${isHovered ? "20px" : "0px"})`,
+            boxShadow: isHovered
+              ? `${shadowX * 0.5}px ${shadowY * 0.5}px 50px -15px rgba(0, 0, 0, 0.2), 0 0 0 1px rgba(var(--foreground), 0.06)`
+              : "0 15px 35px -15px rgba(0, 0, 0, 0.12), 0 0 0 1px rgba(var(--foreground), 0.03)",
+          }}
         >
-          <span>Resume Aware</span>
-          <span className="h-px w-4 bg-border" />
-          <span>Real-time Feedback</span>
-          <span className="h-px w-4 bg-border" />
-          <span>AI Coaching</span>
+          <div className="flex items-center justify-between border-b border-border/80 px-4 py-2.5 bg-secondary/35 shrink-0">
+            <div className="flex items-center gap-1.5">
+              <div className="h-1.5 w-1.5 rounded-full bg-[#ff5f57]" />
+              <div className="h-1.5 w-1.5 rounded-full bg-[#ffbd2e]" />
+              <div className="h-1.5 w-1.5 rounded-full bg-[#28c840]" />
+              <span className="ml-2 text-[7.5px] font-mono text-muted-foreground uppercase tracking-widest leading-none">
+                Live interview
+              </span>
+            </div>
+            <span className="h-1.5 w-1.5 rounded-full bg-primary animate-ping" />
+          </div>
+
+          <div className="p-4 bg-background/50">
+            <div className="flex items-start gap-2.5">
+              <div className="w-6 h-6 rounded-md bg-secondary flex items-center justify-center shrink-0 border border-border">
+                <svg className="w-3.5 h-3.5 text-foreground/50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+                </svg>
+              </div>
+              <div className="bg-secondary/40 rounded-lg p-3 border border-border/60">
+                <span className="block text-[7px] font-bold text-muted-foreground uppercase tracking-wider mb-1">
+                  AI Interviewer
+                </span>
+                <p className="text-[9px] leading-[1.5] text-foreground/80 font-medium">
+                  &ldquo;I see you listed a database migration project on your resume. How did you design the schema migration path to support zero downtime while transitioning active traffic?&rdquo;
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 3. Output Card A: Technical Performance (Bottom-Left) */}
+        <div
+          className="landing-solid-card absolute top-[272px] left-[20px] w-[180px] shadow-2xl border border-border p-4 rounded-xl z-30 transition-all duration-300 bg-secondary"
+          style={{
+            transform: `translateZ(${isHovered ? "70px" : "0px"})`,
+            boxShadow: isHovered
+              ? `${shadowX * 1.5}px ${shadowY * 1.5}px 45px -10px rgba(0, 0, 0, 0.3)`
+              : "0 12px 24px -10px rgba(0, 0, 0, 0.2)",
+          }}
+        >
+          <div className="flex items-center gap-1.5 border-b border-border/60 pb-2 mb-2.5 shrink-0">
+            <span className="w-2 h-2 rounded bg-primary animate-pulse" />
+            <span className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground">
+              Technical Performance
+            </span>
+          </div>
+          <div className="space-y-2 text-[8.5px] font-mono text-foreground/70">
+            <div className="flex justify-between items-center border-b border-border/30 pb-1">
+              <span>Sys Design:</span>
+              <span className="text-primary font-semibold">91%</span>
+            </div>
+            <div className="flex justify-between items-center border-b border-border/30 pb-1">
+              <span>Migration:</span>
+              <span className="text-primary font-semibold">Robust</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span>DB Arch:</span>
+              <span className="text-foreground/50 font-semibold">O(1) Reads</span>
+            </div>
+          </div>
+        </div>
+
+        {/* 4. Output Card B: Interview Performance (Bottom-Right) */}
+        <div
+          className="landing-solid-card absolute top-[272px] right-[20px] w-[185px] shadow-2xl border border-border p-4 rounded-xl z-30 transition-all duration-300"
+          style={{
+            transform: `translateZ(${isHovered ? "60px" : "0px"})`,
+            boxShadow: isHovered
+              ? `${shadowX * 1.2}px ${shadowY * 1.2}px 40px -10px rgba(0, 0, 0, 0.18), 0 0 0 1px rgba(var(--foreground), 0.05)`
+              : "0 12px 24px -10px rgba(0, 0, 0, 0.1), 0 0 0 1px rgba(var(--foreground), 0.03)",
+          }}
+        >
+          <div className="flex items-center gap-1.5 border-b border-border/80 pb-2 mb-2.5 shrink-0">
+            <span className="w-2 h-2 rounded bg-primary animate-pulse" />
+            <span className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground">
+              Interview Performance
+            </span>
+          </div>
+          <div className="space-y-2 text-[8.5px] font-medium text-foreground/80">
+            <div className="flex justify-between items-center border-b border-border/40 pb-1">
+              <span>Pacing:</span>
+              <span className="text-primary font-bold">132 WPM</span>
+            </div>
+            <div className="flex justify-between items-center border-b border-border/40 pb-1">
+              <span>Clarity:</span>
+              <span className="text-primary font-bold">88% (Ideal)</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span>Structure:</span>
+              <span className="text-muted-foreground font-semibold">Cohesive</span>
+            </div>
+          </div>
         </div>
       </div>
+    </div>
+  )
+}
 
-      
-      <div
-        className={`absolute bottom-8 left-1/2 -translate-x-1/2 transition-all duration-700 ${
-          loaded ? "opacity-100" : "opacity-0"
-        }`}
-        style={{ transitionDelay: "1300ms" }}
-      >
-        <div className="w-px h-10 bg-gradient-to-b from-transparent via-muted-foreground/30 to-muted-foreground/50 animate-pulse" />
+export function HeroSection({ onGetStarted, theme }: HeroSectionProps) {
+  return (
+    <section className="relative flex flex-col items-center overflow-visible border-b border-border/20 px-6 pb-12 pt-[136px] md:pb-20 md:pt-[152px]">
+      <div className="relative z-10 mx-auto flex min-h-[calc(100dvh-152px)] w-full max-w-6xl flex-col justify-center">
+        <div className="grid grid-cols-1 lg:grid-cols-[0.9fr_1.1fr] gap-12 lg:gap-20 items-center w-full">
+          {/* Left */}
+          <div className="flex flex-col items-start text-left max-w-xl">
+            <h1
+              className="text-5xl sm:text-6xl md:text-7xl lg:text-[4.9rem] font-semibold tracking-[-0.04em] leading-[1.02] text-foreground"
+              style={{
+                color: theme === "dark" ? "#FFFFFF" : "#000000",
+                WebkitTextFillColor: theme === "dark" ? "#FFFFFF" : "#000000",
+              }}
+            >
+              Practice your next interview before it happens.
+            </h1>
+
+            <p
+              className="mt-6 text-base sm:text-lg lg:text-[1.2rem] text-muted-foreground font-normal leading-[1.7]"
+              style={{
+                color: theme === "dark" ? "#D4D4D8" : "#000000",
+                WebkitTextFillColor: theme === "dark" ? "#D4D4D8" : "#000000",
+              }}
+            >
+              Paste your resume and the job description. Run a live voice Interview Round calibrated to that role, then practise coding and system design in the separate Technical Round.
+            </p>
+
+            <div
+              className="mt-8"
+            >
+              <button
+                onClick={onGetStarted}
+                className="h-12 rounded-lg bg-primary px-8 text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/25 premium-transition hover:scale-[1.025] hover:shadow-xl hover:shadow-primary/30 hover:brightness-110 active:scale-[0.985] cursor-pointer"
+              >
+                Create Account to Start
+              </button>
+            </div>
+          </div>
+
+          {/* Right */}
+          <div
+            className="flex justify-center lg:justify-end lg:translate-x-6"
+          >
+            <IntegratedRealityGraphic />
+          </div>
+        </div>
       </div>
     </section>
   )

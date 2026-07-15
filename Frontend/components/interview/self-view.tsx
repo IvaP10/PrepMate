@@ -5,19 +5,23 @@ interface SelfViewProps {
   variant?: "overlay" | "sidebar" | "mobile"
   videoRef?: React.RefObject<HTMLVideoElement | null>
   isVideoOn?: boolean
+  stream?: MediaStream | null
 }
-export function SelfView({ variant = "overlay", videoRef, isVideoOn = true }: SelfViewProps) {
+export function SelfView({ variant = "overlay", videoRef, isVideoOn = true, stream }: SelfViewProps) {
   const localRef = useRef<HTMLVideoElement>(null)
   const activeRef = videoRef || localRef
   useEffect(() => {
-    if (!videoRef && activeRef.current && !activeRef.current.srcObject) {
+    if (activeRef.current && stream && activeRef.current.srcObject !== stream) {
+      activeRef.current.srcObject = stream
+      void activeRef.current.play().catch(() => {})
+    } else if (!videoRef && activeRef.current && !activeRef.current.srcObject) {
       navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-        .then(stream => {
-          if (activeRef.current) activeRef.current.srcObject = stream
+        .then(s => {
+          if (activeRef.current) activeRef.current.srcObject = s
         })
         .catch(() => {})
     }
-  }, [videoRef, activeRef])
+  }, [videoRef, activeRef, stream, isVideoOn])
   if (variant === "mobile") {
     return (
       <div className="absolute top-20 right-6 z-40">
@@ -46,10 +50,10 @@ export function SelfView({ variant = "overlay", videoRef, isVideoOn = true }: Se
             <Camera className="h-8 w-8 text-[var(--iv-on-surface-variant)]" />
           </div>
         )}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent" />
+        <div className="absolute inset-0 bg-black/30" />
         <div className="absolute bottom-3 left-3 flex items-center gap-2">
           <div className="w-1.5 h-1.5 rounded-full bg-[var(--iv-primary-dim)] animate-pulse" />
-          <span className="font-sans text-[10px] uppercase tracking-widest text-[var(--iv-on-surface-variant)]">Self View</span>
+          <span className="font-sans text-xs font-medium text-[var(--iv-on-surface-variant)]">Self View</span>
         </div>
       </div>
     )
@@ -63,7 +67,7 @@ export function SelfView({ variant = "overlay", videoRef, isVideoOn = true }: Se
           <Camera className="h-8 w-8 text-[var(--iv-on-surface-variant)]" />
         </div>
       )}
-      <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-black/40 backdrop-blur-md rounded text-[10px] text-white/80 font-medium">
+      <div className="absolute bottom-2 left-2 px-2 py-0.5 bg-background/80 backdrop-blur-md rounded text-xs text-foreground font-medium">
         You
       </div>
     </div>

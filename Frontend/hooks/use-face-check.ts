@@ -9,6 +9,7 @@ interface FaceMetrics {
   cameraContactLevel: "Low" | "Optimal" | "High"
   posture?: string
   fidgetLevel?: "low" | "medium" | "high" | "unknown"
+  source?: "mediapipe" | "fallback" | "unavailable"
 }
 
 const DEFAULTS: FaceMetrics = {
@@ -18,6 +19,7 @@ const DEFAULTS: FaceMetrics = {
   cameraContactLevel: "Optimal",
   posture: "unknown",
   fidgetLevel: "unknown",
+  source: "unavailable",
 }
 
 const MODEL_URL =
@@ -26,7 +28,8 @@ const MODEL_URL =
 export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>) {
   const [metrics, setMetrics] = useState<FaceMetrics>(DEFAULTS)
   const [isRunning, setIsRunning] = useState(false)
-  const animFrameRef = useRef<number | null>(null)
+  const intervalRef = useRef<any>(null)
+  const isRunningRef = useRef(false)
   const lastProcessTime = useRef(0)
   const landmarkerRef = useRef<any>(null)
   const loadingRef = useRef(false)
@@ -62,7 +65,7 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
   const analyzeWithFallback = useCallback((video: HTMLVideoElement): FaceMetrics => {
     const canvas = document.createElement("canvas")
     const ctx = canvas.getContext("2d")
-    if (!ctx || video.readyState < 2) return DEFAULTS
+    if (!ctx || video.readyState < 2) return { ...DEFAULTS, source: "fallback" }
 
     canvas.width = 120
     canvas.height = 90
@@ -84,7 +87,7 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
       }
     }
     const facePresent = skinCount > 8
-    if (!facePresent) return DEFAULTS
+    if (!facePresent) return { ...DEFAULTS, source: "fallback" }
     const xOff = Math.abs(xSum / skinCount - canvas.width / 2) / (canvas.width / 2)
     const yOff = Math.abs(ySum / skinCount - canvas.height / 2) / (canvas.height / 2)
     const centered = xOff < 0.25 && yOff < 0.3
@@ -97,6 +100,7 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
       cameraContactLevel,
       posture: centered ? "straight" : "off_center",
       fidgetLevel: "unknown" as const,
+      source: "fallback",
     }
   }, [])
 
@@ -156,6 +160,7 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
         cameraContactLevel,
         posture,
         fidgetLevel,
+        source: "mediapipe",
       })
     } catch {
       setMetrics(analyzeWithFallback(video))
@@ -163,20 +168,21 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
   }, [analyzeWithFallback, loadLandmarker, videoRef])
 
   const start = useCallback(() => {
-    if (isRunning) return
+    if (isRunningRef.current) return
+    isRunningRef.current = true
     setIsRunning(true)
-    const loop = () => {
+    intervalRef.current = setInterval(() => {
       void analyzeFrame()
-      animFrameRef.current = requestAnimationFrame(loop)
-    }
-    loop()
-  }, [isRunning, analyzeFrame])
+    }, 250)
+  }, [analyzeFrame])
 
   const stop = useCallback(() => {
-    if (animFrameRef.current) {
-      cancelAnimationFrame(animFrameRef.current)
-      animFrameRef.current = null
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current)
+      intervalRef.current = null
     }
+    if (!isRunningRef.current) return
+    isRunningRef.current = false
     setIsRunning(false)
     setMetrics(DEFAULTS)
   }, [])

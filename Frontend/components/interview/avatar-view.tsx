@@ -15,7 +15,7 @@ export function AvatarView({
   isConnected,
   avatarName = "Dr. Aris",
   avatarTitle = "AI Lead Interviewer",
-  mode = "practice",
+  mode = "mock",
   fallbackMode = false,
   audioVisualizerActive = false,
 }: AvatarViewProps) {
@@ -37,9 +37,9 @@ export function AvatarView({
     const drawWaveform = () => {
       const w = canvas.width
       const h = canvas.height
-      ctx.fillStyle = "rgba(0, 0, 0, 0.1)"
+      ctx.fillStyle = "rgba(17, 22, 21, 0.2)"
       ctx.fillRect(0, 0, w, h)
-      ctx.strokeStyle = "#6366f1"
+      ctx.strokeStyle = "#86BDB5"
       ctx.lineWidth = 2
       ctx.beginPath()
       const time = Date.now() / 1000
@@ -53,7 +53,7 @@ export function AvatarView({
         else ctx.lineTo(x, y)
       }
       ctx.stroke()
-      ctx.strokeStyle = "#a855f7"
+      ctx.strokeStyle = "#AAB5B0"
       ctx.lineWidth = 1.5
       ctx.beginPath()
       for (let x = 0; x < w; x++) {
@@ -73,7 +73,7 @@ export function AvatarView({
   const isMock = mode === "mock"
   return (
     <div
-      className={`relative overflow-hidden bg-gradient-to-br from-gray-900 via-gray-800 to-gray-900 ${
+      className={`relative overflow-hidden bg-secondary ${
         isMock ? "w-full h-full" : "rounded-2xl aspect-video"
       }`}
     >
@@ -97,12 +97,12 @@ export function AvatarView({
         />
       ) : (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-          <div className="w-24 h-24 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-2xl">
-            <Camera className="w-10 h-10 text-white" />
+          <div className="w-24 h-24 rounded-full bg-primary flex items-center justify-center shadow-sm">
+            <Camera className="w-10 h-10 text-primary-foreground" />
           </div>
           <div className="text-center">
-            <p className="text-white/90 font-medium text-lg">{avatarName}</p>
-            <p className="text-white/50 text-sm">{avatarTitle}</p>
+            <p className="text-foreground font-medium text-lg">{avatarName}</p>
+            <p className="text-muted-foreground text-sm">{avatarTitle}</p>
           </div>
           {audioVisualizerActive && (
             <canvas
@@ -126,8 +126,8 @@ export function AvatarView({
         <div
           className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium backdrop-blur-md ${
             isConnected
-              ? "bg-emerald-500/20 text-emerald-400"
-              : "bg-white/10 text-white/50"
+              ? "bg-primary/15 text-primary"
+              : "bg-secondary text-muted-foreground"
           }`}
         >
           {isConnected ? (
@@ -140,9 +140,9 @@ export function AvatarView({
       </div>
       {!isMock && (
         <div className="absolute bottom-3 left-3 z-20">
-          <div className="bg-black/60 backdrop-blur-md rounded-lg px-3 py-1.5">
-            <p className="text-white text-sm font-medium">{avatarName}</p>
-            <p className="text-white/50 text-xs">{avatarTitle}</p>
+          <div className="bg-background/80 backdrop-blur-md rounded-lg px-3 py-1.5">
+            <p className="text-foreground text-sm font-medium">{avatarName}</p>
+            <p className="text-muted-foreground text-xs">{avatarTitle}</p>
           </div>
         </div>
       )}

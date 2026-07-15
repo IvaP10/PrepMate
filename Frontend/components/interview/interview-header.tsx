@@ -7,8 +7,6 @@ interface InterviewHeaderProps {
 }
 export function InterviewHeader({ mode, showTimer = false }: InterviewHeaderProps) {
   const modeLabel = {
-    "practice-ai": "Practice Mode",
-    "practice-voice": "Practice Mode",
     "mock-ai": "Mock Interview Mode",
     "mock-voice": "Mock Interview Mode",
   }[mode] || "Interview"
@@ -23,7 +21,7 @@ export function InterviewHeader({ mode, showTimer = false }: InterviewHeaderProp
         )}
       </div>
       <div className="flex items-center gap-4">
-        <span className="text-[10px] uppercase tracking-widest text-[var(--iv-on-surface)]/40 font-bold hidden sm:block">{modeLabel}</span>
+        <span className="text-xs font-medium text-[var(--iv-on-surface)]/60 hidden sm:block">{modeLabel}</span>
         <div className="h-8 w-8 rounded-full bg-[var(--iv-surface-container-high)] flex items-center justify-center overflow-hidden border border-[var(--iv-outline-variant)]/20">
           <User className="h-4 w-4 text-[var(--iv-on-surface-variant)]" />
         </div>

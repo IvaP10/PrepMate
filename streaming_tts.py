@@ -1,7 +1,21 @@
+# ============================================================================
+# MODULE: streaming_tts.py
+# PURPOSE: Kokoro TTS pipeline wrapper — async generator yielding base64 WAV
+#          chunks for WebSocket streaming during interview turns.
+# STRUCTURE:
+#   - _load_kokoro_pipeline_for_voice lazy loader
+#   - chunked synthesis helpers + async generator (later in file)
+# ENDPOINTS: none (used by interview.py inside the WS audio loop)
+# DEPENDS ON: config, kokoro, soundfile, numpy
+# CONSUMED BY: interview.py (and ai_services for non-streaming TTS fallback)
+# DATA TABLES: none
+# ============================================================================
+
 import asyncio
 import base64
 import io
 import logging
+import threading
 from typing import Callable, Optional
 from time import time
 
@@ -12,85 +26,30 @@ from config import settings
 
 logger = logging.getLogger("streaming_tts")
 
-_kokoro_pipeline = None
-_kokoro_loaded = False
+_kokoro_pipelines = {}
+_kokoro_pipeline_lock = threading.Lock()
+_kokoro_synthesis_locks = {}
 
 
-def _load_kokoro():
-    global _kokoro_pipeline, _kokoro_loaded
-    if _kokoro_loaded:
-        return _kokoro_pipeline
-    try:
-        from kokoro import KPipeline
-        _kokoro_pipeline = KPipeline(lang_code="a")
-        _kokoro_loaded = True
-        logger.info("Kokoro TTS loaded")
-    except Exception:
-        logger.error("Failed to load Kokoro")
-        _kokoro_loaded = True
-    return _kokoro_pipeline
-
-
-class KokoroTTS:
-
-    def __init__(self, on_audio_chunk: Optional[Callable] = None):
-        self._on_audio_chunk = on_audio_chunk
-        self._text_buffer: list[str] = []
-        self._send_start_time: Optional[float] = None
-        self._first_byte_time: Optional[float] = None
-
-    @property
-    def available(self) -> bool:
-        return _load_kokoro() is not None
-
-    async def connect(self):
-        return self.available
-
-    async def send_text_chunk(self, text: str):
-        if not self._send_start_time:
-            self._send_start_time = time()
-        self._text_buffer.append(text)
-
-    async def flush_and_close_stream(self):
-        full_text = "".join(self._text_buffer).strip()
-        self._text_buffer = []
-        if not full_text:
-            return
-
-        pipeline = _load_kokoro()
-        if not pipeline:
-            return
-
-        voice = getattr(settings, "KOKORO_VOICE", "af_heart")
-        speed = getattr(settings, "KOKORO_SPEED", 1.0)
-
-        loop = asyncio.get_running_loop()
-        audio_b64 = await loop.run_in_executor(
-            None, lambda: _generate_audio(pipeline, full_text, voice, speed)
-        )
-
-        if audio_b64:
-            if not self._first_byte_time and self._send_start_time:
-                self._first_byte_time = time()
-                ttfb = (self._first_byte_time - self._send_start_time) * 1000
-                logger.info("Kokoro TTS TTFB: %.0fms", ttfb)
-
-            if self._on_audio_chunk:
-                await self._on_audio_chunk(audio_b64)
-
-    async def interrupt(self):
-        self._text_buffer = []
-        self._first_byte_time = None
-        self._send_start_time = None
-        logger.info("Kokoro TTS interrupted")
-
-    async def close(self):
-        self._text_buffer = []
-
-    def get_ttfb_ms(self) -> Optional[float]:
-        if self._first_byte_time and self._send_start_time:
-            return (self._first_byte_time - self._send_start_time) * 1000
-        return None
+def _load_kokoro_pipeline_for_voice(voice: str):
+    lang_code = voice[0] if (voice and len(voice) >= 1) else "a"
+    if lang_code in _kokoro_pipelines:
+        return _kokoro_pipelines[lang_code]
+    # Startup warmup and an early interview connection can otherwise load the
+    # same 82M model twice. The second caller waits for the single warm model.
+    with _kokoro_pipeline_lock:
+        if lang_code in _kokoro_pipelines:
+            return _kokoro_pipelines[lang_code]
+        try:
+            from kokoro import KPipeline
+            pipeline = KPipeline(lang_code=lang_code)
+            _kokoro_pipelines[lang_code] = pipeline
+            _kokoro_synthesis_locks[lang_code] = threading.Lock()
+            logger.info("Kokoro pipeline loaded for lang_code: %s", lang_code)
+            return pipeline
+        except Exception as e:
+            logger.error("Failed to load Kokoro for lang_code %s: %s", lang_code, e)
+            return None
 
 
 def _generate_audio(pipeline, text: str, voice: str, speed: float) -> Optional[str]:
@@ -114,49 +73,37 @@ def _generate_audio(pipeline, text: str, voice: str, speed: float) -> Optional[s
         return None
 
 
-class UnavailableTTS:
-    def __init__(self, on_audio_chunk: Optional[Callable] = None):
-        self._on_audio_chunk = on_audio_chunk
 
-    @property
-    def available(self) -> bool:
-        return False
-
-    async def connect(self):
-        return False
-
-    async def send_text_chunk(self, text: str):
+def _synthesize_blocking(text: str, voice: str, speed: float) -> Optional[str]:
+    pipeline = _load_kokoro_pipeline_for_voice(voice)
+    if not pipeline:
         return None
+    lang_code = voice[0] if (voice and len(voice) >= 1) else "a"
+    synthesis_lock = _kokoro_synthesis_locks.setdefault(lang_code, threading.Lock())
+    with synthesis_lock:
+        return _generate_audio(pipeline, text, voice, speed)
 
-    async def flush_and_close_stream(self):
-        return None
-
-    async def interrupt(self):
-        logger.info("Kokoro TTS unavailable; interrupt ignored")
-
-    async def close(self):
-        return None
-
-    def get_ttfb_ms(self):
-        return None
 
 
 async def synthesize_text_to_base64(text: str) -> Optional[str]:
-    pipeline = _load_kokoro()
-    if not pipeline:
-        return None
     voice = getattr(settings, "KOKORO_VOICE", "af_heart")
     speed = getattr(settings, "KOKORO_SPEED", 1.0)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
-        None, lambda: _generate_audio(pipeline, text, voice, speed)
+        None, lambda: _synthesize_blocking(text, voice, speed)
     )
 
 
-def create_tts(on_audio_chunk=None):
-    kokoro = KokoroTTS(on_audio_chunk=on_audio_chunk)
-    if kokoro.available:
-        logger.info("Using Kokoro-82M for TTS")
-        return kokoro
-    logger.warning("Kokoro unavailable — TTS disabled")
-    return UnavailableTTS(on_audio_chunk=on_audio_chunk)
+async def prewarm_speech_pipeline() -> None:
+    """Load Kokoro and execute one tiny inference before an interview starts."""
+    started = time()
+    try:
+        audio = await synthesize_text_to_base64("Hello.")
+        if audio:
+            logger.info("Kokoro speech pipeline prewarmed in %.2fs", time() - started)
+        else:
+            logger.warning("Kokoro speech pipeline prewarm returned no audio")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Kokoro speech pipeline prewarm failed")

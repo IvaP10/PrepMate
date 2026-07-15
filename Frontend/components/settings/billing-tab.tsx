@@ -1,7 +1,6 @@
 "use client"
 import { useState, useEffect } from "react"
-import { useRouter } from "next/navigation"
-import { CreditCard, Check, X, Download, Loader2, Receipt } from "lucide-react"
+import { CreditCard, Download, Loader2, Receipt } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 import { fetchPaymentTransactions } from "@/lib/api"
@@ -16,7 +15,7 @@ const invoiceMarkup = (txn: any) => {
   const rows = [
     ["Date", date],
     ["Amount", amount],
-    ["Plan", txn.plan_type || "Starter"],
+    ["Plan", txn.plan_type || "Free"],
     ["Status", txn.status || "pending"],
     ["Transaction ID", txn.transaction_id],
   ]
@@ -25,7 +24,6 @@ const invoiceMarkup = (txn: any) => {
 }
 
 export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null; onOpenMembership: () => void }) {
-  const router = useRouter()
   const [transactions, setTransactions] = useState<any[]>([])
   const [loadingTxn, setLoadingTxn] = useState(true)
 
@@ -40,21 +38,25 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
     load()
   }, [])
 
-  const planLabel = user?.interviews_remaining === 0 ? "Free" : "Active Plan"
+  const planType = (user?.plan_type || "starter").toLowerCase()
+  const planLabel = planType.includes("premium") ? "Premium" : planType.includes("pro") ? "Pro" : "Free"
+  const planDescription = planType.includes("premium")
+    ? "Premium includes higher weekly mock limits, technical rounds, custom JD-based rounds, code review, and priority support."
+    : planType.includes("pro")
+      ? "Pro includes weekly technical assessments, custom mock interviews, and higher mock interview limits."
+      : "Free includes 1 AI mock interview per week. Register by 30 July 2026 to get Premium free for 1 month."
 
   return (
     <div className="space-y-6">
       
-      <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
+      <div className="dashboard-card">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Current Plan</h3>
         <p className="mb-4 text-xs text-muted-foreground">Manage your subscription and plan.</p>
-        <div className="flex items-center justify-between rounded-lg border border-border bg-secondary/30 p-4">
+        <div className="sub-card flex items-center justify-between rounded-lg">
           <div>
             <p className="font-semibold text-foreground">{planLabel}</p>
             <p className="text-xs text-muted-foreground mt-0.5">
-              {user?.interviews_remaining !== undefined
-                ? `${user.interviews_remaining} interview${user.interviews_remaining === 1 ? "" : "s"} remaining`
-                : "Cancel anytime. No contracts."}
+              {planDescription}
             </p>
           </div>
           <Button onClick={onOpenMembership} className="gap-2 rounded-full shadow-sm">
@@ -64,24 +66,26 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
       </div>
 
       
-      <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
+      <div className="dashboard-card">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Payment Method</h3>
-        <p className="mb-4 text-xs text-muted-foreground">Your saved payment details.</p>
-        <div className="flex items-center justify-between rounded-lg border border-dashed border-border/70 bg-secondary/20 p-4">
+        <p className="mb-4 text-xs text-muted-foreground">Payments are securely handled by Razorpay Checkout.</p>
+        <div className="sub-card flex items-center justify-between rounded-lg border-dashed">
           <div className="flex items-center gap-3">
             <div className="flex h-10 w-10 items-center justify-center rounded-md bg-card ring-1 ring-border/50">
               <CreditCard className="h-5 w-5 text-muted-foreground" />
             </div>
             <div>
-              <p className="text-sm font-medium text-foreground">No payment method on file</p>
-              <p className="text-xs text-muted-foreground">Add one when you purchase a plan.</p>
+              <p className="text-sm font-medium text-foreground">
+                {transactions.find((txn: any) => txn.status === "completed" || txn.status === "success")?.payment_method || "Razorpay Checkout"}
+              </p>
+              <p className="text-xs text-muted-foreground">Card, UPI, and bank details stay inside Razorpay and are not stored by InterAI.</p>
             </div>
           </div>
         </div>
       </div>
 
       
-      <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
+      <div className="dashboard-card">
         <div className="mb-4 flex items-center gap-2">
           <Receipt className="h-4 w-4 text-muted-foreground" />
           <h3 className="text-sm font-semibold text-foreground">Billing History</h3>
@@ -92,7 +96,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
             <span className="ml-2 text-sm text-muted-foreground">Loading transactions...</span>
           </div>
         ) : transactions.length === 0 ? (
-          <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border/70 bg-secondary/20 py-12 text-center">
+          <div className="sub-card flex flex-col items-center justify-center rounded-lg border-dashed py-12 text-center">
             <Receipt className="mb-2 h-7 w-7 text-muted-foreground/50" />
             <p className="text-sm font-medium text-foreground">No transactions yet</p>
             <p className="mt-1 text-xs text-muted-foreground">Your billing history will appear here after your first purchase.</p>
@@ -120,7 +124,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">
                       <span className="rounded-full bg-primary/10 px-2.5 py-0.5 text-xs font-medium text-primary">
-                        {txn.plan_type || txn.payment_method || "Starter"}
+                        {txn.plan_type || txn.payment_method || "Free"}
                       </span>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3">

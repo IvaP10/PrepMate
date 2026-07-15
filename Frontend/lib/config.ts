@@ -2,9 +2,12 @@ const DEFAULT_API_BASE_URL = process.env.NODE_ENV === 'production' ? '/api' : 'h
 
 export const API_CONFIG = {
   BASE_URL: process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL,
-  TIMEOUT: 120000,
+  TIMEOUT: 30000,
   RETRY_ATTEMPTS: 3,
 } as const
+
+/** Resume upload only — must match backend RESUME_MAX_FILE_SIZE_MB (default 4). */
+export const RESUME_MAX_FILE_BYTES = 4 * 1024 * 1024
 
 export const API_ENDPOINTS = {
   AUTH: {
@@ -21,6 +24,7 @@ export const API_ENDPOINTS = {
   },
   RESUME: {
     UPLOAD: '/pre-interview/upload-resume',
+    VERSIONS: '/pre-interview/resumes',
     CONFIRM: '/pre-interview/confirm-profile',
     FORM: '/pre-interview/form',
     STATUS: '/pre-interview/profile-status',
@@ -28,18 +32,27 @@ export const API_ENDPOINTS = {
   },
   INTERVIEW: {
     START: '/interview/start',
+    BLUEPRINTS: '/interview/blueprints',
     REPORT: '/interview/report',
     STATUS: '/interview/status',
+    ANALYSIS_STATUS: '/interview',
     CANCEL: '/interview/cancel',
     WS_TICKET: '/interview/ws-ticket',
   },
-  DASHBOARD: {
-    STATS: '/dashboard/stats',
-    JOBS: '/dashboard/jobs',
-    JOB_PROFILES: '/dashboard/job-profiles',
-    RECENT_ACTIVITY: '/dashboard/recent-activity',
-    PERFORMANCE: '/dashboard/performance-trend',
-    ANALYTICS: '/dashboard/analytics',
+  ANALYSIS: {
+    RECONCILE_PERFORMANCE: '/analysis/reconcile-performance',
+  },
+  WORKSPACE: {
+    JOBS: '/workspace/jobs',
+    JOB_PROFILES: '/workspace/job-profiles',
+    INTERVIEW_PROFILE: '/workspace/interview-profile',
+    RECENT_ACTIVITY: '/workspace/recent-activity',
+    PERFORMANCE: '/workspace/performance',
+    TECHNICAL_ROUNDS: '/workspace/technical-rounds',
+    LEARNING: '/workspace/learning',
+    EXERCISES: '/workspace/exercises',
+    EXERCISE_ATTEMPT: '/workspace/exercises',
+    EXERCISE_RUN: '/workspace/exercises',
   },
   PROFILE: {
     ME: '/profile/me',
@@ -51,12 +64,14 @@ export const API_ENDPOINTS = {
     NOTIFICATION_PREFS: '/profile/notification-prefs',
     STATISTICS: '/profile/statistics',
     HISTORY: '/profile/interview-history',
+    ENTITLEMENTS: '/profile/entitlements',
   },
   PAYMENT: {
     CREATE_SUBSCRIPTION: '/payment/create-subscription',
     GET_SUBSCRIPTION: '/payment/subscription',
     VERIFY_RAZORPAY: '/payment/verify-razorpay',
     PRICING: '/payment/pricing',
+    PLANS: '/payment/plans',
     TRANSACTIONS: '/payment/transactions',
   },
 } as const

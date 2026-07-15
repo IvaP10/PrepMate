@@ -1,3 +1,28 @@
+# ============================================================================
+# MODULE: payment.py
+# PURPOSE: Razorpay order/verify/webhook + subscription state + transactions.
+#          Currently holds MEMBERSHIP_PLANS hardcoded; Phase 3 replaces with
+#          DB-backed plans served by GET /api/pricing/plans.
+# STRUCTURE:
+#   - Razorpay client init (lines 33-37)
+#   - MEMBERSHIP_PLANS literal (lines 39-90)   << Phase 3: move to DB
+#   - Pydantic models
+#   - Route handlers (lines 136-650+)
+# ENDPOINTS (prefix /api/payment):
+#   - GET  /pricing               -> calculate per-credit total (line 136)
+#   - POST /create-subscription   -> Razorpay order create (148)
+#   - POST /verify-razorpay       -> signature verify + activate plan (308)
+#   - GET  /subscription          -> current sub status (402)
+#   - POST /cancel-subscription   -> mark cancelled (444)
+#   - GET  /transactions          -> billing history (522)
+#   - POST /toggle-auto-renew     -> flip auto_renew flag (565)
+#   - POST /razorpay/webhook      -> async payment confirmation (621)
+# DEPENDS ON: auth, database, config, pricing, security_utils
+# CONSUMED BY: app.py, Frontend/lib/api.ts (createPaymentSession, verifyRazorpay,
+#              fetchPaymentTransactions, checkout page)
+# DATA TABLES: Transactions, Subscriptions, UserInfo (plan_type/is_unlimited)
+# ============================================================================
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Query
 from pydantic import BaseModel
 from typing import Dict, Optional
@@ -6,6 +31,7 @@ import logging
 import uuid
 import hmac
 import hashlib
+import json
 import razorpay
 
 from auth import get_current_user
@@ -13,6 +39,7 @@ from database import get_db
 from config import settings as app_settings
 from pricing import PRICING
 from security_utils import redact_text, stable_hash
+from entitlements import membership_plans, public_plans
 
 router = APIRouter(tags=["Payment"])
 logger = logging.getLogger("ai_interviewer.payment")
@@ -23,32 +50,35 @@ if app_settings.RAZORPAY_KEY_ID and app_settings.RAZORPAY_KEY_SECRET:
 
 RAZORPAY_WEBHOOK_SECRET = app_settings.RAZORPAY_WEBHOOK_SECRET
 
-MEMBERSHIP_PLANS = {
-    "starter": {
-        "amount": 799.0,
-        "currency": "INR",
-        "interviews": 5,
-        "is_unlimited": False,
-        "duration_days": 30,
-        "name": "Starter",
-    },
-    "pro": {
-        "amount": 1499.0,
-        "currency": "INR",
-        "interviews": None,
-        "is_unlimited": True,
-        "duration_days": 30,
-        "name": "Pro",
-    },
-    "pro_annual": {
-        "amount": 11988.0,
-        "currency": "INR",
-        "interviews": None,
-        "is_unlimited": True,
-        "duration_days": 365,
-        "name": "Pro Annual",
-    },
-}
+MEMBERSHIP_PLANS = membership_plans()
+
+
+def _razorpay_missing_config():
+    missing = []
+    if not app_settings.RAZORPAY_KEY_ID:
+        missing.append("RAZORPAY_KEY_ID")
+    if not app_settings.RAZORPAY_KEY_SECRET:
+        missing.append("RAZORPAY_KEY_SECRET")
+    if not RAZORPAY_WEBHOOK_SECRET:
+        missing.append("RAZORPAY_WEBHOOK_SECRET")
+    return missing
+
+
+def _razorpay_checkout_ready() -> bool:
+    return razorpay_client is not None and not _razorpay_missing_config()
+
+
+def _require_razorpay_checkout_ready():
+    missing = _razorpay_missing_config()
+    if missing or razorpay_client is None:
+        logger.warning(
+            "Razorpay checkout blocked; missing config: %s",
+            ", ".join(missing) if missing else "client initialization",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Payments are temporarily unavailable. Please try again later.",
+        )
 
 class CreateSubscriptionRequest(BaseModel):
     plan_type: str
@@ -64,6 +94,10 @@ class PaymentResponse(BaseModel):
     interviews_credited: Optional[int] = None
     session_url: Optional[str] = None
     provider: Optional[str] = None
+    provider_order_id: Optional[str] = None
+    currency: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    checkout_key_required: bool = True
 
 class SubscriptionResponse(BaseModel):
     subscription_id: str
@@ -78,6 +112,16 @@ class SubscriptionResponse(BaseModel):
 
 def _apply_completed_transaction(cursor, user_id: str, credits_to_grant: Optional[int], subscription_id: Optional[str]) -> str:
     if subscription_id:
+        cursor.execute(
+            """
+            UPDATE Subscriptions
+            SET status = 'cancelled', auto_renew = FALSE
+            WHERE user_id = %s
+              AND status = 'active'
+              AND subscription_id <> %s
+            """,
+            (user_id, subscription_id)
+        )
         cursor.execute(
             """
             UPDATE Subscriptions
@@ -129,6 +173,14 @@ async def get_pricing(
         raise HTTPException(status_code=400, detail="Provider must be 'razorpay'")
     return PRICING.calculate_total(sessions, provider)
 
+@router.get("/plans")
+async def get_payment_plans(current_user: Dict = Depends(get_current_user)):
+    return {
+        "plans": public_plans(),
+        "provider": "razorpay",
+        "checkout_ready": _razorpay_checkout_ready(),
+    }
+
 @router.post("/create-subscription", response_model=PaymentResponse)
 async def create_subscription(
     request: CreateSubscriptionRequest,
@@ -154,6 +206,7 @@ async def create_subscription(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Provider must be 'razorpay'"
         )
+    _require_razorpay_checkout_ready()
 
     if is_credit_purchase:
         pricing = PRICING.calculate_total(request.sessions, request.provider)
@@ -173,30 +226,63 @@ async def create_subscription(
         try:
             connection.autocommit = False
 
-            cursor.execute(
-                """
-                SELECT subscription_id, status, end_date
-                FROM Subscriptions
-                WHERE user_id = %s AND status = 'active'
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (current_user["user_id"],)
-            )
-            existing = cursor.fetchone()
-            if existing:
-                cursor.execute(
-                    "UPDATE Subscriptions SET status = 'cancelled', auto_renew = FALSE WHERE subscription_id = %s",
-                    (existing[0],)
-                )
-                logger.info("Cancelled previous subscription %s for %s", stable_hash(existing[0], "sub"), stable_hash(current_user["user_id"], "user"))
-
             transaction_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
             expires_at = now + timedelta(minutes=PRICING.TRANSACTION_EXPIRY_MINUTES)
             session_url = None
             razorpay_order_id = None
             subscription_id = None
+
+            if is_credit_purchase:
+                cursor.execute(
+                    """
+                    SELECT transaction_id
+                    FROM Transactions
+                    WHERE user_id = %s
+                      AND status = 'pending'
+                      AND amount = %s
+                      AND credits_purchased = %s
+                      AND payment_provider = %s
+                      AND subscription_id IS NULL
+                      AND expires_at > %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (current_user["user_id"], amount, request.sessions, request.provider, now)
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT t.transaction_id
+                    FROM Transactions t
+                    JOIN Subscriptions s ON s.subscription_id = t.subscription_id
+                    WHERE t.user_id = %s
+                      AND t.status = 'pending'
+                      AND t.amount = %s
+                      AND t.payment_provider = %s
+                      AND s.plan_type = %s
+                      AND t.expires_at > %s
+                    ORDER BY t.created_at DESC
+                    LIMIT 1
+                    """,
+                    (current_user["user_id"], amount, request.provider, request.plan_type, now)
+                )
+            pending_duplicate = cursor.fetchone()
+            if pending_duplicate:
+                connection.rollback()
+                connection.autocommit = True
+                return {
+                    "transaction_id": pending_duplicate[0],
+                    "amount": amount,
+                    "status": "pending",
+                    "message": "Existing pending checkout reused.",
+                    "session_url": pending_duplicate[0],
+                    "provider_order_id": pending_duplicate[0],
+                    "currency": currency,
+                    "expires_at": expires_at,
+                    "checkout_key_required": True,
+                    "provider": request.provider,
+                }
 
             if membership_plan:
                 subscription_id = str(uuid.uuid4())
@@ -221,7 +307,7 @@ async def create_subscription(
                     )
                 )
 
-            if request.provider == "razorpay" and razorpay_client:
+            if request.provider == "razorpay":
                 try:
                     order = razorpay_client.order.create({
                         "amount": int(amount * 100),
@@ -234,8 +320,6 @@ async def create_subscription(
                 except Exception as e:
                     logger.error("Razorpay order creation failed: %s", redact_text(e))
                     raise HTTPException(status_code=500, detail="Failed to initialize Razorpay order")
-            else:
-                raise HTTPException(status_code=400, detail="Razorpay is not configured")
 
             effective_txn_id = razorpay_order_id if razorpay_order_id else transaction_id
 
@@ -244,15 +328,17 @@ async def create_subscription(
                 INSERT INTO Transactions (
                     transaction_id, user_id, subscription_id, amount,
                     credits_purchased, currency, payment_method, payment_provider,
+                    provider_order_id,
                     status, expires_at, created_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     effective_txn_id, current_user["user_id"],
                     subscription_id,
                     amount, membership_plan["interviews"] if membership_plan else request.sessions, currency,
                     request.payment_method, request.provider,
+                    razorpay_order_id,
                     "pending", expires_at, now,
                 )
             )
@@ -270,6 +356,10 @@ async def create_subscription(
                 "status": "pending",
                 "message": f"Proceed to {request.provider} to complete checkout.",
                 "session_url": session_url,
+                "provider_order_id": razorpay_order_id,
+                "currency": currency,
+                "expires_at": expires_at,
+                "checkout_key_required": True,
                 "provider": request.provider,
             }
 
@@ -294,9 +384,8 @@ async def verify_razorpay_payment(
     request: VerifyRazorpayRequest,
     current_user: Dict = Depends(get_current_user)
 ):
+    _require_razorpay_checkout_ready()
     key_secret = app_settings.RAZORPAY_KEY_SECRET
-    if not key_secret:
-        raise HTTPException(status_code=500, detail="Payment verification not configured")
 
     message = f"{request.razorpay_order_id}|{request.razorpay_payment_id}"
     expected_signature = hmac.HMAC(
@@ -352,8 +441,20 @@ async def verify_razorpay_payment(
             subscription_id = txn[3]
 
             cursor.execute(
-                "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
-                (request.razorpay_order_id,)
+                """
+                UPDATE Transactions
+                SET status = 'completed',
+                    provider_order_id = COALESCE(provider_order_id, %s),
+                    provider_payment_id = %s,
+                    provider_signature_hash = %s
+                WHERE transaction_id = %s
+                """,
+                (
+                    request.razorpay_order_id,
+                    request.razorpay_payment_id,
+                    hashlib.sha256(request.razorpay_signature.encode("utf-8")).hexdigest(),
+                    request.razorpay_order_id,
+                )
             )
 
             result_kind = _apply_completed_transaction(cursor, current_user["user_id"], credits_to_grant, subscription_id)
@@ -474,7 +575,7 @@ async def cancel_subscription(current_user: Dict = Depends(get_current_user)):
                     """
                     UPDATE UserInfo
                     SET is_unlimited = FALSE,
-                        plan_type = 'free',
+                        plan_type = 'starter',
                         interviews_remaining = COALESCE(interviews_remaining, 0)
                     WHERE user_id = %s
                     """,
@@ -625,9 +726,12 @@ async def razorpay_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Signature verification failed")
 
     data = await request.json()
+    event_id = data.get("event_id") or data.get("id") or hashlib.sha256(payload).hexdigest()
     if data.get('event') in ('order.paid', 'payment.captured'):
-        payment_entity = data['payload']['payment']['entity']
-        order_id = payment_entity.get('order_id')
+        payment_entity = (data.get('payload', {}).get('payment') or {}).get('entity') or {}
+        order_entity = (data.get('payload', {}).get('order') or {}).get('entity') or {}
+        order_id = payment_entity.get('order_id') or order_entity.get('id')
+        payment_id = payment_entity.get('id')
 
         if order_id:
             with get_db() as conn:
@@ -639,14 +743,35 @@ async def razorpay_webhook(request: Request):
                         (order_id,)
                     )
                     txn = cursor.fetchone()
+                    cursor.execute(
+                        """
+                        SELECT provider_event_ids
+                        FROM Transactions
+                        WHERE transaction_id = %s
+                        """,
+                        (order_id,),
+                    )
+                    event_row = cursor.fetchone()
+                    event_ids = event_row[0] if event_row and isinstance(event_row[0], list) else []
+                    if event_id in event_ids:
+                        conn.rollback()
+                        return {"status": "success", "idempotent": True}
+
                     if txn and txn[0] == 'pending':
                         credits_to_grant = txn[1]
                         user_id = txn[2]
                         subscription_id = txn[3]
 
                         cursor.execute(
-                            "UPDATE Transactions SET status = 'completed' WHERE transaction_id = %s",
-                            (order_id,)
+                            """
+                            UPDATE Transactions
+                            SET status = 'completed',
+                                provider_order_id = COALESCE(provider_order_id, %s),
+                                provider_payment_id = COALESCE(%s, provider_payment_id),
+                                provider_event_ids = COALESCE(provider_event_ids, '[]'::jsonb) || %s::jsonb
+                            WHERE transaction_id = %s
+                            """,
+                            (order_id, payment_id, json.dumps([event_id]), order_id)
                         )
 
                         result_kind = _apply_completed_transaction(cursor, user_id, credits_to_grant, subscription_id)
@@ -659,7 +784,15 @@ async def razorpay_webhook(request: Request):
                             stable_hash(order_id, "order"),
                         )
                     else:
-                        conn.rollback()
+                        cursor.execute(
+                            """
+                            UPDATE Transactions
+                            SET provider_event_ids = COALESCE(provider_event_ids, '[]'::jsonb) || %s::jsonb
+                            WHERE transaction_id = %s
+                            """,
+                            (json.dumps([event_id]), order_id),
+                        )
+                        conn.commit()
                 except Exception:
                     conn.rollback()
                     logger.error("Razorpay webhook DB error for order=%s", stable_hash(order_id, "order"))

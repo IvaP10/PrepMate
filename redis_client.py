@@ -1,7 +1,21 @@
+# ============================================================================
+# MODULE: redis_client.py
+# PURPOSE: Pooled Redis client + interview-session save/get/delete/extend helpers.
+# STRUCTURE:
+#   - init_redis_client() / get_redis_client() (lines 22-55)
+#   - save_session / get_session / delete_session / extend_session_ttl (lines 57-112)
+#   - close_redis() (lines 114-120)
+# ENDPOINTS: none
+# DEPENDS ON: config, security_utils
+# CONSUMED BY: rate_limiter, auth, interview, technical_mode, app (lifespan)
+# DATA TABLES: none (Redis only; key prefix `interview_session:`)
+# ============================================================================
+
 import redis
-import json
+
 import logging
 from typing import Optional, Dict, Any
+from time import monotonic
 from config import settings
 from security_utils import redact_text, stable_hash
 
@@ -9,12 +23,15 @@ logger = logging.getLogger("redis_client")
 
 _redis_pool = None
 _redis_client = None
+_last_init_attempt = 0.0
+_RECONNECT_INTERVAL_SECONDS = 5.0
 
 def init_redis_client():
-    global _redis_pool, _redis_client
+    global _redis_pool, _redis_client, _last_init_attempt
     if _redis_client is not None:
         return
 
+    _last_init_attempt = monotonic()
     try:
         _redis_pool = redis.ConnectionPool(
             host=settings.REDIS_HOST,
@@ -40,65 +57,16 @@ def init_redis_client():
         _redis_pool = None
         _redis_client = None
 
-def get_redis_client():
+def get_redis_client(reconnect: bool = True):
+    if _redis_client is None and reconnect:
+        now = monotonic()
+        if now - _last_init_attempt >= _RECONNECT_INTERVAL_SECONDS:
+            init_redis_client()
     return _redis_client
 
-def save_session(session_id: str, session_data: Dict[str, Any], ttl: int = None) -> bool:
-    if not _redis_client:
-        return False
+# Alias used by knowledge_map.py and other modules that prefer the shorter name
+get_redis = get_redis_client
 
-    try:
-        key = f"interview_session:{session_id}"
-        data = json.dumps(session_data)
-
-        if ttl:
-            _redis_client.setex(key, ttl, data)
-        else:
-            _redis_client.set(key, data)
-
-        return True
-    except Exception as e:
-        logger.error("Failed to save session %s: %s", stable_hash(session_id, "session"), redact_text(e))
-        return False
-
-def get_session(session_id: str) -> Optional[Dict[str, Any]]:
-    if not _redis_client:
-        return None
-
-    try:
-        key = f"interview_session:{session_id}"
-        data = _redis_client.get(key)
-
-        if data:
-            return json.loads(data)
-        return None
-    except Exception as e:
-        logger.error("Failed to get session %s: %s", stable_hash(session_id, "session"), redact_text(e))
-        return None
-
-def delete_session(session_id: str) -> bool:
-    if not _redis_client:
-        return False
-
-    try:
-        key = f"interview_session:{session_id}"
-        _redis_client.delete(key)
-        return True
-    except Exception as e:
-        logger.error("Failed to delete session %s: %s", stable_hash(session_id, "session"), redact_text(e))
-        return False
-
-def extend_session_ttl(session_id: str, ttl: int) -> bool:
-    if not _redis_client:
-        return False
-
-    try:
-        key = f"interview_session:{session_id}"
-        _redis_client.expire(key, ttl)
-        return True
-    except Exception as e:
-        logger.error("Failed to extend session TTL %s: %s", stable_hash(session_id, "session"), redact_text(e))
-        return False
 
 def close_redis():
     global _redis_client, _redis_pool

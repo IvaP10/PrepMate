@@ -1,0 +1,137 @@
+[
+  {
+    "id": "behavioral-empty",
+    "question_type": "behavioral",
+    "question": "Tell me about a difficult decision you owned.",
+    "answer": "",
+    "rubric": {},
+    "semantic_mode": "disabled",
+    "expected_followup": "clarify",
+    "authoritative_expected": false,
+    "human_score": null
+  },
+  {
+    "id": "behavioral-owned-result-learning",
+    "question_type": "behavioral",
+    "question": "Tell me about a failure you owned, its result, and what you learned.",
+    "answer": "During a launch outage, my goal was to restore checkout safely. I owned the incident, added a rollback and bounded retries, and coordinated validation. As a result failures dropped by 30 percent for 200 customers. I learned to test the fallback before deployment.",
+    "rubric": {},
+    "semantic_mode": "disabled",
+    "expected_followup": "advance",
+    "authoritative_expected": true,
+    "human_score": 80
+  },
+  {
+    "id": "behavioral-vague-team-answer",
+    "question_type": "behavioral",
+    "question": "Tell me about a project and the impact you personally delivered.",
+    "answer": "The team built an interview product with several useful features. We worked together and the product became better for people who wanted practice.",
+    "rubric": {},
+    "semantic_mode": "disabled",
+    "expected_followup": "clarify",
+    "authoritative_expected": true,
+    "human_score": 18
+  },
+  {
+    "id": "technical-too-short",
+    "question_type": "technical",
+    "question": "Explain database indexing and its trade-off.",
+    "answer": "It makes queries faster.",
+    "rubric": {"expected_points": ["lookup", "write overhead"]},
+    "semantic_mode": "disabled",
+    "expected_followup": "clarify",
+    "authoritative_expected": false,
+    "human_score": null
+  },
+  {
+    "id": "technical-index-substantive",
+    "question_type": "technical",
+    "question": "How does a database index improve performance, and what trade-off does it create?",
+    "answer": "A database index stores selected keys in a lookup structure so the engine avoids a full table scan. I used a B-tree for range and equality lookups. The trade-off is storage and slower writes, and low selectivity can make the index ineffective.",
+    "rubric": {"expected_points": ["lookup structure", "selectivity", "write overhead"]},
+    "semantic_mode": "fixture",
+    "semantic_payload": {
+      "covered_points": ["lookup structure", "selectivity", "write overhead"],
+      "missed_points": [],
+      "incorrect_claims": [],
+      "contradictions": [],
+      "evidence_quotes": ["The trade-off is storage and slower writes"],
+      "semantic_confidence": 0.9,
+      "suggested_followup": null
+    },
+    "expected_followup": "challenge_tradeoff",
+    "authoritative_expected": true,
+    "human_score": 62
+  },
+  {
+    "id": "technical-contradiction",
+    "question_type": "technical",
+    "question": "Which cache write policy did you deploy?",
+    "answer": "I first called it write-through, but I also called the same deployed policy write-back. Those claims conflict and I need to verify the configuration.",
+    "rubric": {"expected_points": ["policy", "reason"]},
+    "semantic_mode": "fixture",
+    "semantic_payload": {
+      "covered_points": ["policy"],
+      "missed_points": ["reason"],
+      "incorrect_claims": [],
+      "contradictions": ["The deployed policy is described as both write-through and write-back."],
+      "evidence_quotes": ["I also called the same deployed policy write-back"],
+      "semantic_confidence": 0.92,
+      "suggested_followup": "Verify the deployment setting."
+    },
+    "expected_followup": "verify_contradiction",
+    "authoritative_expected": true,
+    "human_score": 35
+  },
+  {
+    "id": "technical-provider-failure",
+    "question_type": "technical",
+    "question": "Explain optimistic locking and conflict recovery.",
+    "answer": "Optimistic locking checks a version before committing. A conflicting writer causes the update to fail, after which the operation can reload state and retry with a bounded policy.",
+    "rubric": {"expected_points": ["version", "conflict", "retry"]},
+    "semantic_mode": "failure",
+    "expected_followup": "advance",
+    "authoritative_expected": false,
+    "human_score": null
+  },
+  {
+    "id": "project-architecture-evidence",
+    "question_type": "project",
+    "question": "Explain the architecture and data flow of a project you owned, including trade-offs and the result.",
+    "answer": "I owned the API design. Requests entered the gateway, were validated, then written to PostgreSQL and published to a worker queue. I chose a queue over synchronous processing to reduce latency, but accepted eventual consistency. We added retries and a dead-letter fallback. The result cut failures by 25 percent, and I learned to monitor queue age.",
+    "rubric": {"expected_points": ["ownership", "data flow", "tradeoff", "outcome"]},
+    "semantic_mode": "fixture",
+    "semantic_payload": {
+      "covered_points": ["ownership", "data flow", "tradeoff", "outcome"],
+      "missed_points": [],
+      "incorrect_claims": [],
+      "contradictions": [],
+      "evidence_quotes": ["Requests entered the gateway"],
+      "semantic_confidence": 0.9,
+      "suggested_followup": null
+    },
+    "expected_followup": "probe_evidence",
+    "authoritative_expected": true,
+    "human_score": 68
+  },
+  {
+    "id": "technical-invalid-quote-discarded",
+    "question_type": "technical",
+    "question": "Explain idempotent request handling.",
+    "answer": "I store the first committed result against a request key so a retry returns the same result without repeating the side effect.",
+    "rubric": {"expected_points": ["request key", "stored result", "retry"]},
+    "semantic_mode": "fixture",
+    "semantic_payload": {
+      "covered_points": ["request key", "stored result", "retry"],
+      "missed_points": [],
+      "incorrect_claims": [],
+      "contradictions": [],
+      "evidence_quotes": ["I store the first committed result", "I eliminated all failures forever"],
+      "semantic_confidence": 0.88,
+      "suggested_followup": null
+    },
+    "expected_followup": "advance",
+    "authoritative_expected": true,
+    "human_score": 70
+  }
+]

@@ -1,3 +1,19 @@
+# ============================================================================
+# MODULE: resume_parser.py
+# PURPOSE: Extract text + links + light metadata from PDF/DOCX resumes
+#          (PyMuPDF for selectable PDFs, PaddleOCR fallback for scans, python-docx
+#          for Word documents).
+# STRUCTURE:
+#   - ResumeParseResult dataclass (lines 23-32)
+#   - URL_PATTERN regex (line 35-38)
+#   - _normalize_text helper + per-format parsers (later in file)
+#   - parse_resume_structured(file_path) entry point
+# ENDPOINTS: none
+# DEPENDS ON: pymupdf, paddleocr, python-docx (lazy imports)
+# CONSUMED BY: pre_interview.py
+# DATA TABLES: none (returns a dict; pre_interview.py persists into UserInfo.resume_json)
+# ============================================================================
+
 from __future__ import annotations
 
 import logging
@@ -13,7 +29,7 @@ logger = logging.getLogger("resume_parser")
 @dataclass
 class ResumeParseResult:
     text: str
-    parser: str
+    parser: str 
     links: List[str]
     metadata: Dict[str, Any]
 
@@ -48,18 +64,32 @@ def _extract_links(text: str) -> List[str]:
     return list(dict.fromkeys(links))
 
 
-def _parse_pdf_with_pymupdf(file_path: str) -> ResumeParseResult:
+def _page_text_pymupdf(page) -> str:
+    blocks = page.get_text("blocks") or []
+    lines: List[str] = []
+    for block in blocks:
+        if len(block) >= 5 and isinstance(block[4], str):
+            line = block[4].strip()
+            if line:
+                lines.append(line)
+    if lines:
+        return "\n".join(lines)
+    return page.get_text("text", sort=True) or ""
+
+
+def _parse_pdf_with_pymupdf(file_path: str, *, allow_ocr: bool = True) -> ResumeParseResult:
     import fitz
 
     doc = fitz.open(file_path)
-    text_pages = [page.get_text("text") for page in doc]
+    text_pages = [_page_text_pymupdf(page) for page in doc]
     ocr_pages: List[str] = []
+    normalized_preview = _normalize_text("\n".join(text_pages))
     low_text_pages = [
         index
         for index, text in enumerate(text_pages)
         if len((text or "").strip()) < 80
     ]
-    if low_text_pages or len(_normalize_text("\n".join(text_pages))) < 250:
+    if allow_ocr and (low_text_pages or len(normalized_preview) < 250):
         ocr_pages = _ocr_pdf_pages(doc, low_text_pages or list(range(len(doc))))
     pages = text_pages + ocr_pages
     page_count = len(doc)
@@ -90,7 +120,7 @@ def _get_paddle_ocr():
         return _paddle_ocr
     _paddle_loaded = True
     try:
-        from paddleocr import PaddleOCR
+        from paddleocr import PaddleOCR  # type: ignore[import-not-found]
 
         try:
             _paddle_ocr = PaddleOCR(
@@ -182,7 +212,7 @@ def _flatten_ocr_result(value: Any) -> List[str]:
 
 
 def _parse_docx_with_python_docx(file_path: str) -> ResumeParseResult:
-    from docx import Document
+    from docx import Document  # type: ignore[import-not-found]
 
     doc = Document(file_path)
     parts = [para.text for para in doc.paragraphs if para.text and para.text.strip()]
@@ -202,7 +232,7 @@ def _parse_docx_with_python_docx(file_path: str) -> ResumeParseResult:
     )
 
 
-def parse_resume_structured(file_path: str) -> Dict[str, Any]:
+def parse_resume_structured(file_path: str, *, fast: bool = False) -> Dict[str, Any]:
     if not os.path.exists(file_path):
         raise FileNotFoundError("Resume file not found")
 
@@ -211,12 +241,13 @@ def parse_resume_structured(file_path: str) -> Dict[str, Any]:
 
     try:
         if ext == ".pdf":
-            result = _parse_pdf_with_pymupdf(file_path)
+            result = _parse_pdf_with_pymupdf(file_path, allow_ocr=not fast)
         elif ext == ".docx":
             result = _parse_docx_with_python_docx(file_path)
         else:
             raise ValueError("No parser for this file type")
         parsed = result.to_dict()
+        parsed["metadata"]["fast"] = fast
         parsed["metadata"]["errors"] = errors
         return parsed
     except Exception as exc:

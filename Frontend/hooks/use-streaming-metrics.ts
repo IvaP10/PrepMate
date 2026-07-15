@@ -16,7 +16,7 @@ interface MetricsConfig {
 const DEFAULT_METRICS: StreamingMetrics = {
   engagement: { value: 50, label: "Moderate" },
   cameraContact: { value: 50, label: "Optimal" },
-  pace: { wpm: 0, label: "—" },
+  pace: { wpm: 0, label: "-" },
   dynamicTip: null,
 }
 
@@ -84,7 +84,7 @@ export function useStreamingMetrics(config: MetricsConfig = {}) {
 
   const calculateWPM = useCallback(() => {
     if (!speechStartRef.current || wordCountRef.current === 0) {
-      return { wpm: 0, label: "—" }
+      return { wpm: 0, label: "-" }
     }
 
     const elapsedMinutes = (Date.now() - speechStartRef.current) / 60000

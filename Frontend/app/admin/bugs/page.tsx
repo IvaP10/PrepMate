@@ -105,16 +105,16 @@ export default function AdminBugsPage() {
             <p className="text-sm text-muted-foreground">Hidden admin route</p>
             <h1 className="mt-1 text-3xl font-bold tracking-tight">Support Inbox</h1>
             <p className="mt-2 text-sm text-muted-foreground">
-              Review bug reports and product feedback submitted from the dashboard.
+              Review bug reports and product feedback submitted from the app.
             </p>
           </div>
           <div className="grid grid-cols-2 gap-3 md:w-[340px]">
             <div className="rounded-xl border border-border bg-card p-4">
-              <p className="text-xs uppercase tracking-wide text-muted-foreground">Total</p>
+              <p className="text-xs text-muted-foreground">Total</p>
               <p className="mt-2 text-2xl font-semibold">{submissions.length}</p>
             </div>
             <div className="rounded-xl border border-border bg-card p-4">
-              <p className="text-xs uppercase tracking-wide text-muted-foreground">Bug Reports</p>
+              <p className="text-xs text-muted-foreground">Bug Reports</p>
               <p className="mt-2 text-2xl font-semibold">{bugCount}</p>
             </div>
           </div>
@@ -179,10 +179,10 @@ export default function AdminBugsPage() {
                 <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="rounded-full border border-border bg-secondary/40 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      <span className="rounded-full border border-border bg-secondary/40 px-2.5 py-1 text-xs font-semibold text-muted-foreground">
                         {submission.kind}
                       </span>
-                      <span className="rounded-full border border-border bg-secondary/40 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      <span className="rounded-full border border-border bg-secondary/40 px-2.5 py-1 text-xs font-semibold text-muted-foreground">
                         {submission.status}
                       </span>
                     </div>
@@ -217,12 +217,12 @@ export default function AdminBugsPage() {
                 <div className="mt-5 grid gap-4 lg:grid-cols-[1.5fr_1fr]">
                   <div className="space-y-4">
                     <div className="rounded-xl border border-border/70 bg-secondary/10 p-4">
-                      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Message</p>
+                      <p className="text-xs font-semibold text-muted-foreground">Message</p>
                       <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-foreground/85">{submission.message}</p>
                     </div>
                     {submission.steps && (
                       <div className="rounded-xl border border-border/70 bg-secondary/10 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Steps to Reproduce</p>
+                        <p className="text-xs font-semibold text-muted-foreground">Steps to Reproduce</p>
                         <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-foreground/85">{submission.steps}</p>
                       </div>
                     )}
@@ -231,19 +231,19 @@ export default function AdminBugsPage() {
                     <div className="rounded-xl border border-border/70 bg-secondary/10 p-4 text-sm">
                       <div className="flex items-center justify-between gap-3">
                         <span className="text-muted-foreground">Interview ID</span>
-                        <span className="font-medium">{submission.interview_id || "—"}</span>
+                        <span className="font-medium">{submission.interview_id || "-"}</span>
                       </div>
                       <div className="mt-3 flex items-center justify-between gap-3">
                         <span className="text-muted-foreground">Rating</span>
-                        <span className="font-medium">{submission.rating || "—"}</span>
+                        <span className="font-medium">{submission.rating || "-"}</span>
                       </div>
                       <div className="mt-3 flex items-start justify-between gap-3">
                         <span className="text-muted-foreground">Page</span>
-                        <span className="max-w-[220px] text-right font-medium text-foreground/80">{submission.page_url || "—"}</span>
+                        <span className="max-w-[220px] text-right font-medium text-foreground/80">{submission.page_url || "-"}</span>
                       </div>
                     </div>
                     <div>
-                      <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Admin Notes</p>
+                      <p className="mb-2 text-xs font-semibold text-muted-foreground">Admin Notes</p>
                       <Textarea
                         value={notesDraft[submission.submission_id] || ""}
                         onChange={(event) =>

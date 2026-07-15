@@ -42,8 +42,8 @@ export default function StatusPage() {
         <div className="mt-4 space-y-2">
           {Object.entries(status?.components || {}).map(([name, value]) => (
             <div key={name} className="flex items-center justify-between rounded-lg border border-border bg-card px-4 py-3">
-              <span className="capitalize">{name.replace(/_/g, " ")}</span>
-              <span className={value === "operational" ? "text-emerald-500" : "text-amber-500"}>{value}</span>
+              <span className="text-xs font-bold uppercase tracking-wider">{name.replace(/_/g, " ")}</span>
+              <span className={`text-xs font-bold uppercase tracking-wider ${value === "operational" ? "text-emerald-500" : "text-amber-500"}`}>{value}</span>
             </div>
           ))}
         </div>

@@ -1,75 +1,88 @@
-# InterAI V1 Architecture
+# InterAI
 
-InterAI is a FastAPI + Next.js interview-practice platform. V1 uses deterministic parsing first, AI only where it materially improves interview generation or coaching, and keeps sensitive media processing on the client.
+InterAI is an evidence-based interview practice application. A FastAPI API, Next.js frontend, PostgreSQL database, Redis cache, and separate durable worker power four connected areas:
 
-## V1 Stack
+- Interview Round: a single continuous, screen-shared voice interview with a required microphone and an optional camera.
+- Technical Round: a separate proctored, typed coding/debugging/concept/system-design flow whose code runs in a private gVisor sandbox.
+- Performance: canonical, version-comparable analysis only; missing evidence stays unknown.
+- Improve: interactive missions, timed activities, saved drafts, held-out checkpoints, and later-interview validation.
 
-| Area | V1 Choice |
-| --- | --- |
-| Resume extraction | PyMuPDF text extraction with PaddleOCR fallback for scanned PDFs |
-| Resume parsing | Rule-based parser using regex, optional spaCy NER, and an EMSI-compatible skill lexicon |
-| Resume AI fallback | Only when rule-parser confidence is below `RESUME_AI_FALLBACK_CONFIDENCE` |
-| Interview generation | Gemini 2.5 Flash primary, Groq fallback, OpenAI emergency fallback |
-| Observability | Langfuse-compatible AI events, optional PostHog, optional Sentry |
-| STT | Groq Whisper |
-| TTS | Kokoro-82M self-hosted |
-| Body language | Browser MediaPipe only; no video frames over WebSocket |
-| Technical mode | Monaco editor, Piston execution, Excalidraw system-design whiteboard, anti-cheat events |
-| Payments | Razorpay only |
-| Free cap | 3 free interviews per user per day |
+Both Interview and Technical flows offer four distinct profiles: Top Tier, Mid Tier, Startup, and Custom. Every session starts from an internal, immutable, versioned blueprint tied to a resume version and job target; exact questions and internal scoring plans are never exposed before the attempt.
 
-## Core Flow
+## Local development
 
-```mermaid
-sequenceDiagram
-    participant FE as Next.js
-    participant API as FastAPI
-    participant Parser as Resume Parser
-    participant LLM as LLM Router
-    participant DB as Postgres
+Requirements: Python 3.12+, Node.js 20+, PostgreSQL 16, and Redis 7. Copy `key.env.example` to `key.env`, use non-placeholder secrets, and keep `ENVIRONMENT=development` for local HTTP.
 
-    FE->>API: Upload resume
-    API->>Parser: PyMuPDF/PaddleOCR extraction
-    Parser->>Parser: Regex + spaCy + skills parsing
-    alt Confidence low
-        Parser->>LLM: AI fallback extraction
-    end
-    API->>DB: Save resume/profile JSON
-
-    FE->>API: Start interview
-    API->>DB: Enforce daily free cap and credits
-    API->>LLM: Gemini question map, failover if needed
-    API->>DB: Create interview
-
-    FE->>API: WebSocket audio chunks
-    API->>Groq: Whisper transcription
-    API->>LLM: Evaluation/follow-up/coaching
-    API->>DB: Save turns, scores, telemetry
-
-    FE->>FE: MediaPipe body-language analysis
-    FE->>API: Client body-language metrics only
-
-    API->>DB: Final report + custom coach exercises
+```bash
+python3 -m pip install -r requirements.txt
+cd Frontend && npm ci && cd ..
+python3 -m alembic upgrade head
 ```
 
-## Important Files
+Run three processes in separate terminals:
 
-- `resume_parser.py`: PyMuPDF extraction plus PaddleOCR OCR fallback.
-- `resume_rules.py`: deterministic resume profile extraction.
-- `llm_router.py`: Gemini to Groq to OpenAI failover with telemetry.
-- `ai_services.py`: Groq Whisper STT, Kokoro speech, evaluation, hints.
-- `interview.py`: interview lifecycle, daily free cap, browser metric ingestion, anti-cheat event logging.
-- `technical_mode.py`: technical rounds, Piston execution, Excalidraw state persistence.
-- `coach.py`: creates four adaptive exercise types after each interview.
-- `observability.py`: Sentry/PostHog/Langfuse-compatible event plumbing.
+```bash
+uvicorn app:app --reload --host 0.0.0.0 --port 8000
+python3 worker.py
+cd Frontend && npm run dev
+```
 
-## Production Essentials
+The API commits analysis and code-execution jobs; only `worker.py` claims them. Production code never runs untrusted submissions on the API host.
 
-- `/health`: machine health checks for API, database, Redis, LLM config, STT, and payments.
-- `/api/status`: public status payload used by the frontend status page.
-- `/status`: frontend status page.
-- `/terms` and `/privacy`: legal pages.
+## Option A Docker deployment
 
-## Dropped From V1
+Docker Compose supplies PostgreSQL, Redis, the migration job, API, worker, Next.js, Caddy TLS proxy, a network-private Prometheus collector with alert rules, and authenticated encrypted PostgreSQL backups. `/metrics` is intentionally absent from Caddy's public routes and the bundled collector scrapes it only across the private `app` network. Leave `METRICS_BEARER_TOKEN` empty for this bundled topology; a replacement collector must send that bearer token when one is configured. Production requires a separate private sandbox executor; the public application stack never mounts a Docker socket. Execution hosts install and register gVisor's `runsc` runtime and run the executor-only Compose file documented in [`infra/sandbox/README.md`](infra/sandbox/README.md).
 
-Stripe, DeepFace, Docling, OpenAI Whisper, OpenAI TTS, and server-side video frame processing are not part of the V1 path.
+```bash
+cp key.env.example key.env
+# Fill all production values, including HTTPS origins/URLs, secure cookies,
+# PISTON_API_URL for the private executor, and BACKUP_ENCRYPTION_KEY.
+docker compose --env-file key.env config --quiet
+docker compose --env-file key.env up --build -d
+curl -fsS https://YOUR_DOMAIN/live
+curl -fsS https://YOUR_DOMAIN/ready
+```
+
+`/live` proves only that the API process is alive. `/ready` is the deployment gate: database connectivity and exact Alembic head, Redis, OpenAI configuration, isolated sandbox runtimes, fresh analysis/technical worker heartbeats, and stuck-job checks must all pass. The API container health check uses `/ready`, so the frontend and proxy are not declared ready over a degraded pipeline.
+
+Run Compose with `--env-file key.env`; this keeps PostgreSQL credentials and required private-service/backup settings used for interpolation aligned with the API, worker, migration, and backup services.
+
+After readiness passes, run the dependency-free latency gate against each intended deployment route. Protected routes accept `--cookie` (or `--bearer` where bearer auth is enabled) for a dedicated disposable test account:
+
+```bash
+python3 scripts/load_smoke.py --path /live --requests 200 --concurrency 20 --p95-ms 500
+python3 scripts/load_smoke.py --path /api/dashboard/home --cookie "interai_session=$LOAD_TEST_SESSION" --requests 100 --concurrency 10 --p95-ms 1000
+```
+
+## Evidence and scoring contract
+
+- Raw answers, transcripts, resume/JD content, reports, and source code use encrypted-at-rest columns.
+- Responses are immutable; assessments are append-only and versioned.
+- The application owns state transitions, follow-ups, weighted rubrics, code correctness, mission progress, and entitlements.
+- OpenAI is limited to transcription, structured semantic evidence, optional wording, and narrative. Structured calls use strict schemas and `store=false`.
+- A required dimension without evidence is `null`. Empty or short answers are insufficient evidence, never an authoritative zero.
+- Coding correctness comes only from visible and encrypted hidden tests run in the private gVisor sandbox.
+- Performance reads `SessionPerformanceAnalyses`; it does not recompute a competing score from legacy rows.
+- Passing an Improve exercise does not resolve a weakness. A held-out variation plus later comparable interview evidence is required.
+- Client-supplied Improve scores, bonuses, condition results, and mastery decisions are ignored.
+
+Raw audio/video retention defaults to disabled (`RAW_VIDEO_RETENTION_HOURS=0`, `AUDIO_RETENTION_DAYS=0`). The app persists transcripts, real timing, and approved browser-derived signals instead.
+
+## Validation
+
+```bash
+python3 -m pytest -q
+python3 -m alembic upgrade head
+python3 -m compileall -q .
+cd Frontend && npm run lint -- --incremental false && npm run build
+```
+
+For a release, also prove an empty-database migration and an existing-database upgrade, worker lease/restart recovery, duplicate answer/finalization behavior, sandbox hidden-test secrecy and adversarial resource-limit probes, export/delete coverage, authenticated browser flows across all four areas, and the latency gates in the implementation plan.
+
+## Operational notes
+
+- Use `python3 -m alembic upgrade head`; do not apply `schema.sql` or individual SQL migrations in production.
+- AES-256-GCM authenticated backups are written to the `postgres_backups` volume and retained for seven days. A backup is not accepted until the isolated restore drill in [`infra/OPERATIONS_RUNBOOK.md`](infra/OPERATIONS_RUNBOOK.md) passes.
+- Run the public desktop/mobile browser gate with `cd Frontend && npm run test:e2e`. The authenticated release suite fails closed unless a disposable account and exact seeded lifecycle IDs are supplied to `npm run test:e2e:release`.
+- Keep Caddy’s application domain, `APP_BASE_URL`, `API_BASE_URL`, `ALLOWED_ORIGINS`, cookie domain, and `COOKIE_SECURE=true` aligned in production.
+- Public execution endpoints, local subprocesses, and host-runtime fallbacks are rejected as production dependencies.

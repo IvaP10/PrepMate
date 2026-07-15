@@ -1,17 +1,20 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useLayoutEffect, useCallback } from "react"
+import { applyFavicon } from "@/lib/favicon"
+import { safeStorageGet, safeStorageSet } from "@/lib/safe-storage"
 
 type Theme = "light" | "dark"
 
 const STORAGE_KEY = "interai-theme"
+let themeTransitionTimeout: ReturnType<typeof setTimeout> | undefined
 
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>("dark")
 
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY) as Theme | null
+      const stored = safeStorageGet("local", STORAGE_KEY) as Theme | null
       if (stored === "light" || stored === "dark") {
         setThemeState(stored)
         applyTheme(stored)
@@ -26,21 +29,21 @@ export function useTheme() {
     }
   }, [])
 
+  useLayoutEffect(() => {
+    applyTheme(theme)
+  }, [theme])
+
   const setTheme = useCallback((t: Theme) => {
     setThemeState(t)
     applyTheme(t, true)
-    try {
-      localStorage.setItem(STORAGE_KEY, t)
-    } catch {}
+    safeStorageSet("local", STORAGE_KEY, t)
   }, [])
 
   const toggleTheme = useCallback(() => {
     setThemeState((prev) => {
       const next = prev === "dark" ? "light" : "dark"
       applyTheme(next, true)
-      try {
-        localStorage.setItem(STORAGE_KEY, next)
-      } catch {}
+      safeStorageSet("local", STORAGE_KEY, next)
       return next
     })
   }, [])
@@ -52,18 +55,26 @@ function applyTheme(theme: Theme, animate = false) {
   const root = document.documentElement
 
   if (animate) {
+    if (themeTransitionTimeout) {
+      clearTimeout(themeTransitionTimeout)
+    }
     root.classList.add("theme-transition")
+    void root.offsetWidth
   }
 
   if (theme === "dark") {
+    root.classList.remove("light")
     root.classList.add("dark")
   } else {
     root.classList.remove("dark")
+    root.classList.add("light")
   }
+  applyFavicon(theme)
 
   if (animate) {
-    setTimeout(() => {
+    themeTransitionTimeout = setTimeout(() => {
       root.classList.remove("theme-transition")
-    }, 550)
+      themeTransitionTimeout = undefined
+    }, 950)
   }
 }

@@ -42,16 +42,28 @@ export function ResumeProvider({
   const [justParsed, setJustParsed] = useState(false)
 
   useEffect(() => {
-    if (!userId) return
+    if (!userId) {
+      setResumeData(null)
+      setLoading(false)
+      setError(null)
+      return
+    }
     let cancelled = false
 
     const loadSavedResume = async () => {
+      setLoading(true)
+      setError(null)
       try {
         const saved = await getResume()
-        if (!cancelled && saved?.fullName) {
-          setResumeData(saved)
+        if (!cancelled) {
+          setResumeData(saved?.fullName ? saved : null)
         }
-      } catch {
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : 'Failed to load the active resume.')
+        }
+      } finally {
+        if (!cancelled) setLoading(false)
       }
     }
 

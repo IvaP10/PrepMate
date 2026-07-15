@@ -1,3 +1,15 @@
+# ============================================================================
+# MODULE: rate_limiter.py
+# PURPOSE: Sliding-window rate limiter with Redis primary + in-process fallback.
+# STRUCTURE:
+#   - RateLimiter (process-local, max_calls/window)            (lines 24-44)
+#   - UserRateLimiter (per-user, Redis-backed + fallback)      (lines 46-129)
+# ENDPOINTS: none
+# DEPENDS ON: redis_client (lazy)
+# CONSUMED BY: ai_services, interview, pre_interview, auth
+# DATA TABLES: none (Redis only; key prefix from `redis_prefix` ctor arg)
+# ============================================================================
+
 import asyncio
 import logging
 from collections import deque
@@ -12,6 +24,14 @@ def _get_redis():
         return get_redis_client()
     except Exception:
         return None
+
+
+def _production() -> bool:
+    try:
+        from config import settings
+        return settings.ENVIRONMENT == "production"
+    except Exception:
+        return False
 
 class RateLimiter:
     def __init__(self, max_calls: int, time_window: int):
@@ -49,6 +69,9 @@ class UserRateLimiter:
         redis_client = _get_redis()
         if redis_client:
             return await self._check_redis(redis_client, user_id)
+        if _production():
+            logger.error("Distributed rate limit unavailable in production; rejecting request")
+            return False
         return await self._check_memory(user_id)
 
     async def _check_redis(self, redis_client, user_id: str) -> bool:
@@ -71,6 +94,9 @@ class UserRateLimiter:
 
             return True
         except Exception:
+            if _production():
+                logger.error("Distributed rate limit failed in production; rejecting request")
+                return False
             logger.warning("Redis rate limit check failed, falling back to memory")
             return await self._check_memory(user_id)
 

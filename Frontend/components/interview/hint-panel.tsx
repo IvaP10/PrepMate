@@ -22,26 +22,26 @@ export function HintPanel({ hints, isVisible = true }: HintPanelProps) {
   }, [hints])
   if (!isVisible || hints.length === 0) return null
   return (
-    <div className="bg-white/[0.03] backdrop-blur-md rounded-xl border border-white/10 overflow-hidden">
+    <div className="bg-card rounded-xl border border-border overflow-hidden">
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/5 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 hover:bg-secondary transition-colors"
       >
         <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-lg bg-amber-500/20 flex items-center justify-center">
-            <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+          <div className="w-6 h-6 rounded-lg bg-secondary flex items-center justify-center">
+            <Sparkles className="w-3.5 h-3.5 text-primary" />
           </div>
-          <h3 className="text-sm font-semibold text-white/80">AI Suggestions</h3>
+          <h3 className="text-sm font-semibold text-foreground">Suggestions</h3>
           {displayedHints.length > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-bold">
+            <span className="px-1.5 py-0.5 rounded-full bg-primary/10 text-primary text-xs font-semibold">
               {displayedHints.length}
             </span>
           )}
         </div>
         {isExpanded ? (
-          <ChevronUp className="w-4 h-4 text-white/40" />
+          <ChevronUp className="w-4 h-4 text-muted-foreground" />
         ) : (
-          <ChevronDown className="w-4 h-4 text-white/40" />
+          <ChevronDown className="w-4 h-4 text-muted-foreground" />
         )}
       </button>
       {isExpanded && (
@@ -49,11 +49,11 @@ export function HintPanel({ hints, isVisible = true }: HintPanelProps) {
           {displayedHints.map((hint, i) => (
             <div
               key={i}
-              className="flex items-start gap-2 p-2.5 rounded-lg bg-white/[0.02] border border-white/5 animate-in fade-in slide-in-from-bottom-1 duration-300"
+              className="flex items-start gap-2 p-2.5 rounded-lg bg-secondary border border-border animate-in fade-in slide-in-from-bottom-1 duration-300"
               style={{ animationDelay: `${i * 100}ms` }}
             >
-              <Lightbulb className="w-3.5 h-3.5 text-amber-400/70 mt-0.5 shrink-0" />
-              <p className="text-xs text-white/60 leading-relaxed">{hint}</p>
+              <Lightbulb className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
+              <p className="text-xs text-muted-foreground leading-relaxed">{hint}</p>
             </div>
           ))}
         </div>

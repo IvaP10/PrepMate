@@ -20,8 +20,8 @@ export default function GlobalError({
           height: "100vh",
           gap: "16px",
           fontFamily: "system-ui, sans-serif",
-          background: "#0a0a0a",
-          color: "#fff",
+          background: "#0B0F0E",
+          color: "#F3F6F5",
         }}>
           <h2 style={{ fontSize: "18px", fontWeight: 600 }}>Something went wrong</h2>
           <button
@@ -29,9 +29,9 @@ export default function GlobalError({
             style={{
               padding: "8px 20px",
               borderRadius: "8px",
-              border: "1px solid #333",
-              background: "#1a1a1a",
-              color: "#fff",
+              border: "1px solid #2E3835",
+              background: "#171D1B",
+              color: "#F3F6F5",
               cursor: "pointer",
               fontSize: "14px",
             }}

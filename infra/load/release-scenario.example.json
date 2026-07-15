@@ -1,0 +1,39 @@
+{
+  "operations": [
+    {
+      "name": "dashboard-performance",
+      "method": "GET",
+      "path": "/api/workspace/performance?mode=mock",
+      "headers": {"Cookie": "interai_session=${LOAD_TEST_SESSION}"},
+      "expected_statuses": [200],
+      "weight": 4
+    },
+    {
+      "name": "report-poll",
+      "method": "GET",
+      "path": "/api/interview/${LOAD_REPORT_INTERVIEW_ID}/analysis-status",
+      "headers": {"Cookie": "interai_session=${LOAD_TEST_SESSION}"},
+      "expected_statuses": [200],
+      "weight": 3
+    },
+    {
+      "name": "improve-draft-save",
+      "method": "PATCH",
+      "path": "/api/workspace/exercises/${LOAD_EXERCISE_ID}/attempt-session/${LOAD_ATTEMPT_SESSION_ID}",
+      "headers": {
+        "Cookie": "interai_session=${LOAD_TEST_SESSION}; csrf_token=${LOAD_CSRF_TOKEN}",
+        "X-CSRF-Token": "${LOAD_CSRF_TOKEN}",
+        "Idempotency-Key": "${LOAD_IDEMPOTENCY_KEY}"
+      },
+      "body": {
+        "mission_id": "${LOAD_MISSION_ID}",
+        "roadmap_node_id": "${LOAD_ROADMAP_NODE_ID}",
+        "idempotency_key": "${LOAD_IDEMPOTENCY_KEY}",
+        "status": "in_progress",
+        "draft_payload": {"answer": "capacity-safe disposable draft"}
+      },
+      "expected_statuses": [200],
+      "weight": 1
+    }
+  ]
+}

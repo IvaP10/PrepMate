@@ -1,13 +1,60 @@
+# ============================================================================
+# MODULE: database.py
+# PURPOSE: psycopg2 ThreadedConnectionPool + sync/async query helpers.
+#          Schema management is handled exclusively by Alembic.
+# STRUCTURE:
+#   - init / get / return / close pool helpers
+#   - verify_schema_migrations() — production boot check
+#   - ensure_runtime_schema() — compatibility wrapper around Alembic upgrade
+#   - get_db() / transaction() / async_execute() query helpers
+# ENDPOINTS: none
+# DEPENDS ON: config
+# CONSUMED BY: every router + every domain module that touches DB
+# ============================================================================
+
 import psycopg2
 import psycopg2.pool  # noqa: F401
 import logging
 import asyncio
+import json
 from contextlib import contextmanager, asynccontextmanager
 from config import settings
 
 logger = logging.getLogger("database")
 
 _connection_pool = None
+ALEMBIC_HEAD_REVISION = "015_improve_graph_invariants"
+REQUIRED_SCHEMA_TABLES = (
+    "ResumeVersions",
+    "InterviewBlueprints",
+    "ResponseAssessments",
+    "SessionPerformanceAnalyses",
+    "WeaknessStates",
+    "TechnicalProblemBank",
+    "TechnicalExecutionJobs",
+    "AnalysisJobs",
+    "AIUsageReservations",
+    "AttemptContextSnapshots",
+    "AttemptPreflightChecks",
+    "AttemptIntegrityEvents",
+)
+REQUIRED_SCHEMA_COLUMNS = {
+    "Interviews": {
+        "blueprint_id", "resume_id", "job_profile_id", "llm_cost_usd",
+        "analysis_job_id", "attempt_status", "analysis_status", "integrity_status",
+        "lifecycle_revision", "context_snapshot_id",
+    },
+    "ResumeVersions": {"parent_resume_id", "superseded_at", "immutable_at"},
+    "InterviewResponses": {"idempotency_key", "evidence_hash", "answer_text_encrypted"},
+    "AnalysisJobs": {"lease_owner", "lease_expires_at", "heartbeat_at", "next_attempt_at"},
+    "AnalysisStageOutputs": {"stage_version", "evidence_hash", "output_encrypted"},
+    "SessionPerformanceAnalyses": {
+        "evaluator_version", "taxonomy_version", "rubric_version",
+        "analysis_json_encrypted", "evidence_index_encrypted",
+    },
+    "TechnicalExecutionJobs": {"lease_owner", "lease_expires_at", "heartbeat_at", "next_attempt_at"},
+    "ImprovementAttemptSessions": {"deadline_at", "remaining_seconds", "expires_at"},
+}
 
 def init_connection_pool():
     global _connection_pool
@@ -54,160 +101,78 @@ def close_connection_pool():
         _connection_pool = None
         logger.info("PostgreSQL connection pool closed")
 
-def ensure_runtime_schema():
+def verify_schema_migrations():
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        statements = [
-            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS external_profile_signals JSONB",
-            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE Interviews ADD COLUMN IF NOT EXISTS report_json JSONB",
-            "ALTER TABLE InterviewQuestions ADD COLUMN IF NOT EXISTS topic_label VARCHAR(255)",
-            "ALTER TABLE InterviewQuestions ADD COLUMN IF NOT EXISTS expected_signal TEXT",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS evaluation_json JSONB",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS technical_accuracy NUMERIC(5,2)",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS communication NUMERIC(5,2)",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS problem_solving NUMERIC(5,2)",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS confidence NUMERIC(5,2)",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS relevance NUMERIC(5,2)",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS answer_quality_flags JSONB DEFAULT '[]'::jsonb",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS evidence_quotes JSONB DEFAULT '[]'::jsonb",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS retry_state JSONB",
-            "ALTER TABLE InterviewResponses ADD COLUMN IF NOT EXISTS stt_confidence NUMERIC(5,2)",
-            """
-            CREATE TABLE IF NOT EXISTS JobProfiles (
-                profile_id SERIAL PRIMARY KEY,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                role VARCHAR(255) NOT NULL,
-                company VARCHAR(255),
-                tech_stack JSONB NOT NULL DEFAULT '[]'::jsonb,
-                is_selected BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        cursor.execute("SELECT to_regclass('public.alembic_version')")
+        if not cursor.fetchone()[0]:
+            raise RuntimeError("Alembic version table is missing; run `python -m alembic upgrade head`")
+        cursor.execute("SELECT version_num FROM alembic_version")
+        revisions = {str(row[0]) for row in cursor.fetchall()}
+        if revisions != {ALEMBIC_HEAD_REVISION}:
+            current = ", ".join(sorted(revisions)) or "none"
+            raise RuntimeError(
+                f"Database is not at Alembic head {ALEMBIC_HEAD_REVISION}; current revision: {current}"
             )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_job_profiles_user ON JobProfiles (user_id, created_at DESC)",
-            """
-            CREATE TABLE IF NOT EXISTS SupportSubmissions (
-                submission_id BIGSERIAL PRIMARY KEY,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                interview_id VARCHAR(64) REFERENCES Interviews(interview_id) ON DELETE SET NULL,
-                kind VARCHAR(20) NOT NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'open',
-                title VARCHAR(255),
-                message TEXT NOT NULL,
-                steps TEXT,
-                rating SMALLINT,
-                page_url TEXT,
-                admin_notes TEXT,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+
+        missing_tables = []
+        for table_name in REQUIRED_SCHEMA_TABLES:
+            cursor.execute("SELECT to_regclass(%s)", (f"public.{table_name.lower()}",))
+            if not cursor.fetchone()[0]:
+                missing_tables.append(table_name)
+
+        missing_columns = []
+        for table_name, required_columns in REQUIRED_SCHEMA_COLUMNS.items():
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table_name.lower(),),
             )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_support_user_created ON SupportSubmissions (user_id, created_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_support_status_created ON SupportSubmissions (status, created_at DESC)",
-            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS avatar_url TEXT",
-            "ALTER TABLE UserInfo ADD COLUMN IF NOT EXISTS notification_prefs JSONB NOT NULL DEFAULT '{}'::jsonb",
-            f"ALTER TABLE UserInfo ALTER COLUMN interviews_remaining SET DEFAULT {settings.FREE_CREDITS_ON_SIGNUP}",
-            """
-            CREATE TABLE IF NOT EXISTS AIEventLogs (
-                event_id BIGSERIAL PRIMARY KEY,
-                user_id VARCHAR(64),
-                interview_id VARCHAR(64),
-                event_type VARCHAR(80) NOT NULL,
-                provider VARCHAR(40),
-                model VARCHAR(120),
-                prompt_tokens INTEGER,
-                output_tokens INTEGER,
-                latency_ms INTEGER,
-                success BOOLEAN NOT NULL DEFAULT TRUE,
-                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_ai_event_logs_created ON AIEventLogs (created_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_ai_event_logs_interview ON AIEventLogs (interview_id, created_at DESC)",
-            """
-            CREATE TABLE IF NOT EXISTS CoachExercises (
-                exercise_id VARCHAR(64) PRIMARY KEY,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                interview_id VARCHAR(64) REFERENCES Interviews(interview_id) ON DELETE SET NULL,
-                exercise_type VARCHAR(30) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                prompt TEXT NOT NULL,
-                project_anchor VARCHAR(255),
-                weakness_key VARCHAR(80),
-                status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                completed_at TIMESTAMP,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_coach_exercises_user_status ON CoachExercises (user_id, status, created_at DESC)",
-            """
-            CREATE TABLE IF NOT EXISTS TechnicalInterviewRounds (
-                round_id VARCHAR(64) PRIMARY KEY,
-                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                round_type VARCHAR(30) NOT NULL,
-                language VARCHAR(20),
-                prompt TEXT NOT NULL,
-                starter_code TEXT,
-                whiteboard_json JSONB,
-                status VARCHAR(20) NOT NULL DEFAULT 'active',
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                completed_at TIMESTAMP
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_technical_rounds_interview ON TechnicalInterviewRounds (interview_id, round_type)",
-            """
-            CREATE TABLE IF NOT EXISTS TechnicalRunEvents (
-                run_id VARCHAR(64) PRIMARY KEY,
-                round_id VARCHAR(64) REFERENCES TechnicalInterviewRounds(round_id) ON DELETE CASCADE,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                language VARCHAR(20) NOT NULL,
-                source_chars INTEGER NOT NULL DEFAULT 0,
-                stdout TEXT,
-                stderr TEXT,
-                exit_code INTEGER,
-                runtime_ms INTEGER,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_technical_run_events_round ON TechnicalRunEvents (round_id, created_at DESC)",
-            """
-            CREATE TABLE IF NOT EXISTS ClientBodyLanguageMetrics (
-                metric_id BIGSERIAL PRIMARY KEY,
-                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_client_body_language_interview ON ClientBodyLanguageMetrics (interview_id, created_at DESC)",
-            """
-            CREATE TABLE IF NOT EXISTS AntiCheatEvents (
-                event_id BIGSERIAL PRIMARY KEY,
-                interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
-                user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
-                event_type VARCHAR(50) NOT NULL,
-                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_anti_cheat_interview ON AntiCheatEvents (interview_id, created_at DESC)",
-        ]
-        for statement in statements:
-            cursor.execute(statement)
-        conn.commit()
-        logger.info("Runtime schema upgrades verified")
-    except Exception:
-        conn.rollback()
-        logger.error("Failed to apply runtime schema upgrades")
-        raise
+            actual_columns = {str(row[0]) for row in cursor.fetchall()}
+            for column_name in sorted(required_columns - actual_columns):
+                missing_columns.append(f"{table_name}.{column_name}")
+
+        if missing_tables or missing_columns:
+            details = []
+            if missing_tables:
+                details.append("tables=" + ",".join(missing_tables))
+            if missing_columns:
+                details.append("columns=" + ",".join(missing_columns))
+            raise RuntimeError("Database schema contract is incomplete: " + "; ".join(details))
+        return {
+            "revision": ALEMBIC_HEAD_REVISION,
+            "tables_checked": len(REQUIRED_SCHEMA_TABLES),
+            "columns_checked": sum(len(value) for value in REQUIRED_SCHEMA_COLUMNS.values()),
+        }
     finally:
         cursor.close()
         return_db_connection(conn)
 
+def ensure_runtime_schema():
+    """Apply Alembic migrations in development/test.
+
+    Production startup is verification-only.  This compatibility entrypoint
+    remains because older local commands import it, but it no longer owns or
+    stamps schema state.
+    """
+    if settings.ENVIRONMENT == "production":
+        return verify_schema_migrations()
+
+    from pathlib import Path
+    from alembic import command as alembic_command
+    from alembic.config import Config as AlembicConfig
+
+    alembic_ini = Path(__file__).resolve().with_name("alembic.ini")
+    if not alembic_ini.exists():
+        raise RuntimeError("alembic.ini is missing")
+    alembic_cfg = AlembicConfig(str(alembic_ini))
+    alembic_command.upgrade(alembic_cfg, "head")
+    logger.info("Alembic migrations applied to head")
+    return verify_schema_migrations()
 @contextmanager
 def get_db():
     conn = get_db_connection()
@@ -225,13 +190,6 @@ def transaction(conn):
         conn.rollback()
         raise
 
-@asynccontextmanager
-async def async_get_db():
-    conn = await asyncio.to_thread(get_db_connection)
-    try:
-        yield conn
-    finally:
-        await asyncio.to_thread(return_db_connection, conn)
 
 async def async_execute(query: str, params=None, fetchone=False, fetchall=False):
     def _run():

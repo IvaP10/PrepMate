@@ -3,136 +3,66 @@ import { useEffect, useRef } from "react"
 
 interface PremiumBackgroundProps {
   theme?: "light" | "dark"
+  mode?: "base" | "comets"
 }
 
-const QUESTIONS = [
-  "Tell me about yourself",
-  "Why this company?",
-  "Greatest strength?",
-  "Where do you see yourself in 5 years?",
-  "Describe a challenge you overcame",
-  "Why should we hire you?",
-  "What motivates you?",
-  "Team or solo work?",
-  "Biggest weakness?",
-  "Most proud achievement?",
-  "How do you handle pressure?",
-  "Leadership example?",
-  "Salary expectations?",
-  "Any questions for us?",
-  "Problem-solving approach?",
-  "Walk me through your resume",
-  "How do you handle conflicts at work?",
-  "Tell me about a time you failed",
-  "What makes you unique?",
-  "Describe your ideal work environment",
-  "How do you prioritize tasks?",
-  "What are your career goals?",
-  "How do you stay updated in your field?",
-  "Describe a time you went above and beyond",
-  "How would your manager describe you?",
-  "What is your management style?",
-  "Tell me about a difficult decision you made",
-  "How do you handle feedback?",
-  "What is your greatest accomplishment?",
-  "Why are you leaving your current role?",
-  "How do you approach learning new skills?",
-  "Describe your communication style",
-  "What do you know about our industry?",
-  "How do you deal with ambiguity?",
-  "Tell me about a successful project",
-  "What are you passionate about?",
-  "How do you build relationships at work?",
-  "Describe a time you showed initiative",
-  "What would you do in the first 90 days?",
-  "How do you measure success?",
-]
-
-const ICONS = ["✦", "◈", "⬡", "◇", "○"]
-
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number, y: number, w: number, h: number, r: number,
-) {
-  ctx.beginPath()
-  ctx.moveTo(x + r, y)
-  ctx.lineTo(x + w - r, y)
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r)
-  ctx.lineTo(x + w, y + h - r)
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
-  ctx.lineTo(x + r, y + h)
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r)
-  ctx.lineTo(x, y + r)
-  ctx.quadraticCurveTo(x, y, x + r, y)
-  ctx.closePath()
+interface Star {
+  x: number        // static horizontal coordinate
+  y: number        // static vertical coordinate
+  size: number     // star radius
+  alpha: number    // base brightness
+  twinkleSpeed: number
+  phase: number    // unique twinkling offset
+  glow: boolean    // slightly larger glowing stars
 }
 
-
-interface CardEntity {
-  text: string; w: number; h: number
-  x: number; y: number; vx: number; vy: number
-  alpha: number; targetAlpha: number; fadeIn: boolean
+interface Comet {
+  x: number
+  y: number
+  vx: number
+  vy: number
+  length: number
+  alpha: number
+  speed: number
+  width: number
 }
 
-interface IconEntity {
-  icon: string; x: number; y: number
-  vx: number; vy: number; alpha: number; size: number
-}
-
-function createCard(W: number, H: number, init: boolean, existing?: CardEntity[]): CardEntity {
-  const usedTexts = new Set(existing?.map(c => c.text) ?? [])
-  let text: string
-  const available = QUESTIONS.filter(q => !usedTexts.has(q))
-  text = available.length > 0
-    ? available[Math.floor(Math.random() * available.length)]
-    : QUESTIONS[Math.floor(Math.random() * QUESTIONS.length)]
-  const w = text.length * 8.5 + 32
-  const h = 38
-  let x: number, y: number
-  let attempts = 0
-
-  do {
-    x = init ? Math.random() * W : -w - 20
-    y = init ? (Math.random() * (H - 60)) + 30 : (Math.random() * (H - 60)) + 30
-    attempts++
-  } while (
-    init && attempts < 40 && existing &&
-    existing.some(c => {
-      const overlapX = x < c.x + c.w + 10 && x + w + 10 > c.x
-      const overlapY = y < c.y + c.h + 10 && y + h + 10 > c.y
-      return overlapX && overlapY
-    })
-  )
-
+function createComet(W: number, H: number): Comet {
+  const startFromTop = Math.random() > 0.4
+  let x = 0, y = 0
+  if (startFromTop) {
+    x = Math.random() * (W * 0.8)
+    y = -30
+  } else {
+    x = -30
+    y = Math.random() * (H * 0.4)
+  }
+  const angle = (20 + Math.random() * 25) * Math.PI / 180 // travel diagonal down-right
+  const speed = 6 + Math.random() * 6 // 25% less speed (fades from 8-16px to 6-12px)
   return {
-    text, w, h, x, y,
-    vx: 0.18 + Math.random() * 0.22,
-    vy: (Math.random() - 0.5) * 0.12,
-    alpha: init ? Math.random() * 0.25 + 0.06 : 0,
-    targetAlpha: 0.1 + Math.random() * 0.2,
-    fadeIn: !init,
+    x,
+    y,
+    vx: Math.cos(angle) * speed,
+    vy: Math.sin(angle) * speed,
+    length: 20 + Math.random() * 110, // any length from short (20px) to long (130px)
+    alpha: 0,
+    speed,
+    width: 0.4 + Math.random() * 2.8,  // any width from very fine (0.4px) to thick and bright (3.2px)
   }
 }
 
-function createIcon(W: number, H: number): IconEntity {
-  return {
-    icon: ICONS[Math.floor(Math.random() * ICONS.length)],
-    x: Math.random() * W,
-    y: Math.random() * H,
-    vx: (Math.random() - 0.5) * 0.12,
-    vy: (Math.random() - 0.5) * 0.12,
-    alpha: 0.15 + Math.random() * 0.2,
-    size: 10 + Math.random() * 10,
-  }
-}
-
-export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
+export function PremiumBackground({ theme = "dark", mode = "base" }: PremiumBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const animRef = useRef<number>(0)
   const themeRef = useRef(theme)
-  const entitiesRef = useRef<{ cards: CardEntity[]; icons: IconEntity[] } | null>(null)
+  const modeRef = useRef(mode)
+  
+  // Preserve entities across renders to prevent resetting on component updates
+  const starsRef = useRef<Star[] | null>(null)
+  const cometsRef = useRef<Comet[]>([])
 
   themeRef.current = theme
+  modeRef.current = mode
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -145,205 +75,144 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
     canvas.width = W
     canvas.height = H
 
-    const resize = () => {
+    const handleResize = () => {
       W = window.innerWidth
       H = window.innerHeight
       canvas.width = W
       canvas.height = H
-    }
-    window.addEventListener("resize", resize)
-
-    if (!entitiesRef.current) {
-      const cards: CardEntity[] = []
-      for (let i = 0; i < 18; i++) {
-        cards.push(createCard(W, H, true, cards))
-      }
-      const icons = Array.from({ length: 8 }, () => createIcon(W, H))
-      entitiesRef.current = { cards, icons }
-    }
-
-    const { cards, icons } = entitiesRef.current
-    const CONNECT_DIST = 180
-
-    function getColors() {
-      const dark = themeRef.current === "dark"
-      return {
-        dark,
-        fg: dark ? "255,255,255" : "30,58,138",
-        cardFill: dark ? "rgba(255,255,255,0.06)" : "rgba(30,58,138,0.14)",
-        cardStroke: dark ? "rgba(255,255,255,0.4)" : "rgba(30,58,138,0.65)",
-        cardText: dark ? "rgba(255,255,255,0.75)" : "rgba(30,58,138,0.85)",
-        checkColor: dark ? "#4ade80" : "#16a34a",
-        iconFill: dark ? "#ffffff" : "#1e3a8a",
-        bubbleStroke: dark ? "rgba(255,255,255,0.4)" : "rgba(30,58,138,0.5)",
-        bubbleFill: dark ? "rgba(255,255,255,0.05)" : "rgba(30,58,138,0.1)",
+      if (starsRef.current) {
+        starsRef.current.forEach((s) => {
+          if (s.x > W) s.x = Math.random() * W
+          if (s.y > H) s.y = Math.random() * H
+        })
       }
     }
+    window.addEventListener("resize", handleResize)
 
-    function updateCards() {
-      for (let i = 0; i < cards.length; i++) {
-        const c = cards[i]
-        if (c.fadeIn && c.alpha < c.targetAlpha) c.alpha += 0.003
-        c.x += c.vx
-        c.y += c.vy
+    // Seed dark-mode paid particles once so plan/theme toggles do not reshuffle them.
+    if (!starsRef.current) {
+      const stars: Star[] = []
+      for (let i = 0; i < 350; i++) {
+        const x = Math.random() * W
+        const y = Math.random() * H
+        const phase = Math.random() * Math.PI * 2
+        const twinkleSpeed = 0.005 + Math.random() * 0.012
 
-        for (let j = 0; j < cards.length; j++) {
-          if (i === j) continue
-          const other = cards[j]
-          const overlapX = c.x < other.x + other.w + 6 && c.x + c.w + 6 > other.x
-          const overlapY = c.y < other.y + other.h + 6 && c.y + c.h + 6 > other.y
-          if (overlapX && overlapY) {
-            const myCenter = c.y + c.h / 2
-            const otherCenter = other.y + other.h / 2
-            if (myCenter < otherCenter) {
-              c.vy -= 0.02
-            } else {
-              c.vy += 0.02
-            }
-          }
+        const rand = Math.random()
+        let size = 0.5
+        let glow = false
+        let alpha = 0.1 + Math.random() * 0.5
+
+        if (rand < 0.80) {
+          // Tiny dense background stars
+          size = 0.4 + Math.random() * 0.6
+        } else if (rand < 0.96) {
+          // Medium bright stars
+          size = 1.0 + Math.random() * 0.6
+          alpha = 0.35 + Math.random() * 0.45
+        } else {
+          // Rare larger sparkling stars with glowing halos
+          size = 1.6 + Math.random() * 0.8
+          alpha = 0.6 + Math.random() * 0.4
+          glow = true
         }
 
-        c.vy = Math.max(-0.3, Math.min(0.3, c.vy))
-
-        if (c.y < 10) c.vy += 0.01
-        if (c.y + c.h > H - 10) c.vy -= 0.01
-
-        if (c.x > W + 60) {
-          const newCard = createCard(W, H, false, cards)
-          cards[i] = newCard
-        }
+        stars.push({
+          x,
+          y,
+          size,
+          alpha,
+          twinkleSpeed,
+          phase,
+          glow,
+        })
       }
+      starsRef.current = stars
     }
 
-    function updateIcons() {
-      icons.forEach((ic) => {
-        ic.x += ic.vx
-        ic.y += ic.vy
-        if (ic.x < -20) ic.x = W + 20
-        if (ic.x > W + 20) ic.x = -20
-        if (ic.y < -20) ic.y = H + 20
-        if (ic.y > H + 20) ic.y = -20
-      })
-    }
-
-    function drawConnections(colors: ReturnType<typeof getColors>) {
-      const nodes = [
-        ...cards.map((c) => ({ x: c.x + c.w / 2, y: c.y + c.h / 2, alpha: c.alpha })),
-        ...icons.map((ic) => ({ x: ic.x, y: ic.y, alpha: ic.alpha })),
-      ]
-      for (let i = 0; i < nodes.length; i++) {
-        for (let j = i + 1; j < nodes.length; j++) {
-          const a = nodes[i], b = nodes[j]
-          const dx = a.x - b.x, dy = a.y - b.y
-          const dist = Math.sqrt(dx * dx + dy * dy)
-          if (dist < CONNECT_DIST) {
-            const strength = (1 - dist / CONNECT_DIST) * Math.min(a.alpha, b.alpha) * 0.8
-            ctx!.beginPath()
-            ctx!.moveTo(a.x, a.y)
-            ctx!.lineTo(b.x, b.y)
-            ctx!.strokeStyle = `rgba(${colors.fg},${strength})`
-            ctx!.lineWidth = 0.4
-            ctx!.stroke()
-          }
-        }
-      }
-    }
-
-    function drawCards(colors: ReturnType<typeof getColors>) {
-      cards.forEach((c) => {
-        ctx!.save()
-        ctx!.globalAlpha = c.alpha
-        ctx!.strokeStyle = colors.cardStroke
-        ctx!.lineWidth = 0.5
-        ctx!.fillStyle = colors.cardFill
-        roundRect(ctx!, c.x, c.y, c.w, c.h, 6)
-        ctx!.fill()
-        ctx!.stroke()
-        ctx!.fillStyle = colors.cardText
-        ctx!.font = "13px system-ui, sans-serif"
-        ctx!.textBaseline = "middle"
-        ctx!.fillText(c.text, c.x + 12, c.y + c.h / 2)
-        ctx!.restore()
-      })
-    }
-
-    function drawIcons(colors: ReturnType<typeof getColors>) {
-      icons.forEach((ic) => {
-        ctx!.save()
-        ctx!.globalAlpha = ic.alpha
-        ctx!.fillStyle = colors.iconFill
-        ctx!.font = `${ic.size}px system-ui`
-        ctx!.textBaseline = "middle"
-        ctx!.textAlign = "center"
-        ctx!.fillText(ic.icon, ic.x, ic.y)
-        ctx!.restore()
-      })
-    }
-
-    function drawCheckmarks(colors: ReturnType<typeof getColors>) {
-      const positions = [
-        { x: W * 0.08, y: H * 0.18 },
-        { x: W * 0.88, y: H * 0.25 },
-        { x: W * 0.12, y: H * 0.78 },
-        { x: W * 0.85, y: H * 0.72 },
-      ]
-      const t = Date.now() / 1000
-      positions.forEach((p, i) => {
-        const pulse = colors.dark ? 0.04 + 0.02 * Math.sin(t * 0.8 + i * 1.5) : 0.2 + 0.1 * Math.sin(t * 0.8 + i * 1.5)
-        ctx!.save()
-        ctx!.globalAlpha = pulse
-        ctx!.strokeStyle = colors.checkColor
-        ctx!.lineWidth = 1.5
-        ctx!.lineCap = "round"
-        ctx!.lineJoin = "round"
-        const s = 14
-        ctx!.beginPath()
-        ctx!.moveTo(p.x, p.y + s * 0.45)
-        ctx!.lineTo(p.x + s * 0.35, p.y + s * 0.75)
-        ctx!.lineTo(p.x + s * 0.85, p.y + s * 0.1)
-        ctx!.stroke()
-        ctx!.restore()
-      })
-    }
-
-    function drawSpeechBubbles(colors: ReturnType<typeof getColors>) {
-      const bs = [
-        { x: W * 0.05, y: H * 0.42, w: 60, h: 28 },
-        { x: W * 0.88, y: H * 0.5, w: 52, h: 26 },
-      ]
-      const t = Date.now() / 1000
-      bs.forEach((b, i) => {
-        const a = colors.dark ? 0.05 + 0.03 * Math.sin(t * 0.6 + i * 2.1) : 0.2 + 0.08 * Math.sin(t * 0.6 + i * 2.1)
-        ctx!.save()
-        ctx!.globalAlpha = a
-        ctx!.strokeStyle = colors.bubbleStroke
-        ctx!.lineWidth = 0.8
-        ctx!.fillStyle = colors.bubbleFill
-        roundRect(ctx!, b.x, b.y, b.w, b.h, 8)
-        ctx!.fill()
-        ctx!.stroke()
-        ctx!.beginPath()
-        ctx!.moveTo(b.x + 14, b.y + b.h)
-        ctx!.lineTo(b.x + 8, b.y + b.h + 8)
-        ctx!.lineTo(b.x + 22, b.y + b.h)
-        ctx!.closePath()
-        ctx!.fill()
-        ctx!.stroke()
-        ctx!.restore()
-      })
-    }
+    const stars = starsRef.current
+    const comets = cometsRef.current
 
     function animate() {
       ctx!.clearRect(0, 0, W, H)
-      const colors = getColors()
+      const shouldDrawPaidParticles = themeRef.current === "dark" && modeRef.current === "comets"
 
-      updateCards()
-      updateIcons()
-      drawConnections(colors)
-      drawCards(colors)
-      drawIcons(colors)
-      drawCheckmarks(colors)
-      drawSpeechBubbles(colors)
+      if (!shouldDrawPaidParticles) {
+        comets.length = 0
+        animRef.current = requestAnimationFrame(animate)
+        return
+      }
+
+      // Update and draw stars (Static in position, twinkling organically in place)
+      stars.forEach((s) => {
+        s.phase += s.twinkleSpeed
+        const twinkle = Math.sin(s.phase)
+        const currentAlpha = Math.max(0.04, Math.min(1.0, s.alpha + twinkle * 0.28))
+
+        ctx!.save()
+        ctx!.beginPath()
+        ctx!.arc(s.x, s.y, s.size, 0, Math.PI * 2)
+
+        if (s.glow) {
+          ctx!.shadowBlur = 4
+          ctx!.shadowColor = "rgba(255, 255, 255, 0.75)"
+          ctx!.fillStyle = `rgba(255, 255, 255, ${currentAlpha})`
+        } else {
+          ctx!.fillStyle = s.size > 1.2 ? `rgba(254, 243, 199, ${currentAlpha})` : `rgba(255, 255, 255, ${currentAlpha})`
+        }
+
+        ctx!.fill()
+        ctx!.restore()
+      })
+
+      // Spawn comets every 15 to 30 seconds on average (average ~20 seconds at 60 FPS)
+      if (Math.random() < 0.0008 && comets.length < 2) {
+        comets.push(createComet(W, H))
+      }
+
+      for (let i = comets.length - 1; i >= 0; i--) {
+        const c = comets[i]
+        c.x += c.vx
+        c.y += c.vy
+
+        if (c.y < H * 0.15) {
+          c.alpha = Math.min(0.95, c.alpha + 0.08)
+        } else {
+          c.alpha = Math.max(0.0, c.alpha - 0.006)
+        }
+
+        if (c.alpha > 0) {
+          ctx!.save()
+          const tailX = c.x - (c.vx / c.speed) * c.length
+          const tailY = c.y - (c.vy / c.speed) * c.length
+
+          const grad = ctx!.createLinearGradient(c.x, c.y, tailX, tailY)
+          grad.addColorStop(0, `rgba(255, 255, 255, ${c.alpha})`)
+          grad.addColorStop(0.15, `rgba(251, 191, 36, ${c.alpha * 0.8})`)
+          grad.addColorStop(0.4, `rgba(147, 197, 253, ${c.alpha * 0.3})`)
+          grad.addColorStop(1, "rgba(255, 255, 255, 0)")
+
+          ctx!.strokeStyle = grad
+          ctx!.lineWidth = c.width + Math.random() * 0.5
+          ctx!.lineCap = "round"
+
+          ctx!.beginPath()
+          ctx!.moveTo(c.x, c.y)
+          ctx!.lineTo(tailX, tailY)
+          ctx!.stroke()
+
+          ctx!.fillStyle = `rgba(255, 255, 255, ${c.alpha})`
+          ctx!.beginPath()
+          ctx!.arc(c.x, c.y, c.width * 1.1, 0, Math.PI * 2)
+          ctx!.fill()
+
+          ctx!.restore()
+        }
+
+        if (c.x > W + 150 || c.y > H + 150 || c.alpha <= 0) {
+          comets.splice(i, 1)
+        }
+      }
 
       animRef.current = requestAnimationFrame(animate)
     }
@@ -352,29 +221,62 @@ export function PremiumBackground({ theme = "dark" }: PremiumBackgroundProps) {
 
     return () => {
       cancelAnimationFrame(animRef.current)
-      window.removeEventListener("resize", resize)
+      window.removeEventListener("resize", handleResize)
     }
   }, [])
 
   const isDark = theme === "dark"
+  const showParticles = isDark && mode === "comets"
 
   return (
     <>
-      
+      {/* Base background color */}
       <div
-        className="pointer-events-none fixed inset-0 -z-[11] transition-colors duration-500"
+        key={`premium-background-${theme}`}
+        className="pointer-events-none fixed inset-0 z-0 transition-colors duration-900 ease-out"
         aria-hidden="true"
-        style={{ background: isDark ? "#0F0F0F" : "#FAFAF8" }}
+        style={{ background: isDark ? "#020206" : "#FDFDFB" }}
       />
-      
+      {/* Light-mode schematic structure */}
+      <div
+        className={`pointer-events-none fixed inset-0 z-[1] transition-opacity duration-900 ease-out ${!isDark ? "opacity-100" : "opacity-0"}`}
+        aria-hidden="true"
+        style={{
+          display: isDark ? "none" : "block",
+          backgroundImage: `
+            linear-gradient(rgba(20, 23, 31, 0.055) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(20, 23, 31, 0.055) 1px, transparent 1px),
+            linear-gradient(rgba(20, 23, 31, 0.035) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(20, 23, 31, 0.035) 1px, transparent 1px)
+          `,
+          backgroundPosition: "center",
+          backgroundSize: "96px 96px, 96px 96px, 24px 24px, 24px 24px",
+        }}
+      />
+      <div
+        className={`pointer-events-none fixed inset-0 z-[2] transition-opacity duration-900 ease-out ${!isDark ? "opacity-100" : "opacity-0"}`}
+        aria-hidden="true"
+        style={{
+          display: isDark ? "none" : "block",
+          backgroundImage: `
+            radial-gradient(circle at 22% 28%, rgba(79, 70, 229, 0.12), transparent 22%),
+            radial-gradient(circle at 82% 18%, rgba(15, 23, 42, 0.07), transparent 18%),
+            radial-gradient(circle at 76% 78%, rgba(13, 148, 136, 0.08), transparent 24%),
+            repeating-radial-gradient(circle at 18% 82%, rgba(20, 23, 31, 0.08) 0 1px, transparent 1px 18px),
+            linear-gradient(118deg, transparent 0 34%, rgba(20, 23, 31, 0.08) 34.1%, transparent 34.5% 100%)
+          `,
+        }}
+      />
+      {/* Animation canvas */}
       <canvas
         ref={canvasRef}
-        className="pointer-events-none fixed inset-0 -z-10"
+        className={`pointer-events-none fixed inset-0 z-[3] transition-opacity duration-900 ease-out ${showParticles ? "opacity-100" : "opacity-0"}`}
         aria-hidden="true"
+        style={{ display: showParticles ? "block" : "none" }}
       />
-      
+      {/* Subtle noise texture */}
       <div
-        className="pointer-events-none fixed inset-0 -z-[9] opacity-[0.015]"
+        className="pointer-events-none fixed inset-0 z-[4] opacity-[0.012]"
         aria-hidden="true"
         style={{
           backgroundImage: `url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E")`,

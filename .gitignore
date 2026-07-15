@@ -55,9 +55,15 @@ out/
 .pyre/
 .mypy_cache/
 .pytype/
+*.tsbuildinfo
 
 # Test artifacts
+.pytest_cache/
 test_resume.pdf
+tmp/
+Frontend/e2e/.generated/
+Frontend/test-results/
+Frontend/playwright-report/
 
-# Misc build artifacts
-package-lock.json
+# Lockfiles are production inputs; commit frontend package locks.
+!Frontend/package-lock.json

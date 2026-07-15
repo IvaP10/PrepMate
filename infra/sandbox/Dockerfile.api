@@ -1,0 +1,14 @@
+FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /service
+COPY infra/sandbox/requirements.txt ./requirements.txt
+RUN python -m pip install --timeout 120 --retries 5 -r requirements.txt
+COPY infra/__init__.py /service/infra/__init__.py
+COPY infra/sandbox /service/infra/sandbox
+
+EXPOSE 8080
+CMD ["uvicorn", "infra.sandbox.service:app", "--host", "0.0.0.0", "--port", "8080"]

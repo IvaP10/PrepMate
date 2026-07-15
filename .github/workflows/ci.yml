@@ -1,0 +1,60 @@
+name: release-contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.9-alpine
+        env:
+          POSTGRES_DB: ai_interviewer
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_interviewer"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7.4.5-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      ENVIRONMENT: test
+      PG_HOST: 127.0.0.1
+      PG_DBNAME: ai_interviewer
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      REDIS_HOST: 127.0.0.1
+      JWT_SECRET: ci-jwt-secret-at-least-thirty-two-characters
+      ENCRYPTION_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      SANDBOX_API_TOKEN: ci-sandbox-token-at-least-thirty-two-characters
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: python -m pip install -r requirements.txt
+      - run: python -m alembic upgrade head
+      - run: python -m pytest -q
+      - run: python tests/test_e2e_system.py
+      - run: python evaluation/run_gates.py
+      - uses: actions/setup-node@v4
+        with: {node-version: "20", cache: npm, cache-dependency-path: Frontend/package-lock.json}
+      - working-directory: Frontend
+        run: npm ci
+      - working-directory: Frontend
+        run: npx playwright install --with-deps chromium
+      - working-directory: Frontend
+        run: npm test
+      - working-directory: Frontend
+        run: npm run lint
+      - working-directory: Frontend
+        run: npm run build
+      - working-directory: Frontend
+        run: npm run test:e2e

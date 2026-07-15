@@ -1,0 +1,44 @@
+name: interai-executor
+
+services:
+  runtime-image:
+    build:
+      context: ../..
+      dockerfile: infra/sandbox/Dockerfile.runtime
+    image: interai-sandbox-runtime:2026-07-v1
+    command: ["/bin/true"]
+    restart: "no"
+
+  controller:
+    build:
+      context: ../..
+      dockerfile: infra/sandbox/Dockerfile.api
+    restart: unless-stopped
+    env_file: [../../key.env]
+    environment:
+      SANDBOX_RUNTIME_IMAGE: interai-sandbox-runtime:2026-07-v1
+      SANDBOX_OCI_RUNTIME: runsc
+      SANDBOX_TIMEOUT_MS: "2000"
+      SANDBOX_ABSOLUTE_TIMEOUT_MS: "10000"
+      SANDBOX_MAX_CONCURRENT_EXECUTIONS: "4"
+      SANDBOX_QUEUE_WAIT_SECONDS: "1.0"
+      SANDBOX_MEMORY_LIMIT_BYTES: "268435456"
+      SANDBOX_PROCESS_LIMIT: "32"
+      SANDBOX_SOURCE_LIMIT_BYTES: "20480"
+      SANDBOX_OUTPUT_LIMIT_BYTES: "65536"
+    volumes:
+      - ${SANDBOX_DOCKER_SOCKET:?Set the scoped or rootless executor daemon socket}:/var/run/docker.sock
+    ports:
+      - "${SANDBOX_BIND_ADDRESS:-127.0.0.1}:8080:8080"
+    depends_on:
+      runtime-image:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=32m
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/health',headers={'Authorization':'Bearer '+os.environ['SANDBOX_API_TOKEN']}); urllib.request.urlopen(r,timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 30

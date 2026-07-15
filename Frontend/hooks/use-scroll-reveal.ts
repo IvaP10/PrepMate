@@ -9,7 +9,9 @@ interface UseScrollRevealOptions {
 export function useScrollReveal(options: UseScrollRevealOptions = {}) {
     const { threshold = 0.1, rootMargin = '0px', triggerOnce = true } = options;
     const ref = useRef<HTMLDivElement>(null);
-    const [isVisible, setIsVisible] = useState(false);
+    // Content must remain usable when IntersectionObserver is delayed, blocked,
+    // or fails to paint correctly (notably in Safari composited layers).
+    const [isVisible, setIsVisible] = useState(true);
 
     useEffect(() => {
         const observer = new IntersectionObserver(

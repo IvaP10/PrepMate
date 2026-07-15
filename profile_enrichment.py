@@ -1,3 +1,17 @@
+# ============================================================================
+# MODULE: profile_enrichment.py
+# PURPOSE: Background GitHub-profile enrichment after a resume upload — pulls
+#          public repos/languages and merges into UserInfo.external_profile_signals.
+# STRUCTURE:
+#   - GITHUB_RE regex (line 28)
+#   - _github_username / _fetch_json helpers (lines 31-50)
+#   - enrich_profile_for_user(user_id, profile) entry point (later in file)
+# ENDPOINTS: none (kicked off async from pre_interview.py)
+# DEPENDS ON: database, aiohttp
+# CONSUMED BY: pre_interview.py (background task per upload)
+# DATA TABLES: UserInfo (external_profile_signals JSONB write)
+# ============================================================================
+
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +24,7 @@ from urllib.parse import urlparse
 import aiohttp
 
 from database import get_db, transaction
+from config import settings
 
 logger = logging.getLogger("profile_enrichment")
 
@@ -27,7 +42,10 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> Any:
     parsed = urlparse(url or "")
     if parsed.scheme != "https" or parsed.netloc != "api.github.com":
         return None
-    async with session.get(url, headers={"Accept": "application/vnd.github+json"}) as response:
+    headers = {"Accept": "application/vnd.github+json"}
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
+    async with session.get(url, headers=headers) as response:
         if response.status >= 400:
             logger.warning("GitHub enrichment request failed: %s", response.status)
             return None
@@ -41,7 +59,8 @@ async def enrich_github(github_url: Optional[str]) -> Dict[str, Any]:
 
     base = "https://api.github.com"
     timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         user, repos = await asyncio.gather(
             _fetch_json(session, f"{base}/users/{username}"),
             _fetch_json(session, f"{base}/users/{username}/repos?type=owner&sort=pushed&per_page=10"),

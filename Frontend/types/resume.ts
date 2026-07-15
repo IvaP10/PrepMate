@@ -62,9 +62,14 @@ export interface ResumeData {
     dateObtained?: string
     expiryDate?: string
   }[]
+  softSkills?: string[]
+  achievements?: string[]
+  interests?: string[]
 
   summary?: string
   metadata?: {
+    resumeId?: string
+    versionNumber?: number
     uploadedAt: string
     parsedAt?: string
     lastModifiedAt?: string

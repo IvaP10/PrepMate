@@ -1,8 +1,12 @@
+"use client"
+import { memo } from "react"
+
 interface ThemeLogoProps {
   size?: number
   className?: string
 }
-export function ThemeLogo({ size = 36, className = "" }: ThemeLogoProps) {
+
+export const ThemeLogo = memo(function ThemeLogo({ size = 36, className = "" }: ThemeLogoProps) {
   const renderedSize = Math.round(size * 0.85)
   const containerWidth = renderedSize
   const containerHeight = renderedSize
@@ -26,4 +30,4 @@ export function ThemeLogo({ size = 36, className = "" }: ThemeLogoProps) {
       />
     </span>
   )
-}
+})

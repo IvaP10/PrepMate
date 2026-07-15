@@ -1,42 +1,148 @@
 "use client"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, type CSSProperties } from "react"
 import { Navbar } from "@/components/landing/navbar"
+import { AnnouncementBar } from "@/components/landing/announcement-bar"
 import { HeroSection } from "@/components/landing/hero-section"
-import { ProblemsSection } from "@/components/landing/problems-section"
+
 import { HowItWorksSection } from "@/components/landing/how-it-works-section"
 import { ModesSection } from "@/components/landing/modes-section"
+import { PerformanceSection } from "@/components/landing/performance-section"
 import { PricingSection } from "@/components/landing/pricing-section"
 import { CtaSection } from "@/components/landing/cta-section"
 import { Footer } from "@/components/landing/footer"
 import { AuthScreen } from "@/components/auth-screen"
 import { ThemeLogo } from "@/components/theme-logo"
-import { Dashboard } from "@/components/dashboard"
-import { ResumeModal } from "@/components/resume-modal"
+import { AppShell } from "@/components/app-shell"
 import { ResumeProvider } from "@/context/resume-context"
 import { PremiumBackground } from "@/components/premium-background"
 import { useTheme } from "@/hooks/use-theme"
-import { verifyToken, clearAuth, getStoredUser, logout, type AuthUser } from "@/lib/auth"
-import { API_CONFIG, API_ENDPOINTS } from "@/lib/config"
+import { logout, getStoredUser, type AuthUser } from "@/lib/auth"
+import { bootstrapSessionWithFallback } from "@/lib/auth-bootstrap"
+import { safeStorageGet, safeStorageRemove, safeStorageSet } from "@/lib/safe-storage"
+import { readImproveTarget } from "@/lib/improve-navigation"
+import type { ExactImproveTarget } from "@/lib/api"
 import { toast } from "sonner"
-type AppView = "landing" | "auth" | "authenticating" | "dashboard"
+
+type AppView = "checking" | "landing" | "auth" | "authenticating" | "dashboard"
+type AuthMode = "login" | "signup"
+
+const APP_VIEW_KEY = "interai_app_view"
+const AUTH_MODE_KEY = "interai_auth_mode"
+const LANDING_NAV_HEIGHT = 64
+const ANNOUNCEMENT_BAR_HEIGHT = 40
+const LANDING_ANCHOR_GAP = 12
+
+function readPersistedAuthMode(): AuthMode {
+  if (typeof window === "undefined") return "login"
+  return safeStorageGet("session", AUTH_MODE_KEY) === "signup" ? "signup" : "login"
+}
+
+function readPersistedAppView(): AppView | null {
+  if (typeof window === "undefined") return null
+  const saved = safeStorageGet("session", APP_VIEW_KEY)
+  if (saved === "landing" || saved === "auth" || saved === "dashboard") return saved
+  return null
+}
+
+/** Client-only restore — must not run during SSR (causes hydration mismatch). */
+function readClientAppState(): { view: AppView; user: AuthUser | null; authMode: AuthMode } {
+  const user = getStoredUser()
+  if (user) {
+    return { view: "dashboard", user, authMode: "login" }
+  }
+  const persistedView = readPersistedAppView()
+  if (persistedView === "landing" || persistedView === "auth") {
+    return { view: persistedView, user: null, authMode: readPersistedAuthMode() }
+  }
+  if (persistedView === "dashboard") {
+    return { view: "landing", user: null, authMode: "login" }
+  }
+  return { view: "landing", user: null, authMode: "login" }
+}
+
+function persistAppView(view: AppView, authMode: AuthMode) {
+  if (typeof window === "undefined") return
+  if (view === "checking" || view === "authenticating") return
+  safeStorageSet("session", APP_VIEW_KEY, view)
+  if (view === "auth") {
+    safeStorageSet("session", AUTH_MODE_KEY, authMode)
+  }
+}
+
+function AuthCheckingScreen({ theme }: { theme: "light" | "dark" }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
+      <PremiumBackground theme={theme} mode="base" />
+      <ThemeLogo size={48} className="relative z-10 opacity-60" />
+    </div>
+  )
+}
+
 export default function Home() {
+  // Render usable landing content first; client auth restore can promote to dashboard.
   const [currentView, setCurrentView] = useState<AppView>("landing")
+  const [authMode, setAuthMode] = useState<AuthMode>("login")
   const [authUser, setAuthUser] = useState<AuthUser | null>(null)
-  const [showResumeModal, setShowResumeModal] = useState(false)
   const [emailVerified, setEmailVerified] = useState(false)
   const [scrollProgress, setScrollProgress] = useState(0)
   const [initialTab, setInitialTab] = useState<string | undefined>(undefined)
+  const [initialImproveTarget, setInitialImproveTarget] = useState<ExactImproveTarget | null>(null)
+  const [announcementVisible, setAnnouncementVisible] = useState(true)
   const { theme, toggleTheme } = useTheme()
+  const currentViewRef = useRef(currentView)
+  const bootstrapGenerationRef = useRef(0)
+  currentViewRef.current = currentView
+
+  useLayoutEffect(() => {
+    const state = readClientAppState()
+    setAuthUser(state.user)
+    setAuthMode(state.authMode)
+    setCurrentView(state.view)
+  }, [])
+
+  const bootstrapAuth = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent ?? false
+    const generation = ++bootstrapGenerationRef.current
+
+    if (!silent) {
+      setCurrentView((prev) => {
+        if (prev === "dashboard" && getStoredUser()) return prev
+        if (prev === "auth" || prev === "authenticating") return prev
+        if (prev === "landing") return prev
+        return "checking"
+      })
+    }
+
+    const { user, authenticated } = await bootstrapSessionWithFallback()
+    if (generation !== bootstrapGenerationRef.current) return
+
+    if (authenticated && user) {
+      setAuthUser(user)
+      setCurrentView("dashboard")
+      return
+    }
+
+    setAuthUser(null)
+    setCurrentView((prev) => {
+      if (prev === "auth" || prev === "authenticating") return prev
+      return "landing"
+    })
+  }, [])
+
   useEffect(() => {
     if (typeof window === "undefined") return
+
     const params = new URLSearchParams(window.location.search)
     const verified = params.get("verified")
+    let showAuth = false
+
     if (verified === "true") {
       toast.success("Email verified!", {
         description: "Your email has been verified. You can now sign in.",
       })
       setEmailVerified(true)
-      setCurrentView("auth")
+      setAuthMode("login")
+      showAuth = true
       window.history.replaceState({}, "", window.location.pathname)
     } else if (verified === "false") {
       const errorType = params.get("error")
@@ -46,26 +152,70 @@ export default function Home() {
             ? "The verification link is invalid or has expired. Please sign up again."
             : "Something went wrong. Please try again.",
       })
-      setCurrentView("auth")
+      setAuthMode("signup")
+      showAuth = true
       window.history.replaceState({}, "", window.location.pathname)
     }
+
     const tab = params.get("tab")
     if (tab) {
       setInitialTab(tab)
+      if (tab === "improve") setInitialImproveTarget(readImproveTarget(params))
       window.history.replaceState({}, "", window.location.pathname)
     }
-  }, [])
-  useEffect(() => {
-    const storedUser = getStoredUser()
-    if (storedUser) {
-      verifyToken().then((user) => {
-        if (user) {
-          setAuthUser(user)
-          setCurrentView("dashboard")
-        }
-      })
+
+    if (showAuth) {
+      setCurrentView("auth")
+      return
     }
-  }, [])
+
+    const hasCachedUser = Boolean(getStoredUser())
+    const viewAfterRestore = readClientAppState().view
+    void bootstrapAuth({
+      silent: hasCachedUser || viewAfterRestore === "dashboard" || viewAfterRestore === "landing",
+    })
+  }, [bootstrapAuth])
+
+  useEffect(() => {
+    persistAppView(currentView, authMode)
+  }, [currentView, authMode])
+
+  useEffect(() => {
+    const resyncShellFromStorage = () => {
+      const state = readClientAppState()
+      setAuthUser(state.user)
+      setAuthMode(state.authMode)
+      setCurrentView(state.view)
+      void bootstrapAuth({ silent: true })
+    }
+
+    const onPageShow = (event: PageTransitionEvent) => {
+      const view = currentViewRef.current
+      if (view === "authenticating") return
+
+      if (view === "checking" || event.persisted) {
+        resyncShellFromStorage()
+        return
+      }
+
+      if (view === "auth") return
+      void bootstrapAuth({ silent: true })
+    }
+
+    window.addEventListener("pageshow", onPageShow)
+    return () => window.removeEventListener("pageshow", onPageShow)
+  }, [bootstrapAuth])
+
+  useEffect(() => {
+    if (currentView !== "landing") return
+    const headerHeight = LANDING_NAV_HEIGHT + (announcementVisible ? ANNOUNCEMENT_BAR_HEIGHT : 0)
+    document.documentElement.style.scrollPaddingTop = `${headerHeight + LANDING_ANCHOR_GAP}px`
+
+    return () => {
+      document.documentElement.style.scrollPaddingTop = ""
+    }
+  }, [announcementVisible, currentView])
+
   useEffect(() => {
     if (currentView !== "landing") return
     const onScroll = () => {
@@ -76,31 +226,24 @@ export default function Home() {
     window.addEventListener("scroll", onScroll, { passive: true })
     return () => window.removeEventListener("scroll", onScroll)
   }, [currentView])
-  useEffect(() => {
-    if (currentView !== "dashboard" || !authUser) return
-    const checkResumeStatus = async () => {
-      try {
-        const response = await fetch(
-          `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.ME}`,
-          {
-            credentials: 'include' as RequestCredentials,
-          }
-        )
-        if (response.ok) {
-          const data = await response.json()
-          if (!data.profile_completed && !data.resume_text) {
-            setShowResumeModal(true)
-          }
-        }
-      } catch {
-      }
+
+  const goToAuth = (mode: AuthMode = "login") => {
+    setAuthMode(mode)
+    setCurrentView("auth")
+  }
+  const goToSignup = () => goToAuth("signup")
+  const goToLanding = () => {
+    if (authUser) {
+      setCurrentView("dashboard")
+      return
     }
-    checkResumeStatus()
-  }, [currentView, authUser])
-  const goToAuth = () => setCurrentView("auth")
-  const goToLanding = () => setCurrentView("landing")
+    setCurrentView("landing")
+  }
   const handleLogin = (user: AuthUser) => {
     setAuthUser(user)
+    if (typeof window !== "undefined") {
+      safeStorageSet("session", "dashboard_tab", initialTab === "improve" ? "improve" : "interview")
+    }
     setCurrentView("authenticating")
     setTimeout(() => {
       setCurrentView("dashboard")
@@ -108,30 +251,44 @@ export default function Home() {
   }
   const handleLogout = async () => {
     await logout()
+    if (typeof window !== "undefined") {
+      safeStorageRemove("session", "dashboard_tab")
+      safeStorageRemove("session", APP_VIEW_KEY)
+      safeStorageRemove("session", AUTH_MODE_KEY)
+    }
+    setInitialTab(undefined)
+    setInitialImproveTarget(null)
     setAuthUser(null)
     setCurrentView("landing")
+  }
+  const handleUserUpdate = (updates: Partial<AuthUser>) => {
+    setAuthUser((current) => {
+      if (!current) return current
+      const next = { ...current, ...updates }
+      safeStorageSet("local", "interai-user", JSON.stringify(next))
+      return next
+    })
+  }
+
+  if (currentView === "checking") {
+    return <AuthCheckingScreen theme={theme} />
   }
   if (currentView === "auth") {
     return (
       <>
-        <PremiumBackground theme={theme} />
-        <AuthScreen onLogin={handleLogin} onBack={goToLanding} theme={theme} verified={emailVerified} />
+        <PremiumBackground theme={theme} mode="base" />
+        <AuthScreen onLogin={handleLogin} onBack={goToLanding} theme={theme} verified={emailVerified} initialMode={authMode} />
       </>
     )
   }
   if (currentView === "authenticating") {
     return (
       <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background">
-        <PremiumBackground theme={theme} />
+        <PremiumBackground theme={theme} mode="base" />
         <div className="animate-blur-in flex flex-col items-center gap-8 relative z-10">
-          <div className="animate-float">
-            <div className="animate-glow-pulse relative">
-              <div className="absolute inset-0 bg-primary/20 blur-3xl rounded-full scale-150"></div>
-              <ThemeLogo size={100} className="relative z-10" />
-            </div>
-          </div>
+          <ThemeLogo size={80} />
           <div className="overflow-hidden">
-            <span className="animate-fade-in-up delay-300 block text-shimmer text-sm font-medium tracking-[0.3em] uppercase opacity-0">
+            <span className="animate-fade-in-up delay-300 block text-sm font-medium tracking-[0.3em] uppercase text-muted-foreground opacity-0">
               Authenticating
             </span>
           </div>
@@ -142,12 +299,15 @@ export default function Home() {
   if (currentView === "dashboard") {
     return (
       <>
-        <PremiumBackground theme={theme} />
         <ResumeProvider userId={authUser?.user_id ?? null}>
-          <Dashboard user={authUser} onLogout={handleLogout} theme={theme} onToggleTheme={toggleTheme} onUploadResume={() => setShowResumeModal(true)} initialTab={initialTab as any} />
-          <ResumeModal
-            open={showResumeModal}
-            onClose={() => setShowResumeModal(false)}
+          <AppShell
+            user={authUser}
+            onLogout={handleLogout}
+            onUserUpdate={handleUserUpdate}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            initialTab={initialTab}
+            initialImproveTarget={initialImproveTarget}
           />
         </ResumeProvider>
       </>
@@ -155,22 +315,37 @@ export default function Home() {
   }
 
   return (
-    <div className="relative min-h-screen">
+    <div
+      className={`relative min-h-screen ${theme}`}
+      style={{
+        color: theme === "dark" ? "#FFFFFF" : "#000000",
+        "--foreground": theme === "dark" ? "#FFFFFF" : "#000000",
+        "--muted-foreground": theme === "dark" ? "#D4D4D8" : "#000000",
+        "--color-foreground": theme === "dark" ? "#FFFFFF" : "#000000",
+        "--color-muted-foreground": theme === "dark" ? "#D4D4D8" : "#000000",
+      } as CSSProperties}
+    >
       <div className="scroll-progress" style={{ width: `${scrollProgress}%` }} />
-      <PremiumBackground theme={theme} />
-      <Navbar
-        onLogin={goToAuth}
-        onSignUp={goToAuth}
-        theme={theme}
-        onToggleTheme={toggleTheme}
-      />
-      <main>
-        <HeroSection onGetStarted={goToAuth} />
-        <ProblemsSection />
+      <PremiumBackground theme={theme} mode={theme === "dark" ? "comets" : "base"} />
+      <div data-landing-header className="fixed top-0 left-0 right-0 z-50 flex flex-col">
+        <Navbar
+          onLogin={() => goToAuth("login")}
+          onSignUp={goToSignup}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          announcementVisible={announcementVisible}
+        />
+        {announcementVisible && (
+          <AnnouncementBar onDismiss={() => setAnnouncementVisible(false)} />
+        )}
+      </div>
+      <main className="relative z-10">
+        <HeroSection key={`landing-hero-${theme}`} onGetStarted={goToSignup} theme={theme} />
         <HowItWorksSection />
-        <ModesSection onGetStarted={goToAuth} />
-        <PricingSection onGetStarted={goToAuth} />
-        <CtaSection onGetStarted={goToAuth} />
+        <ModesSection onGetStarted={goToSignup} />
+        <PerformanceSection />
+        <PricingSection onGetStarted={goToSignup} />
+        <CtaSection onGetStarted={goToSignup} />
       </main>
       <Footer theme={theme} />
     </div>

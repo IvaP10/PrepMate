@@ -1,34 +1,35 @@
 import type { Metadata, Viewport } from 'next'
-import { Geist, Geist_Mono, DM_Serif_Display } from 'next/font/google'
+import Script from 'next/script'
 import { Toaster } from 'sonner'
 import './globals.css'
-const geistSans = Geist({
-  subsets: ['latin'],
-  variable: '--font-geist-sans',
-})
-const dmSerif = DM_Serif_Display({
-  weight: '400',
-  subsets: ['latin'],
-  variable: '--font-serif',
-})
-const geistMono = Geist_Mono({
-  subsets: ['latin'],
-  variable: '--font-geist-mono',
-})
 export const metadata: Metadata = {
   title: 'InterAI',
   description: 'Ace your next interview with personalized AI coaching powered by your resume.',
   icons: {
     icon: [
-      { url: '/images/ligh.png', type: 'image/png', sizes: '20x20' },
+      {
+        url: '/images/light.svg',
+        type: 'image/svg+xml',
+        sizes: 'any',
+        media: '(prefers-color-scheme: light)',
+      },
+      {
+        url: '/images/logo-dark.svg',
+        type: 'image/svg+xml',
+        sizes: 'any',
+        media: '(prefers-color-scheme: dark)',
+      },
     ],
-    apple: { url: '/images/ligh.png', sizes: '20x20' },
+    apple: [
+      { url: '/images/light.svg', sizes: 'any', media: '(prefers-color-scheme: light)' },
+      { url: '/images/logo-dark.svg', sizes: 'any', media: '(prefers-color-scheme: dark)' },
+    ],
   },
 }
 export const viewport: Viewport = {
   themeColor: [
-    { media: '(prefers-color-scheme: light)', color: '#ffffff' },
-    { media: '(prefers-color-scheme: dark)', color: '#111111' },
+    { media: '(prefers-color-scheme: light)', color: '#F7F8F6' },
+    { media: '(prefers-color-scheme: dark)', color: '#0B0F0E' },
   ],
 }
 export default function RootLayout({
@@ -37,32 +38,20 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${dmSerif.variable} ${geistMono.variable}`} suppressHydrationWarning>
-      <head>
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              (function() {
-                try {
-                  var t = localStorage.getItem('interai-theme');
-                  if (t === 'dark') {
-                    document.documentElement.classList.add('dark');
-                  } else if (t === 'light') {
-                    document.documentElement.classList.remove('dark');
-                  } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                    document.documentElement.classList.add('dark');
-                  }
-                } catch(e) {}
-              })();
-            `,
-          }}
-        />
-      </head>
-      <body className="font-sans antialiased">
+    <html lang="en" data-scroll-behavior="smooth" suppressHydrationWarning>
+      <body className="min-h-dvh bg-background font-sans antialiased">
+        <Script src="/theme-init.js" strategy="beforeInteractive" />
         {children}
         <Toaster
+          position="bottom-right"
+          closeButton
           toastOptions={{
-            className: 'bg-card text-card-foreground border-border',
+            classNames: {
+              toast: "toast-premium group",
+              title: "text-foreground font-medium",
+              description: "text-muted-foreground",
+              closeButton: "toast-close-btn",
+            },
           }}
         />
       </body>

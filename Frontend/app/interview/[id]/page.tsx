@@ -15,22 +15,67 @@ import { AnalyzingOverlay } from "@/components/interview/analyzing-overlay"
 import { useVAD } from "@/hooks/use-vad"
 import { useFaceCheck } from "@/hooks/use-face-check"
 import { useStreamingMetrics } from "@/hooks/use-streaming-metrics"
+import { useAudioEnvironment } from "@/hooks/use-audio-environment"
+import { useSessionControlLock } from "@/hooks/use-session-control-lock"
+import { getAuthHeaders } from "@/lib/auth"
 import { API_CONFIG } from "@/lib/config"
-type SessionMode = "practice-ai" | "practice-voice" | "mock-ai" | "mock-voice"
-type InterviewState = "connecting" | "ready" | "active" | "ending" | "analyzing" | "complete"
+import { cancelInterviewSession, endInterviewSession } from "@/lib/api"
+import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
+import {
+  getTechnicalPermissionState,
+  getTechnicalCameraStream,
+  getTechnicalMicrophoneStream,
+  releaseTechnicalPermissions,
+  requestTechnicalScreenShare,
+  subscribeTechnicalPermissionState,
+  type TechnicalPermissionState,
+} from "@/lib/technical-permissions"
+type SessionMode = "mock-ai" | "mock-voice"
+type InterviewState = "connecting" | "ready" | "active" | "recovering" | "ending" | "analyzing" | "complete"
+type JobContext = {
+  role?: string | null
+  company?: string | null
+  job_title?: string | null
+  jd_summary?: string | null
+  key_skills?: string[]
+  profile_type?: string | null
+  profile_label?: string | null
+}
 interface TranscriptMessage {
   role: "interviewer" | "user"
   text: string
   isPartial?: boolean
+  questionId?: string
+}
+function buildInterviewWsUrl(apiBase: string, ticket: string) {
+  const hostBase = /^https?:\/\//i.test(apiBase)
+    ? apiBase.replace(/^http/i, "ws").replace(/\/api\/?$/, "")
+    : window.location.origin.replace(/^http/i, "ws")
+  return `${hostBase}/api/interview/ws/video/${ticket}`
+}
+
+function createEnvelopeId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID()
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (char) => {
+    const random = Math.floor(Math.random() * 16)
+    return (char === "x" ? random : (random & 0x3) | 0x8).toString(16)
+  })
 }
 export default function InterviewRoom() {
   const params = useParams()
   const router = useRouter()
   const searchParams = useSearchParams()
   const sessionId = params.id as string
-  const mode = (searchParams.get("mode") as SessionMode) || "practice-ai"
+  const requestedMode = searchParams.get("mode")
+  const mode: SessionMode = "mock-voice"
+  const inputMode: "voice" = "voice"
+  const cameraEnabled = true
+  const recoveryGraceSeconds = readRecoveryGraceSeconds()
+  const sessionControlLock = useSessionControlLock(sessionId)
+  const voiceMode = inputMode === "voice"
+  const requiresStrictPermissions = true
   const [isMicOn, setIsMicOn] = useState(false)
-  const [isVideoOn, setIsVideoOn] = useState(true)
+  const [isVideoOn, setIsVideoOn] = useState(cameraEnabled)
   const [messages, setMessages] = useState<TranscriptMessage[]>([])
   const [hints, setHints] = useState<string[]>([])
   const [isConnected, setIsConnected] = useState(false)
@@ -41,24 +86,72 @@ export default function InterviewRoom() {
   const [progress, setProgress] = useState("")
   const [pipelineMode, setPipelineMode] = useState<"full" | "audio_only" | "legacy">("legacy")
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null)
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [aiSpeaking, setAiSpeaking] = useState(false)
   const [isCapturing, setIsCapturing] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [sessionTimer, setSessionTimer] = useState(0)
   const [showAnalyzing, setShowAnalyzing] = useState(false)
   const [showEndConfirm, setShowEndConfirm] = useState(false)
+  const [interviewerName, setInterviewerName] = useState("Interviewer")
+  const [interviewerTitle, setInterviewerTitle] = useState("Interview Round")
+  const [jobContext, setJobContext] = useState<JobContext | null>(null)
+  const [permissionState, setPermissionState] = useState<TechnicalPermissionState>(() => getTechnicalPermissionState())
+  const [permissionError, setPermissionError] = useState("")
+  const [requestingPermissions, setRequestingPermissions] = useState(false)
+  const [textAnswer, setTextAnswer] = useState("")
+  const [textSubmitting, setTextSubmitting] = useState(false)
   const activeAudioRef = useRef<HTMLAudioElement[]>([])
   const audioQueueRef = useRef<Promise<void>>(Promise.resolve())
   const videoRef = useRef<HTMLVideoElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
+  const clientSessionIdRef = useRef(createEnvelopeId())
+  const clientSequenceRef = useRef(0)
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const sessionRecorderRef = useRef<MediaRecorder | null>(null)
   const recordedChunksRef = useRef<Blob[]>([])
+  const sessionChunkIndexRef = useRef(0)
   const discardRecordingRef = useRef(false)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const aiTokenBufferRef = useRef("")
   const partialTranscriptRef = useRef("")
+  const lastQuestionIdRef = useRef<string | null>(null)
   const lastFaceMetricSentRef = useRef(0)
+  const pageLoadTimeRef = useRef(Date.now())
+  const lastPermissionStateRef = useRef<TechnicalPermissionState>(getTechnicalPermissionState())
+  const mediaCleanupDoneRef = useRef(false)
+  const interviewEndSentRef = useRef(false)
+  const interviewStartedRef = useRef(false)
+  const interviewStateRef = useRef<InterviewState>("connecting")
+  const recoveryStartedAtRef = useRef<number | null>(null)
+  const reconnectAttemptRef = useRef(0)
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const cameraLossTimerRef = useRef<number | null>(null)
+  const questionStartedAtRef = useRef(Date.now())
+  const speechRecordingStartedAtRef = useRef<number | null>(null)
+  const pendingTextAnswerRef = useRef<{ idempotencyKey: string; text: string } | null>(null)
+  const cleanupInterviewEnvironmentRef = useRef<(options?: { complete?: boolean; keepalive?: boolean }) => void>(() => {})
+  const deferredUnmountCleanupRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sendClientEvent = useCallback((
+    type: string,
+    payload: Record<string, unknown> = {},
+    target: WebSocket | null = wsRef.current,
+  ) => {
+    if (!target || target.readyState !== WebSocket.OPEN) return null
+    clientSequenceRef.current += 1
+    const eventId = createEnvelopeId()
+    target.send(JSON.stringify({
+      event_id: eventId,
+      sequence: clientSequenceRef.current,
+      client_session_id: clientSessionIdRef.current,
+      interview_id: sessionId,
+      type,
+      sent_at: new Date().toISOString(),
+      payload,
+    }))
+    return eventId
+  }, [sessionId])
   const getSupportedAudioMimeType = useCallback(() => {
     if (typeof MediaRecorder === "undefined") return ""
     const candidates = [
@@ -83,6 +176,62 @@ export default function InterviewRoom() {
       reader.onerror = () => reject(new Error("Failed to encode audio blob"))
       reader.readAsDataURL(blob)
     })
+  }, [])
+  const registerMediaChunk = useCallback(async (blob: Blob, mediaKind: "video" | "audio" = "video") => {
+    try {
+      const chunkIndex = sessionChunkIndexRef.current++
+      const uploadResp = await fetch(`${API_CONFIG.BASE_URL}/interview/${sessionId}/media/upload-url`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({
+          media_kind: mediaKind,
+          content_type: blob.type || "video/webm",
+          byte_size: blob.size,
+          chunk_index: chunkIndex,
+        }),
+      })
+      if (!uploadResp.ok) return
+      const upload = await uploadResp.json()
+      await fetch(`${API_CONFIG.BASE_URL}/interview/${sessionId}/media/chunk-complete`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({
+          asset_id: upload.asset_id,
+          media_kind: mediaKind,
+          object_key: upload.object_key,
+          content_type: blob.type || "video/webm",
+          byte_size: blob.size,
+          chunk_index: chunkIndex,
+          metadata: { browser_recorded: true },
+        }),
+      })
+    } catch {
+    }
+  }, [sessionId])
+  const startSessionRecording = useCallback((stream: MediaStream) => {
+    if (typeof MediaRecorder === "undefined" || sessionRecorderRef.current) return
+    const mediaKind = stream.getVideoTracks().length > 0 ? "video" : "audio"
+    const candidates = mediaKind === "video"
+      ? ["video/webm;codecs=vp8,opus", "video/webm"]
+      : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
+    const mimeType = candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) || ""
+    try {
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) void registerMediaChunk(event.data, mediaKind)
+      }
+      recorder.start(10000)
+      sessionRecorderRef.current = recorder
+    } catch {
+      sendClientEvent("anti_cheat_event", { event_type: "recording_failed", payload: {} })
+    }
+  }, [registerMediaChunk, sendClientEvent])
+  const stopSessionRecording = useCallback(() => {
+    const recorder = sessionRecorderRef.current
+    if (recorder && recorder.state !== "inactive") recorder.stop()
+    sessionRecorderRef.current = null
   }, [])
   const stopSpeechRecording = useCallback((discard = false) => {
     const recorder = mediaRecorderRef.current
@@ -119,8 +268,12 @@ export default function InterviewRoom() {
       const shouldDiscard = discardRecordingRef.current
       const socket = wsRef.current
       const blobType = recorder.mimeType || mimeType || "audio/webm"
+      const durationMs = speechRecordingStartedAtRef.current
+        ? Math.max(0, Date.now() - speechRecordingStartedAtRef.current)
+        : 0
 
       mediaRecorderRef.current = null
+      speechRecordingStartedAtRef.current = null
       recordedChunksRef.current = []
       discardRecordingRef.current = false
 
@@ -137,7 +290,16 @@ export default function InterviewRoom() {
       try {
         const audioBlob = new Blob(chunks, { type: blobType })
         const audioBase64 = await blobToBase64(audioBlob)
-        socket.send(JSON.stringify({ type: "audio_chunk", audio: audioBase64 }))
+        sendClientEvent("audio_chunk", {
+          audio: audioBase64,
+          mime_type: blobType,
+          duration_ms: durationMs,
+          question_id: lastQuestionIdRef.current,
+          timing: {
+            response_seconds: Math.max(0, (Date.now() - questionStartedAtRef.current) / 1000),
+            voiced_duration_seconds: durationMs / 1000,
+          },
+        }, socket)
       } catch {
         setIsProcessing(false)
         toast.error("Failed to send audio. Please try again.")
@@ -145,8 +307,9 @@ export default function InterviewRoom() {
     }
 
     recorder.start()
+    speechRecordingStartedAtRef.current = Date.now()
     mediaRecorderRef.current = recorder
-  }, [blobToBase64, getSupportedAudioMimeType])
+  }, [blobToBase64, getSupportedAudioMimeType, sendClientEvent])
   const {
     metrics: streamingMetrics,
     updateEngagement,
@@ -156,13 +319,36 @@ export default function InterviewRoom() {
     resetSpeechTracking,
   } = useStreamingMetrics()
   const { metrics: faceMetrics, start: startFaceCheck, stop: stopFaceCheck } = useFaceCheck(videoRef)
+  useAudioEnvironment(localStream, {
+    enabled: voiceMode && interviewState === "active",
+    onBackgroundAudioDetected: useCallback((details: { type: string; confidence: number }) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        sendClientEvent("anti_cheat_event", {
+          event_type: "background_audio_detected",
+          payload: details,
+        })
+      }
+      toast.warning(
+        details.type === "background_music"
+          ? "Background music detected. Please mute other audio sources during the interview."
+          : "Background audio detected. Please ensure a quiet environment for the interview."
+      )
+    }, [sendClientEvent]),
+  })
+  useEffect(() => {
+    interviewStateRef.current = interviewState
+  }, [interviewState])
+  useEffect(() => {
+    if (requestedMode && requestedMode !== "mock-voice") {
+      toast.info("Opening your Interview Round.")
+      router.replace(`/interview/${sessionId}?mode=mock-voice`)
+    }
+  }, [requestedMode, router, sessionId])
   const vad = useVAD({
     onSpeechStart: () => {
+      if (aiSpeaking) return
       setIsCapturing(true)
       setIsProcessing(false)
-      if (aiSpeaking) {
-        setAiSpeaking(false)
-      }
       startSpeechRecording()
     },
     onSpeechEnd: (duration) => {
@@ -177,6 +363,55 @@ export default function InterviewRoom() {
       stopSpeechRecording(true)
     },
   })
+  useEffect(() => {
+    const unsubscribe = subscribeTechnicalPermissionState((state) => {
+      const previous = lastPermissionStateRef.current
+      setPermissionState(state)
+      lastPermissionStateRef.current = state
+      if (previous.screenShareReady && !state.screenShareReady && wsRef.current?.readyState === WebSocket.OPEN) {
+        sendClientEvent("anti_cheat_event", {
+          event_type: state.screenShareReady ? "fullscreen_exit" : "screen_share_stopped",
+          payload: {},
+        })
+      }
+    })
+    return unsubscribe
+  }, [requiresStrictPermissions, sendClientEvent])
+  const requestInterviewPermissions = useCallback(async () => {
+    if (interviewEndSentRef.current) return
+    setPermissionError("")
+    setRequestingPermissions(true)
+    const result = await requestTechnicalScreenShare()
+    const nextState = result.ok ? result.state : getTechnicalPermissionState()
+    setPermissionState(nextState)
+    setRequestingPermissions(false)
+    if (!result.ok || !nextState.screenShareReady) {
+      await releaseTechnicalPermissions()
+      const message = result.ok ? "Fullscreen and screen sharing are required to continue." : result.message
+      setPermissionError(message)
+      toast.error(message)
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        sendClientEvent("anti_cheat_event", {
+          event_type: "interview_permission_failed",
+          payload: { reason: result.ok ? "incomplete" : result.reason },
+        })
+      }
+    }
+  }, [sendClientEvent])
+  useEffect(() => {
+    if (interviewState !== "active" || permissionState.screenShareReady || interviewEndSentRef.current) return
+    toast.warning(`Screen sharing stopped. Restore it within ${recoveryGraceSeconds} seconds or this attempt will end incomplete.`)
+    const timeout = window.setTimeout(() => {
+      if (getTechnicalPermissionState().screenShareReady || interviewEndSentRef.current) return
+      interviewEndSentRef.current = true
+      void cancelInterviewSession(sessionId).finally(() => {
+        cleanupInterviewEnvironmentRef.current()
+        toast.error("The restoration window expired. This attempt was marked incomplete.")
+        router.replace("/")
+      })
+    }, recoveryGraceSeconds * 1000)
+    return () => window.clearTimeout(timeout)
+  }, [interviewState, permissionState.screenShareReady, recoveryGraceSeconds, router, sessionId])
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768)
     check()
@@ -196,22 +431,71 @@ export default function InterviewRoom() {
         now - lastFaceMetricSentRef.current > 1200
       ) {
         lastFaceMetricSentRef.current = now
-        wsRef.current.send(JSON.stringify({
-          type: "body_language_metrics",
+        sendClientEvent("body_language_metrics", {
           metrics: faceMetrics,
-        }))
+        })
       }
     }
-  }, [faceMetrics, interviewState, updateCameraContact])
+  }, [faceMetrics, interviewState, sendClientEvent, updateCameraContact])
+  useEffect(() => {
+    if (interviewState !== "active" || !localStream || !isVideoOn) return
+    startFaceCheck()
+    return () => stopFaceCheck()
+  }, [interviewState, isVideoOn, localStream, startFaceCheck, stopFaceCheck])
+  useEffect(() => {
+    const videoTrack = localStream?.getVideoTracks()[0]
+    if (!videoTrack) return
+    const handleCameraEnded = () => {
+      if (interviewEndSentRef.current || interviewStateRef.current !== "active") return
+      setIsVideoOn(false)
+      sendClientEvent("anti_cheat_event", {
+        event_type: "camera_track_ended",
+        payload: {},
+      })
+      toast.error("Camera connection was interrupted. Restore camera access to continue.")
+      if (cameraLossTimerRef.current) window.clearTimeout(cameraLossTimerRef.current)
+      cameraLossTimerRef.current = window.setTimeout(() => {
+        const hasLiveCamera = Boolean(
+          localStreamRef.current?.getVideoTracks().some((track) => track.readyState === "live" && track.enabled)
+        )
+        if (hasLiveCamera || interviewEndSentRef.current) return
+        interviewEndSentRef.current = true
+        void cancelInterviewSession(sessionId).finally(() => {
+          cleanupInterviewEnvironmentRef.current()
+          router.replace("/?tab=interview")
+        })
+      }, recoveryGraceSeconds * 1000)
+    }
+    videoTrack.addEventListener("ended", handleCameraEnded)
+    return () => videoTrack.removeEventListener("ended", handleCameraEnded)
+  }, [localStream, recoveryGraceSeconds, router, sendClientEvent, sessionId])
   useEffect(() => {
     async function setupMedia() {
+      if (!voiceMode && !cameraEnabled) {
+        setIsMicOn(false)
+        setIsVideoOn(false)
+        return
+      }
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        const preflightCamera = getTechnicalCameraStream()
+        const preflightMicrophone = getTechnicalMicrophoneStream()
+        const preflightTracks = [
+          ...(preflightCamera?.getVideoTracks() || []),
+          ...(voiceMode ? preflightMicrophone?.getAudioTracks() || [] : []),
+        ].filter((track) => track.readyState === "live")
+        const hasPreflightVideo = preflightTracks.some((track) => track.kind === "video")
+        const hasPreflightAudio = !voiceMode || preflightTracks.some((track) => track.kind === "audio")
+        const stream = hasPreflightVideo && hasPreflightAudio
+          ? new MediaStream(preflightTracks)
+          : await navigator.mediaDevices.getUserMedia({ video: true, audio: voiceMode })
         if (videoRef.current) videoRef.current.srcObject = stream
         localStreamRef.current = stream
-        startFaceCheck()
+        setLocalStream(stream)
+        startSessionRecording(stream)
       } catch {
-        toast.error("Could not access camera or microphone.")
+        toast.error(voiceMode
+          ? "Camera and microphone access are required for the Interview Round. Allow both, then retry."
+          : "Camera access is required for the Interview Round. Allow it, then retry.")
         setIsVideoOn(false)
         setIsMicOn(false)
       }
@@ -219,10 +503,13 @@ export default function InterviewRoom() {
     setupMedia()
     return () => {
       stopSpeechRecording(true)
+      stopSessionRecording()
       localStreamRef.current?.getTracks().forEach((t) => t.stop())
+      localStreamRef.current = null
+      setLocalStream(null)
       stopFaceCheck()
     }
-  }, [stopFaceCheck, stopSpeechRecording])
+  }, [cameraEnabled, startSessionRecording, stopFaceCheck, stopSessionRecording, stopSpeechRecording, voiceMode])
   const handleWSMessage = useCallback(
     (event: MessageEvent) => {
       try {
@@ -230,40 +517,87 @@ export default function InterviewRoom() {
         switch (data.type) {
           case "session_started":
             setInterviewState("ready")
+            const restoredQuestionId = data.question_id || data.current_question_id || lastQuestionIdRef.current
+            lastQuestionIdRef.current = restoredQuestionId
+            questionStartedAtRef.current = Date.now()
+            if (data.settings?.interview_activated_at) {
+              const startedAt = Date.parse(data.settings.interview_activated_at)
+              if (Number.isFinite(startedAt)) {
+                setSessionTimer(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
+              }
+            } else {
+              setSessionTimer(0)
+            }
+            if (data.audio_pending) setAiSpeaking(true)
+            if (data.persona) {
+              if (data.persona.name) setInterviewerName(data.persona.name)
+              if (data.persona.role) setInterviewerTitle(data.persona.role)
+            }
+            if (data.settings?.job_context && typeof data.settings.job_context === "object") {
+              setJobContext(data.settings.job_context as JobContext)
+            }
             if (data.opening_text) {
-              setMessages((prev) => [
-                ...prev,
-                { role: "interviewer", text: data.opening_text },
-              ])
+              setCurrentQuestion(data.current_question || data.opening_text)
+              setCurrentTopic(data.current_topic || "Warm-up")
+              setProgress(data.progress || "Warm-up")
+              setMessages((prev) => prev.some((item) => item.role === "interviewer" && item.questionId === restoredQuestionId)
+                ? prev
+                : [...prev, { role: "interviewer", text: data.opening_text, questionId: restoredQuestionId }])
             }
             if (data.opening_audio) {
               playAudioBase64(data.opening_audio)
             }
-            if (mode.startsWith("practice")) {
-              setTimeout(() => initPipeline(), 600)
-            }
             break
           case "pipeline_ready":
+            interviewStartedRef.current = true
+            recoveryStartedAtRef.current = null
+            reconnectAttemptRef.current = 0
             setPipelineMode(data.pipeline_mode)
             setIsProcessing(false)
             if (data.avatar_session?.sdp_offer) {
               setRemoteStream(new MediaStream())
             }
             setInterviewState("active")
+            if (data.activated_at) {
+              const activatedAt = Date.parse(data.activated_at)
+              setSessionTimer(Number.isFinite(activatedAt)
+                ? Math.max(0, Math.floor((Date.now() - activatedAt) / 1000))
+                : 0)
+            } else if (!interviewStartedRef.current) {
+              setSessionTimer(0)
+            }
             if (timerRef.current) clearInterval(timerRef.current)
             timerRef.current = setInterval(() => {
               setSessionTimer((prev) => prev + 1)
             }, 1000)
             break
           case "question":
+            if (data.requires_ack && data.question_id && wsRef.current?.readyState === WebSocket.OPEN) {
+              sendClientEvent("question_ack", {
+                question_id: data.question_id,
+                delivery_id: data.delivery_id,
+                sequence: data.sequence,
+              })
+            }
+            if (data.question_id && lastQuestionIdRef.current === data.question_id) {
+              setIsProcessing(false)
+              setTextSubmitting(false)
+              break
+            }
+            lastQuestionIdRef.current = data.question_id || null
+            questionStartedAtRef.current = Date.now()
+            pendingTextAnswerRef.current = null
+            setTextSubmitting(false)
+            setTextAnswer("")
             setIsProcessing(false)
             setCurrentQuestion(data.question_text)
             setCurrentTopic(data.topic)
             setProgress(data.progress)
             setMessages((prev) => [
               ...prev,
-              { role: "interviewer", text: data.question_text },
+              { role: "interviewer", text: data.question_text, questionId: data.question_id },
             ])
+            if (data.audio_pending) setAiSpeaking(true)
             if (data.question_audio) {
               playAudioBase64(data.question_audio)
             }
@@ -280,11 +614,27 @@ export default function InterviewRoom() {
               partialTranscriptRef.current = ""
               setMessages((prev) => {
                 const filtered = prev.filter((m) => !m.isPartial)
+                if (pendingTextAnswerRef.current?.text.trim() === String(data.text || "").trim()) {
+                  return filtered
+                }
                 return [...filtered, { role: "user", text: data.text }]
               })
               addTranscriptWords(data.text)
               resetSpeechTracking()
             }
+            break
+          case "answer_committed":
+            if (
+              pendingTextAnswerRef.current
+              && data.idempotency_key
+              && data.idempotency_key !== pendingTextAnswerRef.current.idempotencyKey
+            ) {
+              break
+            }
+            pendingTextAnswerRef.current = null
+            setTextSubmitting(false)
+            setIsProcessing(true)
+            if (data.duplicate) toast.info("That answer was already saved. Continuing from the saved response.")
             break
           case "ai_token":
             aiTokenBufferRef.current += data.token
@@ -318,14 +668,16 @@ export default function InterviewRoom() {
             aiTokenBufferRef.current = ""
             break
           case "audio_chunk":
-            playAudioBase64(data.audio)
+            void playAudioBase64(data.audio, data.audio_mime_type || "audio/wav")
             setAiSpeaking(true)
+            break
+          case "speech_unavailable":
+            setAiSpeaking(false)
+            if (data.message) toast.info(data.message)
             break
           case "evaluation":
             setIsProcessing(false)
-            if (mode.startsWith("practice")) {
-              updateEngagement(2000, data.score / 100)
-            }
+            updateEngagement(2000, data.score / 100)
             break
           case "dynamic_tooltip":
             setDynamicTip(data.tip)
@@ -340,27 +692,37 @@ export default function InterviewRoom() {
             updateCameraContact(contactVal, data.eye_contact ? "Optimal" : "Low")
             break
           case "interview_ending":
+            cleanupInterviewEnvironmentRef.current()
             setInterviewState("analyzing")
             setShowAnalyzing(true)
             break
           case "interview_complete":
             setIsProcessing(false)
-            setInterviewState("complete")
             if (data.closing_text) {
               setMessages((prev) => [
                 ...prev,
                 { role: "interviewer", text: data.closing_text },
               ])
             }
-            if (data.closing_audio) {
-              playAudioBase64(data.closing_audio)
-            }
-            if (data.redirect_to) {
-              setTimeout(() => router.replace(data.redirect_to), 2000)
-            }
+            void (async () => {
+              if (data.closing_audio) {
+                await playAudioBase64(data.closing_audio, data.audio_mime_type || "audio/wav")
+              }
+              cleanupInterviewEnvironmentRef.current()
+              setInterviewState("analyzing")
+              setShowAnalyzing(true)
+            })()
+            break
+          case "interview_already_finalized":
+            setIsProcessing(false)
+            setInterviewState("complete")
+            cleanupInterviewEnvironmentRef.current()
+            router.replace(data.redirect_to || `/interview/${sessionId}/report`)
             break
           case "error":
             setIsProcessing(false)
+            setTextSubmitting(false)
+            pendingTextAnswerRef.current = null
             toast.error(data.message)
             break
         }
@@ -368,10 +730,46 @@ export default function InterviewRoom() {
         toast.error("Received an invalid interview message.")
       }
     },
-    [mode, router, addTranscriptWords, resetSpeechTracking, updateEngagement, updateCameraContact, setDynamicTip]
+    [mode, router, sessionId, addTranscriptWords, resetSpeechTracking, sendClientEvent, updateEngagement, updateCameraContact, setDynamicTip]
   )
   useEffect(() => {
+    if (sessionControlLock !== "owned") return
     let cancelled = false
+
+    const endExpiredRecovery = async () => {
+      if (cancelled || interviewEndSentRef.current) return
+      interviewEndSentRef.current = true
+      setInterviewState("ending")
+      try {
+        await cancelInterviewSession(sessionId)
+      } catch {
+        // The durable backend recovery sweeper remains authoritative if this
+        // final client request cannot be delivered.
+      } finally {
+        cleanupInterviewEnvironmentRef.current({ complete: true })
+        toast.error("The connection recovery window expired. This attempt was marked incomplete.")
+        router.replace("/?tab=interview")
+      }
+    }
+
+    const scheduleReconnect = () => {
+      if (cancelled || interviewEndSentRef.current) return
+      const recoveryStartedAt = recoveryStartedAtRef.current ?? Date.now()
+      recoveryStartedAtRef.current = recoveryStartedAt
+      const elapsed = Date.now() - recoveryStartedAt
+      const graceMs = recoveryGraceSeconds * 1000
+      if (elapsed >= graceMs) {
+        void endExpiredRecovery()
+        return
+      }
+      setInterviewState("recovering")
+      const delay = Math.min(4000, 500 * (2 ** reconnectAttemptRef.current))
+      reconnectAttemptRef.current += 1
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null
+        void connectWebSocket()
+      }, Math.min(delay, graceMs - elapsed))
+    }
 
     async function connectWebSocket() {
       const apiBase = API_CONFIG.BASE_URL
@@ -379,48 +777,62 @@ export default function InterviewRoom() {
         const ticketRes = await fetch(`${apiBase}/interview/ws-ticket`, {
           method: "POST",
           credentials: "include",
+          headers: getAuthHeaders(),
         })
         if (!ticketRes.ok) {
           const body = await ticketRes.json().catch(() => null)
-          toast.error(body?.detail || body?.message || "Failed to connect to the interview session.")
-          router.push("/")
+          if (ticketRes.status === 401 || ticketRes.status === 403) {
+            toast.error(body?.detail || body?.message || "Your session expired. Sign in again.")
+            router.replace("/")
+            return
+          }
+          scheduleReconnect()
           return
         }
         const { ticket } = await ticketRes.json()
         if (cancelled || !ticket) return
 
-        const wsBase = apiBase.replace(/^http/, "ws").replace(/\/api$/, "")
-        const ws = new WebSocket(`${wsBase}/api/interview/ws/video/${ticket}`)
+        const ws = new WebSocket(buildInterviewWsUrl(apiBase, ticket))
 
         ws.onopen = () => {
           setIsConnected(true)
-          ws.send(JSON.stringify({ type: "start_session", interview_id: sessionId }))
+          sendClientEvent("start_session", { interview_id: sessionId }, ws)
         }
         ws.onmessage = handleWSMessage
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           setIsConnected(false)
           if (timerRef.current) clearInterval(timerRef.current)
+          if (cancelled || interviewEndSentRef.current || mediaCleanupDoneRef.current) return
+          if (event.code === 4010) {
+            toast.error("This attempt is already active in another tab.")
+            cleanupInterviewEnvironmentRef.current()
+            router.replace("/?tab=interview")
+            return
+          }
+          if (recoveryStartedAtRef.current === null) {
+            toast.warning(`Connection interrupted. Reconnecting for up to ${recoveryGraceSeconds} seconds…`)
+          }
+          scheduleReconnect()
         }
         ws.onerror = () => {
-          toast.error("WebSocket connection failed")
           setIsConnected(false)
         }
         wsRef.current = ws
       } catch {
-        toast.error("Failed to connect. Please try again.")
-        router.push("/")
+        scheduleReconnect()
       }
     }
 
     connectWebSocket()
     return () => {
       cancelled = true
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
       wsRef.current?.close()
       if (timerRef.current) clearInterval(timerRef.current)
     }
-  }, [sessionId, handleWSMessage, router])
+  }, [handleWSMessage, recoveryGraceSeconds, router, sendClientEvent, sessionControlLock, sessionId])
   useEffect(() => {
-    if (interviewState !== "active" || !isMicOn || !localStreamRef.current) return
+    if (!voiceMode || interviewState !== "active" || !isMicOn || !localStreamRef.current) return
     const audioStream = new MediaStream(localStreamRef.current.getAudioTracks())
     if (audioStream.getAudioTracks().length === 0) return
     vad.startListening(audioStream)
@@ -428,33 +840,39 @@ export default function InterviewRoom() {
       stopSpeechRecording(true)
       vad.stopListening()
     }
-  }, [interviewState, isMicOn, stopSpeechRecording])
+  }, [aiSpeaking, interviewState, isMicOn, stopSpeechRecording, voiceMode])
   useEffect(() => {
-    if (!mode.startsWith("mock")) return
+    if (!requiresStrictPermissions) return
+    const lastPermissionDialogRef = { current: 0 }
     const sendAntiCheat = (eventType: string, payload: Record<string, unknown> = {}) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({
-          type: "anti_cheat_event",
-          event_type: eventType,
-          payload,
-        }))
-      }
+      sendClientEvent("anti_cheat_event", { event_type: eventType, payload })
+    }
+    const warnStrictMode = (eventType: string, message: string, payload: Record<string, unknown> = {}) => {
+      sendAntiCheat(eventType, payload)
+      toast.warning(message)
     }
     const onVisibility = () => {
+      if (Date.now() - pageLoadTimeRef.current < 15000) return
+      if (Date.now() - lastPermissionDialogRef.current < 3000) return
       if (document.visibilityState === "hidden") {
-        sendAntiCheat("tab_switch", { visibilityState: document.visibilityState })
+        warnStrictMode("tab_switch", "Strict mock warning: tab switching is flagged.", { visibilityState: document.visibilityState })
       }
     }
-    const onBlur = () => sendAntiCheat("window_blur")
+    const onBlur = () => {
+      if (Date.now() - pageLoadTimeRef.current < 15000) return
+      if (Date.now() - lastPermissionDialogRef.current < 3000) return
+      warnStrictMode("window_blur", "Strict mock warning: leaving the interview window is logged.")
+    }
     const onFullscreen = () => {
+      if (Date.now() - pageLoadTimeRef.current < 15000) return
+      lastPermissionDialogRef.current = Date.now()
       if (!document.fullscreenElement && interviewState === "active") {
-        sendAntiCheat("fullscreen_exit")
+        warnStrictMode("fullscreen_exit", "Strict mock warning: fullscreen exit is flagged.")
       }
     }
     const onPaste = (event: ClipboardEvent) => {
       event.preventDefault()
-      sendAntiCheat("paste_blocked")
-      toast.error("Paste is disabled during mock interviews.")
+      warnStrictMode("paste_blocked", "Paste is disabled and this interview was flagged.")
     }
     document.addEventListener("visibilitychange", onVisibility)
     document.addEventListener("fullscreenchange", onFullscreen)
@@ -466,14 +884,14 @@ export default function InterviewRoom() {
       window.removeEventListener("blur", onBlur)
       document.removeEventListener("paste", onPaste)
     }
-  }, [mode, interviewState])
-  const playAudioBase64 = useCallback((base64: string) => {
+  }, [requiresStrictPermissions, interviewState, sendClientEvent])
+  const playAudioBase64 = useCallback((base64: string, mimeType = "audio/wav") => {
     audioQueueRef.current = audioQueueRef.current.then(() => new Promise<void>((resolve) => {
       try {
         const binary = atob(base64)
         const bytes = new Uint8Array(binary.length)
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-        const blob = new Blob([bytes], { type: "audio/mp3" })
+        const blob = new Blob([bytes], { type: mimeType })
         const url = URL.createObjectURL(blob)
         const audio = new Audio(url)
         activeAudioRef.current.push(audio)
@@ -504,6 +922,7 @@ export default function InterviewRoom() {
         resolve()
       }
     }))
+    return audioQueueRef.current
   }, [])
   const stopAllAudio = useCallback(() => {
     activeAudioRef.current.forEach(audio => {
@@ -515,21 +934,81 @@ export default function InterviewRoom() {
     audioQueueRef.current = Promise.resolve()
     setAiSpeaking(false)
   }, [])
+  const sendInterviewEnd = useCallback((keepalive = false) => {
+    if (interviewEndSentRef.current) return
+    interviewEndSentRef.current = true
+    try {
+      sendClientEvent("end_interview")
+    } catch {
+    }
+    void endInterviewSession(sessionId, { keepalive }).catch(() => null)
+  }, [sendClientEvent, sessionId])
+  const cleanupInterviewEnvironment = useCallback((options: { complete?: boolean; keepalive?: boolean } = {}) => {
+    if (options.complete) {
+      sendInterviewEnd(Boolean(options.keepalive))
+    }
+    if (mediaCleanupDoneRef.current) return
+    mediaCleanupDoneRef.current = true
+    stopAllAudio()
+    stopSpeechRecording(true)
+    stopSessionRecording()
+    vad.stopListening()
+    stopFaceCheck()
+    if (timerRef.current) {
+      clearInterval(timerRef.current)
+      timerRef.current = null
+    }
+    if (cameraLossTimerRef.current) {
+      clearTimeout(cameraLossTimerRef.current)
+      cameraLossTimerRef.current = null
+    }
+    localStreamRef.current?.getTracks().forEach((track) => track.stop())
+    localStreamRef.current = null
+    setLocalStream(null)
+    if (videoRef.current) videoRef.current.srcObject = null
+    void releaseTechnicalPermissions()
+  }, [sendInterviewEnd, stopAllAudio, stopFaceCheck, stopSessionRecording, stopSpeechRecording, vad])
+  useEffect(() => {
+    cleanupInterviewEnvironmentRef.current = cleanupInterviewEnvironment
+  }, [cleanupInterviewEnvironment])
   const initPipeline = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      if (mode.startsWith("mock") && document.fullscreenEnabled && !document.fullscreenElement) {
+      if (voiceMode && !localStreamRef.current?.getAudioTracks().length) {
+        toast.error("Microphone access is required for the Interview Round. Allow microphone access, then retry.")
+        return
+      }
+      if (!localStreamRef.current?.getVideoTracks().length) {
+        toast.error("Camera access is required for the Interview Round. Allow camera access, then retry.")
+        return
+      }
+      const livePermissionState = getTechnicalPermissionState()
+      if (!livePermissionState.screenShareReady) {
+        setPermissionError("Share your entire screen before the Interview Round can begin.")
+        return
+      }
+      interviewStartedRef.current = true
+      if (requiresStrictPermissions && document.fullscreenEnabled && !document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch(() => {
-          wsRef.current?.send(JSON.stringify({
-            type: "anti_cheat_event",
+          sendClientEvent("anti_cheat_event", {
             event_type: "fullscreen_request_failed",
             payload: {},
-          }))
+          })
         })
       }
-      wsRef.current.send(JSON.stringify({ type: "init_pipeline" }))
-      setIsMicOn(true)
+      sendClientEvent("init_pipeline", {
+        input_mode: inputMode,
+        camera_enabled: cameraEnabled,
+        screen_share_enabled: livePermissionState.screenShareReady,
+      })
+      setIsMicOn(voiceMode)
     }
-  }, [mode])
+  }, [cameraEnabled, inputMode, requiresStrictPermissions, sendClientEvent, voiceMode])
+  useEffect(() => {
+    if (interviewState !== "ready" || !isConnected) return
+    if (voiceMode && !localStream?.getAudioTracks().length) return
+    if (!permissionState.screenShareReady) return
+    initPipeline()
+  }, [initPipeline, interviewState, isConnected, localStream, permissionState.screenShareReady, voiceMode])
   const toggleMic = useCallback(() => {
     setIsMicOn((prev) => {
       const next = !prev
@@ -543,29 +1022,97 @@ export default function InterviewRoom() {
     })
   }, [stopSpeechRecording])
   const toggleVideo = useCallback(() => {
-    setIsVideoOn((prev) => {
-      const next = !prev
-      localStreamRef.current?.getVideoTracks().forEach((t) => { t.enabled = next })
-      return next
-    })
+    toast.info("Camera must remain on throughout the Interview Round.")
   }, [])
+  const submitTextAnswer = useCallback(() => {
+    const text = textAnswer.trim()
+    if (!text || textSubmitting || isProcessing) return
+    const socket = wsRef.current
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      toast.error("The interview connection is not ready. Your answer was not sent.")
+      return
+    }
+    const questionId = lastQuestionIdRef.current
+    const idempotencyKey = typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `answer-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const responseSeconds = Math.max(0, Math.round((Date.now() - questionStartedAtRef.current) / 1000))
+    pendingTextAnswerRef.current = { idempotencyKey, text }
+    setTextSubmitting(true)
+    setIsProcessing(true)
+    setMessages((prev) => [...prev.filter((message) => !message.isPartial), { role: "user", text, ...(questionId ? { questionId } : {}) }])
+    sendClientEvent("text_answer", {
+      text,
+      question_id: questionId,
+      idempotency_key: idempotencyKey,
+      response_seconds: responseSeconds,
+      timing: { response_seconds: responseSeconds },
+    }, socket)
+  }, [isProcessing, sendClientEvent, textAnswer, textSubmitting])
   const requestEndCall = useCallback(() => {
     setShowEndConfirm(true)
   }, [])
-  const confirmEndCall = useCallback(() => {
+  const confirmEndCall = useCallback(async () => {
     setShowEndConfirm(false)
-    stopAllAudio()
-    stopSpeechRecording(true)
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "end_interview" }))
+    setInterviewState("ending")
+    cleanupInterviewEnvironment()
+    try {
+      await cancelInterviewSession(sessionId)
+      router.replace("/?tab=interview")
+    } catch (error) {
+      interviewEndSentRef.current = false
+      mediaCleanupDoneRef.current = false
+      setInterviewState("active")
+      toast.error(error instanceof Error ? error.message : "Could not end this attempt. Check your connection and try again.")
     }
-    localStreamRef.current?.getTracks().forEach((t) => t.stop())
-    setInterviewState("analyzing")
-    setShowAnalyzing(true)
-  }, [stopSpeechRecording, stopAllAudio])
+  }, [cleanupInterviewEnvironment, router, sessionId])
   const cancelEndCall = useCallback(() => {
     setShowEndConfirm(false)
   }, [])
+
+  useEffect(() => {
+    if (showAnalyzing || interviewState === "complete") return
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ""
+    }
+    const onPageHide = () => cleanupInterviewEnvironment()
+    window.addEventListener("beforeunload", onBeforeUnload)
+    window.addEventListener("pagehide", onPageHide)
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload)
+      window.removeEventListener("pagehide", onPageHide)
+    }
+  }, [cleanupInterviewEnvironment, interviewState, showAnalyzing])
+
+  useEffect(() => {
+    if (showAnalyzing || interviewState === "complete") return
+    window.history.pushState({ interviewGuard: true }, "", window.location.href)
+    const onPopState = () => {
+      setShowEndConfirm(true)
+      window.history.pushState({ interviewGuard: true }, "", window.location.href)
+    }
+    window.addEventListener("popstate", onPopState)
+    return () => window.removeEventListener("popstate", onPopState)
+  }, [interviewState, showAnalyzing])
+
+  useEffect(() => {
+    if (deferredUnmountCleanupRef.current) {
+      clearTimeout(deferredUnmountCleanupRef.current)
+      deferredUnmountCleanupRef.current = null
+    }
+    return () => {
+      // React development mode replays mount effects once. Defer cleanup by
+      // one task so the replay can cancel it instead of stopping the media
+      // streams acquired by the dashboard preflight immediately after route
+      // entry. A real unmount still runs the cleanup on the next task.
+      deferredUnmountCleanupRef.current = setTimeout(() => {
+        deferredUnmountCleanupRef.current = null
+        cleanupInterviewEnvironmentRef.current()
+      }, 0)
+    }
+  }, [])
+
   const formatTimer = (seconds: number) => {
     const m = Math.floor(seconds / 60).toString().padStart(2, "0")
     const s = (seconds % 60).toString().padStart(2, "0")
@@ -597,9 +1144,19 @@ export default function InterviewRoom() {
     streamingMetrics,
     formatTimer,
     initPipeline,
-    localStream: localStreamRef.current,
+    localStream,
+    showQuestionText: true,
+    interviewerName,
+    interviewerTitle,
+    jobContext,
+    inputMode,
+    cameraEnabled,
+    textAnswer,
+    textSubmitting,
+    onTextAnswerChange: setTextAnswer,
+    onSubmitTextAnswer: submitTextAnswer,
   }
-  if (showAnalyzing) {
+  if (showAnalyzing || interviewState === "analyzing") {
     return (
       <AnalyzingOverlay
         isVisible
@@ -608,21 +1165,30 @@ export default function InterviewRoom() {
       />
     )
   }
-  if (isMobile && mode.startsWith("practice")) {
-    return <MobileLayout {...layoutProps} />
+
+  if (sessionControlLock === "blocked") {
+    return <DuplicateSessionScreen onBack={() => router.replace("/?tab=interview")} />
   }
-  switch (mode) {
-    case "practice-ai":
-      return <PracticeAILayout {...layoutProps} />
-    case "practice-voice":
-      return <PracticeVoiceLayout {...layoutProps} />
-    case "mock-ai":
-      return <MockAILayout {...layoutProps} />
-    case "mock-voice":
-      return <MockVoiceLayout {...layoutProps} />
-    default:
-      return <PracticeAILayout {...layoutProps} />
+
+  if (sessionControlLock !== "owned") {
+    return <MeetConnectingOverlay state="connecting" />
   }
+
+  if (!permissionState.screenShareReady && !interviewEndSentRef.current && interviewState !== "complete" && interviewState !== "ending") {
+    return (
+      <>
+        <InterviewPermissionGate
+          permissionState={permissionState}
+          error={permissionError}
+          requesting={requestingPermissions}
+          onBack={requestEndCall}
+          onRequest={requestInterviewPermissions}
+        />
+        <EndConfirmDialog show={showEndConfirm} onConfirm={confirmEndCall} onCancel={cancelEndCall} />
+      </>
+    )
+  }
+  return <MockVoiceLayout {...layoutProps} />
 }
 interface LayoutProps {
   isMicOn: boolean
@@ -656,6 +1222,16 @@ interface LayoutProps {
   formatTimer: (s: number) => string
   initPipeline: () => void
   localStream: MediaStream | null
+  showQuestionText: boolean
+  interviewerName?: string
+  interviewerTitle?: string
+  jobContext?: JobContext | null
+  inputMode: "voice" | "text"
+  cameraEnabled: boolean
+  textAnswer: string
+  textSubmitting: boolean
+  onTextAnswerChange: (value: string) => void
+  onSubmitTextAnswer: () => void
 }
 interface TranscriptMessage {
   role: "interviewer" | "user"
@@ -666,29 +1242,29 @@ function EndConfirmDialog({ show, onConfirm, onCancel }: { show: boolean; onConf
   if (!show) return null
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="w-full max-w-sm mx-4 rounded-2xl bg-[#2d2e30] border border-[#3c4043] shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
+      <div className="w-full max-w-sm mx-4 rounded-2xl bg-card border border-border shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
         <div className="p-6 text-center">
-          <div className="w-14 h-14 rounded-full bg-[#ea4335]/15 flex items-center justify-center mx-auto mb-4">
-            <AlertTriangle className="w-7 h-7 text-[#ea4335]" />
+          <div className="w-14 h-14 rounded-full bg-destructive/15 flex items-center justify-center mx-auto mb-4">
+            <AlertTriangle className="w-7 h-7 text-destructive" />
           </div>
-          <h3 className="text-lg font-semibold text-[#e8eaed] mb-2">End this interview?</h3>
-          <p className="text-sm text-[#9aa0a6] leading-relaxed">
-            Are you sure you want to quit? Your progress will be saved and the AI will stop. This action cannot be undone.
+          <h3 className="text-lg font-semibold text-foreground mb-2">End this attempt?</h3>
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            This session cannot be resumed. Available evidence will be kept, but the attempt will be marked incomplete and will not receive an official final score.
           </p>
         </div>
-        <div className="flex border-t border-[#3c4043]">
+        <div className="flex border-t border-border">
           <button
             onClick={onCancel}
-            className="flex-1 px-4 py-3.5 text-sm font-medium text-[#8ab4f8] hover:bg-[#3c4043]/50 transition-colors"
+            className="flex-1 px-4 py-3.5 text-sm font-medium text-primary hover:bg-border/50 transition-colors"
           >
-            Continue Interview
+            Stay in session
           </button>
-          <div className="w-px bg-[#3c4043]" />
+          <div className="w-px bg-border" />
           <button
             onClick={onConfirm}
-            className="flex-1 px-4 py-3.5 text-sm font-medium text-[#ea4335] hover:bg-[#ea4335]/10 transition-colors"
+            className="flex-1 px-4 py-3.5 text-sm font-medium text-destructive hover:bg-destructive/10 transition-colors"
           >
-            Quit
+            End attempt
           </button>
         </div>
       </div>
@@ -696,13 +1272,87 @@ function EndConfirmDialog({ show, onConfirm, onCancel }: { show: boolean; onConf
   )
 }
 
+function DuplicateSessionScreen({ onBack }: { onBack: () => void }) {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4 text-foreground">
+      <div className="w-full max-w-md rounded-2xl border border-border bg-card p-7 text-center shadow-xl">
+        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-amber-500/15">
+          <AlertTriangle className="h-7 w-7 text-amber-600 dark:text-amber-300" />
+        </div>
+        <h1 className="text-xl font-semibold">Attempt already open</h1>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          This continuous attempt is controlled by another tab. Return to that tab, or close it before reopening this session.
+        </p>
+        <button onClick={onBack} className="mt-6 rounded-lg bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground">
+          Back
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function MeetConnectingOverlay({ state }: { state: string }) {
   return (
-    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#202124]">
-      <div className="w-12 h-12 rounded-full border-[3px] border-[#3c4043] border-t-[#8ab4f8] animate-spin mb-6" />
-      <p className="text-[#9aa0a6] text-sm">
-        {state === "connecting" ? "Connecting to session..." : "Starting interview..."}
+    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background">
+      <div className="w-12 h-12 rounded-full border-[3px] border-border border-t-primary animate-spin mb-6" />
+      <p className="text-muted-foreground text-sm">
+        {state === "connecting" ? "Connecting…" : "Preparing question…"}
       </p>
+    </div>
+  )
+}
+
+function InterviewPermissionGate({
+  permissionState,
+  error,
+  requesting,
+  onBack,
+  onRequest,
+}: {
+  permissionState: TechnicalPermissionState
+  error: string
+  requesting: boolean
+  onBack: () => void
+  onRequest: () => void
+}) {
+  return (
+    <div className="min-h-screen bg-background text-foreground flex items-center justify-center px-4">
+      <div className="w-full max-w-md rounded-2xl border border-border bg-card shadow-2xl overflow-hidden">
+        <div className="p-6 border-b border-border">
+          <div className="flex items-start gap-3">
+            <div className="w-11 h-11 rounded-xl bg-primary/15 flex items-center justify-center text-primary">
+              <Eye className="w-5 h-5" />
+            </div>
+            <div>
+              <h1 className="text-lg font-semibold">Share your screen</h1>
+              <p className="mt-1 text-sm text-muted-foreground">Choose Entire screen.</p>
+            </div>
+          </div>
+        </div>
+        <div className="p-6 space-y-3">
+          <PermissionStatus label="Screen share" active={permissionState.screenShareReady} />
+          {error && <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
+        </div>
+        <div className="flex gap-2 border-t border-border p-4">
+          <button onClick={onBack} className="flex-1 rounded-full border border-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-border transition-colors">
+            Back
+          </button>
+          <button onClick={onRequest} disabled={requesting} className="flex-1 rounded-full bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60 transition-colors">
+            {requesting ? "Requesting..." : "Share screen"}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function PermissionStatus({ label, active }: { label: string; active: boolean }) {
+  return (
+    <div className="flex items-center justify-between rounded-lg border border-border bg-background px-3 py-2">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${active ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300" : "bg-amber-500/15 text-amber-700 dark:text-amber-300"}`}>
+        {active ? "Ready" : "Required"}
+      </span>
     </div>
   )
 }
@@ -718,77 +1368,77 @@ function MeetSidePanel({
 }) {
   if (!show) return null
   return (
-    <aside className="w-80 border-l border-[#3c4043] flex flex-col bg-[#202124] shrink-0 animate-in slide-in-from-right duration-200">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[#3c4043]">
+    <aside className="w-80 border-l border-border flex flex-col bg-background shrink-0 animate-in slide-in-from-right duration-200">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <div className="flex items-center gap-2">
-          <Brain className="w-4 h-4 text-[#8ab4f8]" />
-          <h3 className="text-sm font-medium text-[#e8eaed]">AI Assistant</h3>
+          <Brain className="w-4 h-4 text-primary" />
+          <h3 className="text-sm font-medium text-foreground">AI Assistant</h3>
         </div>
-        <button onClick={onClose} className="w-8 h-8 rounded-full hover:bg-[#3c4043] flex items-center justify-center text-[#9aa0a6] transition-colors">
+        <button onClick={onClose} className="w-8 h-8 rounded-full hover:bg-border flex items-center justify-center text-muted-foreground transition-colors">
           <X className="w-4 h-4" />
         </button>
       </div>
       <div className="flex-1 overflow-y-auto p-4 space-y-5">
         <div>
-          <p className="text-[11px] uppercase tracking-wider text-[#9aa0a6] font-medium mb-2">Real-Time Suggestion</p>
-          <div className="p-3 rounded-lg bg-[#303134] border border-[#3c4043]">
-            <p className="text-sm text-[#bdc1c6] leading-relaxed italic">
+          <p className="text-xs text-muted-foreground font-medium mb-2">Real-Time Suggestion</p>
+          <div className="p-3 rounded-lg bg-secondary border border-border">
+            <p className="text-sm text-muted-foreground leading-relaxed italic">
               {dynamicTip ? `\u201C${dynamicTip}\u201D` : "Suggestions will appear as you speak..."}
             </p>
           </div>
         </div>
         <div>
-          <p className="text-[11px] uppercase tracking-wider text-[#9aa0a6] font-medium mb-2">Stuck? Try this</p>
+          <p className="text-xs text-muted-foreground font-medium mb-2">Stuck? Try this</p>
           <ul className="space-y-2">
             {hints.length > 0 ? hints.slice(-3).map((hint, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-[#bdc1c6] leading-relaxed">
-                <span className="text-[#8ab4f8] mt-0.5 shrink-0">•</span>
+              <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground leading-relaxed">
+                <span className="text-primary mt-0.5 shrink-0">•</span>
                 {hint}
               </li>
             )) : (
-              <li className="text-sm text-[#5f6368] italic">Hints will appear based on the current question...</li>
+              <li className="text-sm text-muted-foreground/70 italic">Hints will appear based on the current question...</li>
             )}
           </ul>
         </div>
         <div>
-          <p className="text-[11px] uppercase tracking-wider text-[#9aa0a6] font-medium mb-3">Performance</p>
+          <p className="text-xs text-muted-foreground font-medium mb-3">Performance</p>
           <div className="space-y-3">
             <div>
               <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-[#9aa0a6]">Eye Contact</span>
-                <span className="text-xs text-[#e8eaed] font-medium">{metrics.eyeContact}</span>
+                <span className="text-xs text-muted-foreground">Eye Contact</span>
+                <span className="text-xs text-foreground font-medium">{metrics.eyeContact}</span>
               </div>
-              <div className="h-1 bg-[#3c4043] rounded-full overflow-hidden">
-                <div className="h-full bg-[#8ab4f8] rounded-full transition-all duration-700" style={{ width: `${metrics.cameraValue}%` }} />
-              </div>
-            </div>
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-[#9aa0a6]">Confidence</span>
-                <span className="text-xs text-[#e8eaed] font-medium tabular-nums">{metrics.confidence}%</span>
-              </div>
-              <div className="h-1 bg-[#3c4043] rounded-full overflow-hidden">
-                <div className="h-full bg-[#81c995] rounded-full transition-all duration-700" style={{ width: `${metrics.confidence}%` }} />
+              <div className="h-1 bg-border rounded-full overflow-hidden">
+                <div className="h-full bg-primary rounded-full transition-all duration-700" style={{ width: `${metrics.cameraValue}%` }} />
               </div>
             </div>
             <div>
               <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-[#9aa0a6]">Composure</span>
-                <span className="text-xs text-[#e8eaed] font-medium">{metrics.emotion}</span>
+                <span className="text-xs text-muted-foreground">Confidence</span>
+                <span className="text-xs text-foreground font-medium tabular-nums">{metrics.confidence}%</span>
+              </div>
+              <div className="h-1 bg-border rounded-full overflow-hidden">
+                <div className="h-full bg-primary rounded-full transition-all duration-700" style={{ width: `${metrics.confidence}%` }} />
+              </div>
+            </div>
+            <div>
+              <div className="flex justify-between items-center mb-1">
+                <span className="text-xs text-muted-foreground">Composure</span>
+                <span className="text-xs text-foreground font-medium">{metrics.emotion}</span>
               </div>
               <div className="flex gap-1">
                 {[...Array(5)].map((_, i) => (
-                  <div key={i} className={`flex-1 h-1 rounded-full transition-all duration-500 ${i < Math.ceil(metrics.engagementValue / 20) ? "bg-[#fdd663]" : "bg-[#3c4043]"}`} />
+                  <div key={i} className={`flex-1 h-1 rounded-full transition-all duration-500 ${i < Math.ceil(metrics.engagementValue / 20) ? "bg-[var(--accent-amber)]" : "bg-border"}`} />
                 ))}
               </div>
             </div>
             {metrics.pace > 0 && (
-              <div className="pt-2 border-t border-[#3c4043]">
+              <div className="pt-2 border-t border-border">
                 <div className="flex justify-between items-center">
-                  <span className="text-xs text-[#9aa0a6]">Pace</span>
-                  <span className="text-xs text-[#e8eaed] font-medium tabular-nums">{metrics.pace} <span className="text-[#9aa0a6]">wpm</span></span>
+                  <span className="text-xs text-muted-foreground">Pace</span>
+                  <span className="text-xs text-foreground font-medium tabular-nums">{metrics.pace} <span className="text-muted-foreground">wpm</span></span>
                 </div>
-                <p className="text-[10px] text-[#5f6368] mt-0.5">{metrics.paceLabel} · optimal 120–160 wpm</p>
+                <p className="text-xs text-muted-foreground/70 mt-0.5">{metrics.paceLabel} · optimal 120–160 wpm</p>
               </div>
             )}
           </div>
@@ -807,24 +1457,33 @@ function MeetBottomBar({
   showCaptions: boolean; onToggleCaptions: () => void; showSidePanel: boolean; onToggleSidePanel: () => void
 }) {
   return (
-    <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-[#202124]">
+    <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-background">
       <div className="flex items-center gap-3 min-w-[180px]">
-        <span className="text-sm font-mono tabular-nums text-[#e8eaed]">{formatTimer(timer)}</span>
-        <span className="text-[#5f6368]">|</span>
-        <span className="text-xs text-[#9aa0a6]">{modeLabel}</span>
+        <span className="text-sm font-mono tabular-nums text-foreground">{formatTimer(timer)}</span>
+        <span className="text-muted-foreground/70">|</span>
+        <span className="text-xs text-muted-foreground">{modeLabel}</span>
       </div>
-      <InterviewControls variant="meet" isMicOn={isMicOn} isVideoOn={isVideoOn} onToggleMic={onToggleMic} onToggleVideo={onToggleVideo} onEndCall={onEndCall} />
+      <InterviewControls
+        variant="meet"
+        isMicOn={isMicOn}
+        isVideoOn={isVideoOn}
+        onToggleMic={onToggleMic}
+        onToggleVideo={onToggleVideo}
+        onEndCall={onEndCall}
+        captionsEnabled={showCaptions}
+        onToggleCaptions={onToggleCaptions}
+      />
       <div className="flex items-center gap-1 min-w-[180px] justify-end">
         <button
           onClick={onToggleCaptions}
-          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showCaptions ? "bg-[#8ab4f8] text-[#202124]" : "hover:bg-[#3c4043] text-[#e8eaed]"}`}
+          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showCaptions ? "bg-primary text-primary-foreground" : "hover:bg-border text-foreground"}`}
           title="Captions"
         >
           <Eye className="w-5 h-5" />
         </button>
         <button
           onClick={onToggleSidePanel}
-          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showSidePanel ? "bg-[#8ab4f8] text-[#202124]" : "hover:bg-[#3c4043] text-[#e8eaed]"}`}
+          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showSidePanel ? "bg-primary text-primary-foreground" : "hover:bg-border text-foreground"}`}
           title="AI Assistant"
         >
           <Brain className="w-5 h-5" />
@@ -838,17 +1497,17 @@ function MeetCaptions({ show, lastUserMsg, isCapturing }: { show: boolean; lastU
   if (!show || !lastUserMsg) return null
   return (
     <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-30 w-full max-w-2xl px-4">
-      <div className="bg-[#202124]/95 backdrop-blur-md rounded-lg px-5 py-3 text-center shadow-xl">
-        <p className="text-sm text-[#e8eaed] leading-relaxed">
+      <div className="bg-background/95 backdrop-blur-md rounded-lg px-5 py-3 text-center shadow-xl">
+        <p className="text-sm text-foreground leading-relaxed">
           {lastUserMsg.isPartial ? (
             <>
-              <span className="text-[#9aa0a6]">{lastUserMsg.text.slice(0, Math.floor(lastUserMsg.text.length * 0.4))}</span>
-              <span className="text-white font-medium">{lastUserMsg.text.slice(Math.floor(lastUserMsg.text.length * 0.4))}</span>
+              <span className="text-muted-foreground">{lastUserMsg.text.slice(0, Math.floor(lastUserMsg.text.length * 0.4))}</span>
+              <span className="text-foreground font-medium">{lastUserMsg.text.slice(Math.floor(lastUserMsg.text.length * 0.4))}</span>
             </>
           ) : (
-            <span className="text-[#bdc1c6]">{lastUserMsg.text}</span>
+            <span className="text-muted-foreground">{lastUserMsg.text}</span>
           )}
-          {isCapturing && <span className="inline-block w-[2px] h-[14px] bg-[#8ab4f8] ml-1 align-middle animate-pulse" />}
+          {isCapturing && <span className="inline-block w-[2px] h-[14px] bg-primary ml-1 align-middle animate-pulse" />}
         </p>
       </div>
     </div>
@@ -856,38 +1515,40 @@ function MeetCaptions({ show, lastUserMsg, isCapturing }: { show: boolean; lastU
 }
 
 function MeetAITile({
-  isConnected, aiSpeaking, currentQuestion, currentTopic, localStream,
+  isConnected, aiSpeaking, currentQuestion, currentTopic, localStream, showQuestionText = true, compact = false,
+  interviewerName = "Dr. Aris", interviewerTitle = "AI Lead Interviewer",
 }: {
-  isConnected: boolean; aiSpeaking: boolean; currentQuestion: string; currentTopic: string; localStream: MediaStream | null
+  isConnected: boolean; aiSpeaking: boolean; currentQuestion: string; currentTopic: string; localStream: MediaStream | null; showQuestionText?: boolean; compact?: boolean
+  interviewerName?: string; interviewerTitle?: string
 }) {
   return (
-    <div className="flex-[2] relative rounded-xl overflow-hidden bg-[#1a1a1c]">
+    <div className="relative h-full w-full overflow-hidden rounded-lg bg-secondary">
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <div className={`w-24 h-24 rounded-full bg-gradient-to-br from-[#669df6] to-[#1a73e8] flex items-center justify-center text-3xl font-medium text-white shadow-xl transition-all duration-300 ${aiSpeaking ? "ring-[3px] ring-[#669df6]/60 scale-105" : ""}`}>
-          A
+        <div className={`${compact ? "h-12 w-12 text-lg" : "h-24 w-24 text-3xl"} rounded-full bg-primary flex items-center justify-center font-medium text-primary-foreground shadow-sm transition-colors`}>
+          {interviewerName ? interviewerName.charAt(0) : "A"}
         </div>
-        <p className="mt-3 text-[#e8eaed] text-base font-medium">Dr. Aris</p>
-        <p className="text-[#9aa0a6] text-xs">AI Lead Interviewer</p>
-        {aiSpeaking && (
+        <p className={`${compact ? "mt-2 text-xs" : "mt-3 text-base"} text-foreground font-medium`}>{interviewerName}</p>
+        {!compact && <p className="text-muted-foreground text-xs">{interviewerTitle}</p>}
+        {aiSpeaking && !compact && (
           <div className="mt-4 w-48 opacity-40">
-            <WaveformVisualizer stream={localStream} isActive variant="indigo" size="sm" />
+            <WaveformVisualizer stream={localStream} isActive variant="primary" size="sm" />
           </div>
         )}
       </div>
-      <div className="absolute top-3 left-3 z-10">
-        <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium ${isConnected ? "bg-[#137333]/80 text-[#81c995]" : "bg-[#3c4043] text-[#9aa0a6]"}`}>
-          <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? "bg-[#81c995] animate-pulse" : "bg-[#9aa0a6]"}`} />
+      {!compact && <div className="absolute top-3 left-3 z-10">
+        <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${isConnected ? "bg-primary/15 text-primary" : "bg-border text-muted-foreground"}`}>
+          <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? "bg-primary animate-pulse" : "bg-muted-foreground"}`} />
           {isConnected ? "Connected" : "Connecting..."}
         </div>
-      </div>
+      </div>}
       <div className="absolute bottom-3 left-3 z-10">
-        <span className="text-[#e8eaed] text-sm font-medium bg-[#202124]/70 backdrop-blur-sm px-2.5 py-1 rounded">Dr. Aris</span>
+        <span className="text-foreground text-xs font-medium bg-background/70 backdrop-blur-sm px-2.5 py-1 rounded">{interviewerName}</span>
       </div>
-      {currentQuestion && (
+      {showQuestionText && currentQuestion && !compact && (
         <div className="absolute bottom-14 left-0 right-0 text-center px-6 z-10">
-          <div className="inline-block bg-[#202124]/85 backdrop-blur-md rounded-lg px-5 py-3 max-w-xl">
-            <p className="text-[10px] uppercase tracking-[0.2em] text-[#9aa0a6] mb-1">{currentTopic || "Question"}</p>
-            <p className="text-[#e8eaed] text-sm leading-relaxed font-medium">{currentQuestion}</p>
+          <div className="inline-block bg-background/85 backdrop-blur-md rounded-lg px-5 py-3 max-w-xl">
+            <p className="text-xs text-muted-foreground mb-1">{currentTopic || "Question"}</p>
+            <p className="text-foreground text-sm leading-relaxed font-medium">{currentQuestion}</p>
           </div>
         </div>
       )}
@@ -895,146 +1556,72 @@ function MeetAITile({
   )
 }
 
-function MeetSelfTile({ videoRef, isVideoOn, isMicOn }: { videoRef: React.RefObject<HTMLVideoElement | null>; isVideoOn: boolean; isMicOn: boolean }) {
+function MeetSelfTile({
+  stream,
+  videoRef,
+  isVideoOn,
+  isMicOn,
+  compact = false,
+}: {
+  stream: MediaStream | null
+  videoRef: React.RefObject<HTMLVideoElement | null>
+  isVideoOn: boolean
+  isMicOn: boolean
+  compact?: boolean
+}) {
+  useEffect(() => {
+    if (videoRef.current && stream && videoRef.current.srcObject !== stream) {
+      videoRef.current.srcObject = stream
+      void videoRef.current.play().catch(() => {})
+    }
+  }, [stream, videoRef, isVideoOn])
+
   return (
-    <div className="flex-1 max-w-[320px] relative rounded-xl overflow-hidden bg-[#1a1a1c]">
+    <div className="relative h-full w-full overflow-hidden rounded-lg bg-secondary">
       {isVideoOn ? (
         <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover scale-x-[-1]" />
       ) : (
         <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <div className="w-24 h-24 rounded-full bg-[#5f6368] flex items-center justify-center text-3xl font-medium text-white">Y</div>
+          <div className={`${compact ? "h-12 w-12 text-lg" : "h-24 w-24 text-3xl"} rounded-full bg-muted-foreground flex items-center justify-center font-medium text-primary-foreground`}>Y</div>
         </div>
       )}
       <div className="absolute bottom-3 left-3 z-10">
-        <span className="text-[#e8eaed] text-sm font-medium bg-[#202124]/70 backdrop-blur-sm px-2.5 py-1 rounded">You</span>
+        <span className="text-foreground text-xs font-medium bg-background/70 backdrop-blur-sm px-2.5 py-1 rounded">You</span>
       </div>
       {!isMicOn && (
         <div className="absolute bottom-3 right-3 z-10">
-          <div className="w-7 h-7 rounded-full bg-[#ea4335] flex items-center justify-center"><MicOff className="w-3.5 h-3.5 text-white" /></div>
+          <div className="w-7 h-7 rounded-full bg-destructive flex items-center justify-center"><MicOff className="w-3.5 h-3.5 text-primary-foreground" /></div>
         </div>
       )}
     </div>
   )
 }
 
-function PracticeAILayout(props: LayoutProps) {
-  const [showSidePanel, setShowSidePanel] = useState(false)
-  const [showCaptions, setShowCaptions] = useState(false)
-  const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
-  const eyeContactLabel = props.streamingMetrics.cameraContact.value >= 70 ? "Consistent" : props.streamingMetrics.cameraContact.value >= 40 ? "Moderate" : "Low"
-  const confidenceValue = props.streamingMetrics.engagement.value
-  const emotionLabel = confidenceValue >= 70 ? "Focused" : confidenceValue >= 40 ? "Neutral" : "Nervous"
-
-  const sideMetrics = {
-    eyeContact: eyeContactLabel, confidence: confidenceValue, emotion: emotionLabel,
-    cameraValue: props.streamingMetrics.cameraContact.value, engagementValue: confidenceValue,
-    pace: props.streamingMetrics.pace.wpm, paceLabel: props.streamingMetrics.pace.label,
-  }
-
-  return (
-    <div className="h-screen flex flex-col bg-[#202124] text-white overflow-hidden relative">
-      {(props.interviewState === "connecting" || props.interviewState === "ready") && <MeetConnectingOverlay state={props.interviewState} />}
-      <div className="flex-1 flex min-h-0">
-        <div className="flex-1 p-2 flex gap-2">
-          <MeetAITile isConnected={props.isConnected} aiSpeaking={props.aiSpeaking} currentQuestion={props.currentQuestion} currentTopic={props.currentTopic} localStream={props.localStream} />
-          <MeetSelfTile videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} />
-        </div>
-        <MeetSidePanel show={showSidePanel} onClose={() => setShowSidePanel(false)} hints={props.hints} dynamicTip={props.streamingMetrics.dynamicTip} metrics={sideMetrics} />
-      </div>
-      <MeetCaptions show={showCaptions} lastUserMsg={lastUserMsg} isCapturing={props.isCapturing} />
-      <MeetBottomBar
-        timer={props.sessionTimer} formatTimer={props.formatTimer} modeLabel="Practice"
-        isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall}
-        showCaptions={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)}
-        showSidePanel={showSidePanel} onToggleSidePanel={() => setShowSidePanel(!showSidePanel)}
-      />
-      <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
-    </div>
-  )
-}
-function PracticeVoiceLayout(props: LayoutProps) {
-  const [showSidePanel, setShowSidePanel] = useState(false)
-  const [showCaptions, setShowCaptions] = useState(false)
-  const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
-  const eyeContactLabel = props.streamingMetrics.cameraContact.value >= 70 ? "Consistent" : props.streamingMetrics.cameraContact.value >= 40 ? "Moderate" : "Low"
-  const confidenceValue = props.streamingMetrics.engagement.value
-  const emotionLabel = confidenceValue >= 70 ? "Focused" : confidenceValue >= 40 ? "Neutral" : "Nervous"
-  const sideMetrics = {
-    eyeContact: eyeContactLabel, confidence: confidenceValue, emotion: emotionLabel,
-    cameraValue: props.streamingMetrics.cameraContact.value, engagementValue: confidenceValue,
-    pace: props.streamingMetrics.pace.wpm, paceLabel: props.streamingMetrics.pace.label,
-  }
-
-  return (
-    <div className="h-screen flex flex-col bg-[#202124] text-white overflow-hidden relative">
-      {(props.interviewState === "connecting" || props.interviewState === "ready") && <MeetConnectingOverlay state={props.interviewState} />}
-      <div className="flex-1 flex min-h-0">
-        <div className="flex-1 p-2 flex gap-2">
-          
-          <div className="flex-[2] relative rounded-xl overflow-hidden bg-[#1a1a1c]">
-            <div className="absolute inset-0 flex flex-col items-center justify-center">
-              <div className={`w-24 h-24 rounded-full bg-gradient-to-br from-[#669df6] to-[#1a73e8] flex items-center justify-center text-3xl font-medium text-white shadow-xl transition-all duration-300 ${props.aiSpeaking ? "ring-[3px] ring-[#669df6]/60 scale-105" : ""}`}>A</div>
-              <p className="mt-3 text-[#e8eaed] text-base font-medium">Dr. Aris</p>
-              <p className="text-[#9aa0a6] text-xs">AI Lead Interviewer</p>
-              <div className="mt-5 w-56 opacity-40">
-                <WaveformVisualizer stream={props.localStream} isActive={props.isCapturing || props.aiSpeaking} variant="indigo" size="sm" />
-              </div>
-            </div>
-            <div className="absolute bottom-3 left-3 z-10">
-              <span className="text-[#e8eaed] text-sm font-medium bg-[#202124]/70 backdrop-blur-sm px-2.5 py-1 rounded">Dr. Aris</span>
-            </div>
-            {props.currentQuestion && (
-              <div className="absolute bottom-14 left-0 right-0 text-center px-6 z-10">
-                <div className="inline-block bg-[#202124]/85 backdrop-blur-md rounded-lg px-5 py-3 max-w-xl">
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-[#9aa0a6] mb-1">{props.currentTopic || "Question"}</p>
-                  <p className="text-[#e8eaed] text-sm leading-relaxed font-medium">{props.currentQuestion}</p>
-                </div>
-              </div>
-            )}
-          </div>
-          <MeetSelfTile videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} />
-        </div>
-        <MeetSidePanel show={showSidePanel} onClose={() => setShowSidePanel(false)} hints={props.hints} dynamicTip={props.streamingMetrics.dynamicTip} metrics={sideMetrics} />
-      </div>
-      <MeetCaptions show={showCaptions} lastUserMsg={lastUserMsg} isCapturing={props.isCapturing} />
-      <MeetBottomBar
-        timer={props.sessionTimer} formatTimer={props.formatTimer} modeLabel="Practice · Voice"
-        isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall}
-        showCaptions={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)}
-        showSidePanel={showSidePanel} onToggleSidePanel={() => setShowSidePanel(!showSidePanel)}
-      />
-      <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
-    </div>
-  )
-}
 function MockAILayout(props: LayoutProps) {
+  const [showCaptions, setShowCaptions] = useState(false)
+  const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
   return (
-    <div className="h-screen flex flex-col bg-[#202124] text-white overflow-hidden relative">
+    <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden relative">
       {(props.interviewState === "connecting") && <MeetConnectingOverlay state={props.interviewState} />}
-      {props.interviewState === "ready" && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#202124]">
-          <div className="w-24 h-24 rounded-full bg-gradient-to-br from-[#669df6] to-[#1a73e8] flex items-center justify-center text-3xl font-medium text-white shadow-xl mb-6">A</div>
-          <p className="text-[#e8eaed] text-lg font-medium mb-2">Ready to begin</p>
-          <p className="text-[#9aa0a6] text-sm mb-8">Make sure your microphone and camera are ready</p>
-          <button onClick={props.initPipeline} className="px-8 py-3 rounded-full bg-[#1a73e8] hover:bg-[#1765cc] text-white font-medium text-base transition-all shadow-xl">
-            Begin Interview
-          </button>
+      {(props.interviewState === "ready" || props.interviewState === "recovering") && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background">
+          <div className="w-24 h-24 rounded-full bg-primary flex items-center justify-center text-3xl font-medium text-primary-foreground shadow-sm mb-6">A</div>
+          <p className="text-foreground text-lg font-medium mb-2">{props.interviewState === "recovering" ? "Restoring your session…" : "Starting interview…"}</p>
+          <p className="text-muted-foreground text-sm">Your continuous attempt will begin automatically.</p>
         </div>
       )}
-      <div className="flex-1 flex min-h-0">
-        <div className="flex-1 p-2 flex gap-2">
-          <MeetAITile isConnected={props.isConnected} aiSpeaking={props.aiSpeaking} currentQuestion={props.currentQuestion} currentTopic={props.currentTopic} localStream={props.localStream} />
-          <MeetSelfTile videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} />
-        </div>
+      <div className="flex-1 min-h-0 p-3">
+        <CleanInterviewStage props={props} />
       </div>
-      <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-[#202124]">
+      <MeetCaptions show={showCaptions} lastUserMsg={lastUserMsg} isCapturing={props.isCapturing} />
+      <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-background">
         <div className="flex items-center gap-3 min-w-[180px]">
-          <Clock className="w-3.5 h-3.5 text-[#9aa0a6]" />
-          <span className="text-sm font-mono tabular-nums text-[#e8eaed]">{props.formatTimer(props.sessionTimer)}</span>
-          <span className="text-[#5f6368]">|</span>
-          <span className="text-xs text-[#9aa0a6]">Mock Interview</span>
+          <Clock className="w-3.5 h-3.5 text-muted-foreground" />
+          <span className="text-sm font-mono tabular-nums text-foreground">{props.formatTimer(props.sessionTimer)}</span>
+          <span className="text-muted-foreground/70">|</span>
+          <span className="text-xs text-muted-foreground">Mock Interview</span>
         </div>
-        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} endLabel="End Interview" />
+        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} captionsEnabled={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)} endLabel="End Interview" cameraLocked />
         <div className="min-w-[180px]" />
       </div>
       <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
@@ -1042,38 +1629,143 @@ function MockAILayout(props: LayoutProps) {
   )
 }
 function MockVoiceLayout(props: LayoutProps) {
+  const [showCaptions, setShowCaptions] = useState(false)
+  const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
   return (
-    <div className="h-screen flex flex-col bg-[#202124] text-white overflow-hidden relative">
+    <div className="relative flex h-screen flex-col overflow-hidden bg-secondary/20 text-foreground">
       {(props.interviewState === "connecting") && <MeetConnectingOverlay state={props.interviewState} />}
-      <div className="flex-1 flex min-h-0">
-        <div className="flex-1 p-2 flex gap-2">
-          <div className="flex-[2] relative rounded-xl overflow-hidden bg-[#1a1a1c]">
-            <div className="absolute inset-0 flex flex-col items-center justify-center">
-              <div className={`w-24 h-24 rounded-full bg-gradient-to-br from-[#669df6] to-[#1a73e8] flex items-center justify-center text-3xl font-medium text-white shadow-xl transition-all duration-300 ${props.aiSpeaking ? "ring-[3px] ring-[#669df6]/60 scale-105" : ""}`}>A</div>
-              <p className="mt-3 text-[#e8eaed] text-base font-medium">Dr. Aris</p>
-              <p className="text-[#9aa0a6] text-xs">Lead Technical Recruiter</p>
-              <div className="mt-5 w-56 opacity-40">
-                <WaveformVisualizer stream={props.localStream} isActive={props.aiSpeaking || props.isCapturing} variant="indigo" size="sm" />
-              </div>
-            </div>
-            <div className="absolute bottom-3 left-3 z-10">
-              <span className="text-[#e8eaed] text-sm font-medium bg-[#202124]/70 backdrop-blur-sm px-2.5 py-1 rounded">Dr. Aris</span>
-            </div>
+      {(props.interviewState === "ready" || props.interviewState === "recovering") && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background">
+          <div className="w-24 h-24 rounded-full bg-primary flex items-center justify-center text-3xl font-medium text-primary-foreground shadow-sm mb-6">
+            {props.interviewerName ? props.interviewerName.charAt(0) : "A"}
           </div>
-          <MeetSelfTile videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} />
+          <p className="text-foreground text-lg font-medium">{props.interviewState === "recovering" ? "Restoring…" : "Starting…"}</p>
         </div>
+      )}
+      <div className="min-h-0 flex-1 p-3 sm:p-4">
+        <CleanInterviewStage props={props} />
       </div>
-      <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-[#202124]">
-        <div className="flex items-center gap-3 min-w-[180px]">
-          <Clock className="w-3.5 h-3.5 text-[#9aa0a6]" />
-          <span className="text-sm font-mono tabular-nums text-[#e8eaed]">{props.formatTimer(props.sessionTimer)}</span>
-          <span className="text-[#5f6368]">|</span>
-          <span className="text-xs text-[#9aa0a6]">Mock · Voice</span>
+      <MeetCaptions show={showCaptions} lastUserMsg={lastUserMsg} isCapturing={props.isCapturing} />
+      <div className="z-30 grid min-h-20 shrink-0 grid-cols-[1fr_auto_1fr] items-center gap-3 border-t border-border bg-background px-4 sm:px-6">
+        <div className="flex min-w-0 items-center gap-2">
+          <Clock className="w-3.5 h-3.5 text-muted-foreground" />
+          <span className="text-sm font-mono tabular-nums text-foreground">{props.formatTimer(props.sessionTimer)}</span>
+          <span className="hidden text-xs text-muted-foreground sm:inline">Interview in progress</span>
         </div>
-        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} endLabel="End Session" />
-        <div className="min-w-[180px]" />
+        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} captionsEnabled={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)} endLabel="Leave interview" cameraLocked />
+        <div className="hidden justify-self-end text-xs text-muted-foreground sm:block">Camera remains on</div>
       </div>
       <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
+    </div>
+  )
+}
+
+function CleanInterviewStage({ props }: { props: LayoutProps }) {
+  const status = props.isProcessing
+    ? "Preparing the next question"
+    : props.isCapturing
+      ? "Listening"
+      : props.aiSpeaking
+        ? "Interviewer speaking"
+        : "Ready for your answer"
+  return (
+    <div className="grid h-full min-h-[420px] gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+      <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+        <header className="flex items-center justify-between border-b border-border px-5 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
+              {props.interviewerName?.charAt(0) || "A"}
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-foreground">{props.interviewerName || "AI Interviewer"}</p>
+              <p className="text-xs text-muted-foreground">{props.interviewerTitle || "Interviewer"}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 rounded-full bg-secondary px-3 py-1.5 text-xs font-medium text-muted-foreground">
+            <span className={`h-2 w-2 rounded-full ${props.isConnected ? "bg-emerald-500" : "bg-amber-500"}`} />
+            {props.isConnected ? "Live" : "Connecting"}
+          </div>
+        </header>
+        {props.jobContext && (
+          <details className="border-b border-border px-5 py-2 text-xs text-muted-foreground">
+            <summary className="cursor-pointer font-medium text-foreground">
+              {props.jobContext.job_title || props.jobContext.role || "Role context"} · {props.jobContext.profile_label || "Interview"}
+            </summary>
+            {props.jobContext.jd_summary && <p className="mt-2 max-w-4xl leading-5">{props.jobContext.jd_summary}</p>}
+            {!!props.jobContext.key_skills?.length && <p className="mt-1">Focus: {props.jobContext.key_skills.join(" · ")}</p>}
+          </details>
+        )}
+        <div className="flex flex-1 flex-col items-center justify-center px-6 py-10 text-center sm:px-12">
+          {props.currentTopic && <p className="text-xs font-medium text-muted-foreground">{props.currentTopic}</p>}
+          <h1 className="mt-3 max-w-3xl text-balance text-2xl font-semibold leading-relaxed text-foreground sm:text-3xl">
+            {props.currentQuestion || "Your interview will begin in a moment."}
+          </h1>
+          <div className="mt-8 flex items-center gap-2 rounded-full border border-border bg-background px-4 py-2 text-sm text-muted-foreground">
+            <span className={`h-2 w-2 rounded-full ${props.isCapturing || props.aiSpeaking ? "animate-pulse bg-primary" : "bg-muted-foreground/50"}`} />
+            {status}
+          </div>
+        </div>
+      </section>
+      <aside className="flex min-h-0 flex-col gap-3">
+        <div className="h-40 overflow-hidden rounded-xl border border-border bg-card shadow-sm lg:h-44">
+          <MeetSelfTile stream={props.localStream} videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} compact />
+        </div>
+        <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+          <div className="space-y-2 text-sm text-foreground">
+            <p className="flex items-center justify-between"><span className="text-muted-foreground">Camera</span><span className="text-emerald-600 dark:text-emerald-300">On</span></p>
+            <p className="flex items-center justify-between"><span className="text-muted-foreground">Microphone</span><span>{props.isMicOn ? "On" : "Muted"}</span></p>
+          </div>
+        </div>
+      </aside>
+    </div>
+  )
+}
+
+function MockVideoStage({
+  props,
+  featuredTile,
+  onSwap,
+}: {
+  props: LayoutProps
+  featuredTile: "ai" | "user"
+  onSwap: () => void
+}) {
+  const aiTile = (
+    <MeetAITile
+      isConnected={props.isConnected}
+      aiSpeaking={props.aiSpeaking}
+      currentQuestion={props.currentQuestion}
+      currentTopic={props.currentTopic}
+      localStream={props.localStream}
+      showQuestionText={props.showQuestionText}
+      compact={featuredTile !== "ai"}
+      interviewerName={props.interviewerName}
+      interviewerTitle={props.interviewerTitle}
+    />
+  )
+  const userTile = (
+    <MeetSelfTile
+      stream={props.localStream}
+      videoRef={props.videoRef}
+      isVideoOn={props.isVideoOn}
+      isMicOn={props.isMicOn}
+      compact={featuredTile !== "user"}
+    />
+  )
+
+  return (
+    <div className="relative h-full min-h-[360px] w-full overflow-hidden rounded-lg bg-background">
+      <div className="h-full w-full overflow-hidden rounded-lg border border-border bg-secondary">
+        {featuredTile === "ai" ? aiTile : userTile}
+      </div>
+      <button
+        type="button"
+        onClick={onSwap}
+        className="absolute right-5 top-5 z-20 h-[28%] min-h-[128px] w-[28%] min-w-[180px] max-w-[340px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl transition-transform hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-primary"
+        title={featuredTile === "ai" ? "Show yourself large" : "Show AI large"}
+      >
+        {featuredTile === "ai" ? userTile : aiTile}
+      </button>
     </div>
   )
 }
@@ -1084,21 +1776,21 @@ function MobileLayout(props: LayoutProps) {
       <header className="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-[var(--iv-surface)]">
         <div className="flex items-center gap-4">
           <ArrowLeft className="h-5 w-5 text-[var(--iv-primary)] cursor-pointer" onClick={props.onEndCall} />
-          <h1 className="font-serif italic text-xl tracking-tight text-[var(--iv-primary)]">Interview Room</h1>
+          <h1 className="text-xl font-semibold text-[var(--iv-primary)]">Interview Room</h1>
         </div>
         <div className="flex items-center gap-2">
           <div className="bg-[var(--iv-surface-container-high)] px-3 py-1.5 rounded-full flex items-center gap-2 border border-[var(--iv-outline-variant)]/10">
             <span className={`w-2 h-2 rounded-full ${props.isCapturing ? "bg-emerald-400 animate-pulse" : "bg-[var(--iv-secondary)]"}`} />
-            <span className="text-[10px] uppercase tracking-widest font-bold text-[var(--iv-primary)]">
+            <span className="text-xs font-medium text-[var(--iv-primary)]">
               {props.isCapturing ? "Capturing" : "Live"}
             </span>
           </div>
         </div>
       </header>
       <main className="relative pt-16 h-screen flex flex-col justify-between overflow-hidden">
-        <SelfView variant="mobile" videoRef={props.videoRef} isVideoOn={props.isVideoOn} />
+        <SelfView variant="mobile" videoRef={props.videoRef} isVideoOn={props.isVideoOn} stream={props.localStream} />
         <div className="flex-1 flex flex-col justify-center px-8 text-center max-w-lg mx-auto">
-          <span className="text-[10px] uppercase tracking-[0.3em] text-[var(--iv-outline)] mb-6 font-bold">
+          <span className="text-xs text-[var(--iv-outline)] mb-6 font-medium">
             {props.currentTopic || "Current Prompt"}
           </span>
           <h2 className="font-serif text-3xl italic text-[var(--iv-on-surface)] leading-snug">
@@ -1110,7 +1802,7 @@ function MobileLayout(props: LayoutProps) {
             <WaveformVisualizer
               stream={props.localStream}
               isActive={props.isCapturing}
-              variant="emerald"
+              variant="primary"
               size="sm"
             />
           </div>
@@ -1119,7 +1811,7 @@ function MobileLayout(props: LayoutProps) {
           {props.messages.length > 0 && (
             <div className="bg-[var(--iv-surface-container-low)] rounded-2xl p-5 border border-[var(--iv-outline-variant)]/10 min-h-[80px]">
               <div className="flex justify-between items-center mb-3">
-                <span className="text-[10px] uppercase tracking-widest text-[var(--iv-outline)] font-bold">Transcription</span>
+                <span className="text-xs text-[var(--iv-outline)] font-medium">Transcription</span>
               </div>
               <p className="text-sm text-[var(--iv-on-surface-variant)] leading-relaxed">
                 {props.messages[props.messages.length - 1]?.text}
@@ -1135,16 +1827,16 @@ function MobileLayout(props: LayoutProps) {
                 <Eye className="h-3.5 w-3.5 text-[var(--iv-tertiary)]" />
               </div>
               <div>
-                <p className="text-[10px] text-[var(--iv-outline)] uppercase font-bold">Eye Contact</p>
+                <p className="text-xs text-[var(--iv-outline)] font-medium">Eye Contact</p>
                 <p className="text-xs text-[var(--iv-on-surface)]">{props.streamingMetrics.cameraContact.label}</p>
               </div>
             </div>
             <div className="bg-[var(--iv-surface-container)] p-3 rounded-xl flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-[var(--iv-surface-container-highest)] flex items-center justify-center">
-                <span className="text-[var(--iv-secondary)] text-sm">⚡</span>
+                <Clock className="h-3.5 w-3.5 text-[var(--iv-secondary)]" />
               </div>
               <div>
-                <p className="text-[10px] text-[var(--iv-outline)] uppercase font-bold">Pace</p>
+                <p className="text-xs text-[var(--iv-outline)] font-medium">Pace</p>
                 <p className="text-xs text-[var(--iv-on-surface)]">{props.streamingMetrics.pace.label}</p>
               </div>
             </div>

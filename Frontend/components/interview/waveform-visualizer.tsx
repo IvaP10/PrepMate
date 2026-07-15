@@ -3,11 +3,11 @@ import { useRef, useEffect } from "react"
 interface WaveformVisualizerProps {
   stream?: MediaStream | null
   isActive?: boolean
-  variant?: "indigo" | "emerald" | "amber"
+  variant?: "primary" | "emerald" | "amber"
   size?: "sm" | "md" | "lg"
 }
 const COLORS = {
-  indigo: { primary: "#6366f1", secondary: "#a855f7" },
+  primary: { primary: "#2F6F68", secondary: "#86BDB5" },
   emerald: { primary: "#10b981", secondary: "#34d399" },
   amber: { primary: "#f59e0b", secondary: "#fbbf24" },
 }
@@ -15,7 +15,7 @@ const SIZES = { sm: 40, md: 60, lg: 80 }
 export function WaveformVisualizer({
   stream,
   isActive = false,
-  variant = "indigo",
+  variant = "primary",
   size = "md",
 }: WaveformVisualizerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)

@@ -1,3 +1,17 @@
+# ============================================================================
+# MODULE: pricing.py
+# PURPOSE: Credit pricing constants + per-order total/discount/fee calculator.
+# STRUCTURE:
+#   - PricingConfig dataclass with credit price, fees, free-credit count (lines 13-22)
+#   - get_discount_percent / calculate_total methods (lines 24-57)
+#   - PRICING singleton (line 61)
+# ENDPOINTS: none (consumed by /api/payment/pricing in payment.py)
+# DEPENDS ON: (stdlib only)
+# CONSUMED BY: payment.py, workspace_api.py
+# DATA TABLES: none today (Phase 3 moves the constants into `pricing_plans` /
+#              `pricing_discounts` tables; calculate_total signature stays stable)
+# ============================================================================
+
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict

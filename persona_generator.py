@@ -1,3 +1,18 @@
+# ============================================================================
+# MODULE: persona_generator.py
+# PURPOSE: Deterministically pick a synthetic interviewer persona (name,
+#          company type, voice style) from a user-id hash + strictness, plus
+#          generate the opening statement text.
+# STRUCTURE:
+#   - INTERVIEWER_NAMES / COMPANY_TYPES static lists (lines 14-44+)
+#   - generate_persona(user_id, strictness, interview_type) (later in file)
+#   - generate_opening_statement(persona, role) (later in file)
+# ENDPOINTS: none
+# DEPENDS ON: strictness_config (stdlib hashlib only otherwise)
+# CONSUMED BY: interview.py
+# DATA TABLES: none
+# ============================================================================
+
 import hashlib
 from typing import Dict, List, Optional
 from strictness_config import get_strictness_config
@@ -18,6 +33,25 @@ INTERVIEWER_NAMES = {
     "extreme": [
         "Dr. Victoria Cromwell", "Maximilian Frost", "Dr. Helena Ashford",
         "Sebastian Thorne", "Dr. Evelyn Blackstone"
+    ]
+}
+
+INTERVIEWER_NAMES_INDIAN = {
+    "easy": [
+        "Priya Patel", "Amit Sharma", "Neha Gupta",
+        "Rohan Mehta", "Ananya Rao"
+    ],
+    "medium": [
+        "Siddharth Singh", "Deepika Iyer", "Vikram Malhotra",
+        "Pooja Joshi", "Aditya Verma"
+    ],
+    "hard": [
+        "Dr. Rajesh Kurup", "Dr. Shalini Mukherji", "Dr. Arvind Subramanian",
+        "Dr. Meera Nair", "Dr. Sandeep Nair"
+    ],
+    "extreme": [
+        "Dr. Vikram Sarabhai", "Dr. Arundhati Roy", "Dr. Homi Bhabha",
+        "Dr. CV Raman", "Dr. APJ Kalam"
     ]
 }
 
@@ -64,7 +98,10 @@ ROLE_TITLES = {
 def generate_persona(strictness_level: str, job_title: str, company_name: Optional[str] = None) -> Dict:
     config = get_strictness_config(strictness_level)
     seed = (strictness_level, job_title, company_name or "")
-    interviewer_name = _pick(INTERVIEWER_NAMES.get(strictness_level, INTERVIEWER_NAMES["medium"]), "name", *seed)
+    from config import settings
+    voice = getattr(settings, "KOKORO_VOICE", "af_heart")
+    names_source = INTERVIEWER_NAMES_INDIAN
+    interviewer_name = _pick(names_source.get(strictness_level, names_source["medium"]), "name", *seed)
     role_title = _pick(ROLE_TITLES.get(strictness_level, ROLE_TITLES["medium"]), "role", *seed)
     company = company_name or _pick(COMPANY_TYPES, "company", *seed)
     return {

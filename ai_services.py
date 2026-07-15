@@ -1,35 +1,49 @@
+# ============================================================================
+# MODULE: ai_services.py
+# PURPOSE: OpenAI STT + Kokoro TTS + LLM-backed response evaluation +
+#          coaching-hint generation. Rate-limited and circuit-broken.
+# STRUCTURE:
+#   - OpenAI client lazy init
+#   - Process-local rate limiters (lines 49-53)
+#   - CircuitBreaker (lines 55+)
+#   - transcribe_audio / generate_speech / evaluate_response_realtime /
+#     generate_coaching_hint (later in file)
+# ENDPOINTS: none (consumed via WS handler in interview.py)
+# DEPENDS ON: config, rate_limiter, llm_router, prompt_security, security_utils
+# CONSUMED BY: interview.py, technical_mode.py
+# DATA TABLES: none (telemetry flows through observability.log_ai_event)
+# ============================================================================
+
 import os
 import logging
 import base64
 import binascii
 import tempfile
 import uuid as _uuid
+import asyncio
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import settings
 from rate_limiter import RateLimiter
-from llm_router import complete_json_sync, complete_text_sync, chunk_text
+from llm_router import complete_json_async, complete_text_async, chunk_text
 from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
 from security_utils import redact_text
 
 logger = logging.getLogger("ai_services")
 
-_groq_client = None
+_openai_client = None
 
 
-def _get_groq_client():
-    global _groq_client
-    if _groq_client is None:
-        if not settings.GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is not configured")
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None:
+        if not settings.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not configured")
         from openai import OpenAI
 
-        _groq_client = OpenAI(
-            api_key=settings.GROQ_API_KEY,
-            base_url="https://api.groq.com/openai/v1",
-        )
-    return _groq_client
+        _openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    return _openai_client
 
 transcription_limiter = RateLimiter(max_calls=settings.RATE_LIMIT_CALLS, time_window=settings.RATE_LIMIT_WINDOW)
 evaluation_limiter = RateLimiter(max_calls=settings.RATE_LIMIT_CALLS, time_window=settings.RATE_LIMIT_WINDOW)
@@ -47,7 +61,7 @@ class CircuitBreaker:
         self.is_open = False
     def record_failure(self):
         self.failures += 1
-        self.last_failure_time = datetime.utcnow()
+        self.last_failure_time = datetime.now(timezone.utc)
         if self.failures >= self.failure_threshold:
             self.is_open = True
             logger.error("Circuit breaker opened after %d failures", self.failures)
@@ -55,7 +69,7 @@ class CircuitBreaker:
         if not self.is_open:
             return True
         if self.last_failure_time:
-            elapsed = (datetime.utcnow() - self.last_failure_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - self.last_failure_time).total_seconds()
             if elapsed > self.recovery_timeout:
                 logger.info("Circuit breaker attempting recovery")
                 self.is_open = False
@@ -64,6 +78,8 @@ class CircuitBreaker:
         return False
 
 openai_circuit_breaker = CircuitBreaker()
+transcription_circuit_breaker = CircuitBreaker()
+speech_circuit_breaker = CircuitBreaker()
 
 LOW_QUALITY_FLAGS = {"off_topic", "too_short", "vague", "no_evidence"}
 MAX_AUDIO_BYTES = 2 * 1024 * 1024
@@ -140,9 +156,9 @@ def _normalize_evidence_quotes(quotes, response: str) -> List[str]:
             normalized.append(text)
     return normalized
 
-async def transcribe_audio(audio_base64: str) -> str:
+async def transcribe_audio(audio_base64: str, mime_type: Optional[str] = None) -> str:
     await transcription_limiter.acquire()
-    if not openai_circuit_breaker.can_attempt():
+    if not transcription_circuit_breaker.can_attempt():
         logger.error("Circuit breaker open - transcription unavailable")
         return ""
     tmp_path = None
@@ -151,30 +167,50 @@ async def transcribe_audio(audio_base64: str) -> str:
         if len(audio_bytes) > MAX_AUDIO_BYTES:
             raise ValueError("Audio payload exceeded size limit")
 
-        tmp_path = os.path.join(tempfile.gettempdir(), f"audio_{_uuid.uuid4().hex}.webm")
+        normalized_mime = str(mime_type or "audio/webm").split(";", 1)[0].strip().lower()
+        suffix = {
+            "audio/webm": ".webm",
+            "audio/ogg": ".ogg",
+            "audio/mp4": ".m4a",
+            "audio/mpeg": ".mp3",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+        }.get(normalized_mime, ".webm")
+        if len(audio_bytes) < 512:
+            raise ValueError("Audio payload was too small to contain clear speech")
+
+        tmp_path = os.path.join(tempfile.gettempdir(), f"audio_{_uuid.uuid4().hex}{suffix}")
         with open(tmp_path, "wb") as f:
             f.write(audio_bytes)
 
-        with open(tmp_path, "rb") as audio_file:
-            transcription = _get_groq_client().audio.transcriptions.create(
-                model=settings.GROQ_WHISPER_MODEL,
-                file=audio_file,
-                language="en"
-            )
+        def _transcribe_file():
+            with open(tmp_path, "rb") as audio_file:
+                return _get_openai_client().audio.transcriptions.create(
+                    model=settings.OPENAI_TRANSCRIBE_MODEL,
+                    file=audio_file,
+                    language="en"
+                )
 
-        transcribed_text = transcription.text
-        logger.info("Groq Whisper transcription succeeded")
-        openai_circuit_breaker.record_success()
+        # The OpenAI client is synchronous. Keep it off the WebSocket event
+        # loop so audio processing cannot freeze timers, TTS, or heartbeats.
+        transcription = await asyncio.to_thread(_transcribe_file)
+
+        transcribed_text = str(transcription.text or "").strip()
+        logger.info(
+            "OpenAI transcription succeeded bytes=%d mime=%s",
+            len(audio_bytes),
+            normalized_mime,
+        )
+        transcription_circuit_breaker.record_success()
         return transcribed_text
 
     except (binascii.Error, ValueError) as e:
         logger.warning("Invalid audio payload: %s", redact_text(e))
-        openai_circuit_breaker.record_failure()
         return ""
 
     except Exception as e:
         logger.error("Audio transcription failed: %s", redact_text(e))
-        openai_circuit_breaker.record_failure()
+        transcription_circuit_breaker.record_failure()
         return ""
 
     finally:
@@ -183,22 +219,30 @@ async def transcribe_audio(audio_base64: str) -> str:
 
 async def generate_speech(text: str) -> str:
     await speech_limiter.acquire()
-    if not openai_circuit_breaker.can_attempt():
+    if not speech_circuit_breaker.can_attempt():
         logger.error("Circuit breaker open - speech generation unavailable")
         return ""
     try:
         from streaming_tts import synthesize_text_to_base64
 
-        audio_base64 = await synthesize_text_to_base64(text[:4096])
+        audio_base64 = await asyncio.wait_for(
+            synthesize_text_to_base64(text[:4096]),
+            timeout=max(1, int(getattr(settings, "KOKORO_TIMEOUT_SECONDS", 8))),
+        )
         if not audio_base64:
             return ""
         logger.info("Generated Kokoro speech")
-        openai_circuit_breaker.record_success()
+        speech_circuit_breaker.record_success()
         return audio_base64
+
+    except asyncio.TimeoutError:
+        logger.warning("Speech generation timed out; continuing without TTS audio")
+        speech_circuit_breaker.record_failure()
+        return ""
 
     except Exception as e:
         logger.error("Speech generation failed: %s", redact_text(e))
-        openai_circuit_breaker.record_failure()
+        speech_circuit_breaker.record_failure()
         return ""
 
 async def stream_llm_response(
@@ -213,7 +257,7 @@ async def stream_llm_response(
         return
 
     try:
-        result = complete_text_sync(
+        result = await complete_text_async(
             messages,
             event_type="interview_stream_response",
             temperature=temperature,
@@ -380,7 +424,7 @@ Return ONLY valid JSON:
         return _fallback_evaluation(response, avg_confidence, posture_quality)
 
     try:
-        evaluation = complete_json_sync(
+        evaluation = await complete_json_async(
             [
                 {
                     "role": "system",
@@ -536,7 +580,7 @@ async def generate_hint_for_confusion(
     if not openai_circuit_breaker.can_attempt():
         return "Think about the core components and how they interact."
     try:
-        result = complete_text_sync(
+        result = await complete_text_async(
             [
                 {
                     "role": "system",
@@ -595,7 +639,7 @@ async def generate_coaching_hint(
         score_context = "Good answer. Minor refinements possible."
 
     try:
-        result = complete_text_sync(
+        result = await complete_text_async(
             [
                 {
                     "role": "system",

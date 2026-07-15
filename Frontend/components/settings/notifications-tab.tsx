@@ -15,7 +15,7 @@ function Toggle({ checked, onChange, label, description, icon: Icon }: {
   checked: boolean; onChange: (v: boolean) => void; label: string; description: string; icon: any
 }) {
   return (
-    <div className="flex items-start justify-between gap-4 rounded-lg border border-border/40 bg-secondary/20 p-4">
+    <div className="sub-card flex items-start justify-between gap-4 rounded-lg">
       <div className="flex items-start gap-3">
         <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-card ring-1 ring-border/50">
           <Icon className="h-4 w-4 text-primary" />
@@ -25,7 +25,7 @@ function Toggle({ checked, onChange, label, description, icon: Icon }: {
           <p className="mt-0.5 text-xs text-muted-foreground leading-5">{description}</p>
         </div>
       </div>
-      <button type="button" onClick={() => onChange(!checked)} aria-label={`Toggle ${label}`}
+      <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} aria-label={`Toggle ${label}`}
         className={`relative mt-1 h-6 w-11 shrink-0 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${checked ? "bg-primary border-primary/60" : "bg-secondary border-border"}`}>
         <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow-md transition-transform duration-200 ${checked ? "translate-x-5" : "translate-x-0"}`} />
       </button>
@@ -82,7 +82,7 @@ export function NotificationsTab() {
 
   return (
     <div className="space-y-6">
-      <div className="rounded-2xl border border-border/40 bg-card shadow-sm p-6">
+      <div className="dashboard-card">
         <h3 className="mb-1 text-sm font-semibold text-foreground">Email Notifications</h3>
         <p className="mb-5 text-xs text-muted-foreground">Choose what emails you receive from InterAI.</p>
         <div className="space-y-3">
@@ -106,7 +106,7 @@ export function NotificationsTab() {
           </div>
 
           <div className="space-y-3">
-            <div className="flex items-start justify-between gap-4 rounded-lg border border-border/40 bg-secondary/20 p-4">
+            <div className="sub-card flex items-start justify-between gap-4 rounded-lg">
               <div className="flex items-start gap-3">
                 <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-card ring-1 ring-border/50">
                   <Calendar className="h-4 w-4 text-primary" />

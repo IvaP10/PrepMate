@@ -1,0 +1,12 @@
+.git
+.next
+Frontend/.next
+Frontend/node_modules
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+*.log
+key.env
+.env
+postgres_backups
