@@ -2,16 +2,26 @@ FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f14
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential curl libpq5 \
+    && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 libpq5 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN python -m pip install --timeout 120 --retries 5 -r requirements.txt
+COPY requirements.lock.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --timeout 300 --retries 5 -r requirements.lock.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --no-deps --timeout 120 --retries 5 \
+    "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85"
+ENV HF_HOME=/app/.cache/huggingface
+ARG KOKORO_MODEL_REVISION=f3ff3571791e39611d31c381e3a41a3af07b4987
+RUN python -c "from huggingface_hub import HfApi, snapshot_download; repo='hexgrad/Kokoro-82M'; expected='${KOKORO_MODEL_REVISION}'; actual=HfApi().model_info(repo).sha; assert actual == expected, f'Kokoro model revision changed: {actual}'; snapshot_download(repo_id=repo, revision='main', allow_patterns=['config.json', 'kokoro-v1_0.pth', 'voices/af_heart.pt'])"
+RUN HF_HUB_OFFLINE=1 python -c "from kokoro import KPipeline; pipeline=KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M'); audio=next(iter(pipeline('Hello.', voice='af_heart')))[2]; assert len(audio) > 0"
+RUN python -m pip install --no-cache-dir --upgrade pip==26.1.2
+ENV HF_HUB_OFFLINE=1
 
 COPY . .
 RUN useradd --create-home --uid 10001 interai \
@@ -20,4 +30,4 @@ RUN useradd --create-home --uid 10001 interai \
 USER interai
 EXPOSE 8000
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--proxy-headers"]
+CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port \"${PORT:-8000}\" --workers 2 --proxy-headers"]

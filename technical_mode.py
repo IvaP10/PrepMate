@@ -195,6 +195,7 @@ VISIBLE_RUN_RATE_LIMITER = UserRateLimiter(
 EXECUTION_JOB_VERSION = "technical-execution-v1"
 ROUND_SPEC_VERSION = "technical-round-spec-v1"
 MAX_EXECUTION_OUTPUT_BYTES = 64 * 1024
+EXECUTION_OUTPUT_TRUNCATION_MARKER = "\n[output truncated at 64 KB]"
 SENSITIVE_TECHNICAL_EVENT_TYPES = {
     "technical_transcript",
     "spoken_explanation",
@@ -1713,7 +1714,6 @@ async def _load_active_problem_bank() -> List[Dict[str, Any]]:
 
 
 def _noncoding_authored_spec(round_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    role = str(context.get("job_title") or "Software Engineer")
     topics = _string_list(context.get("technical_topics") or context.get("target_skills") or [], 4)
     topic = topics[0] if topics else {
         "technical_concept": "reliability",
@@ -1726,47 +1726,17 @@ def _noncoding_authored_spec(round_type: str, context: Dict[str, Any]) -> Dict[s
         "oop": "object boundaries and dependency inversion",
     }.get(round_type, "software engineering fundamentals")
     prompts = {
-        "technical_concept": (
-            f"For a {role} system, explain {topic}. Describe how it works, when you would use it, "
-            "its main trade-offs, and one failure mode you would actively monitor."
-        ),
-        "system_design": (
-            f"Design {topic} for a {role} workload. Walk through requirements, API and data flow, "
-            "storage choices, scaling, failure handling, observability, and the trade-offs you made."
-        ),
-        "ml": (
-            f"Explain how you would design and validate {topic} in production. Cover data quality, "
-            "offline and online evaluation, serving, monitoring, drift, and rollback."
-        ),
-        "backend": (
-            f"Explain how you would implement {topic} in a production backend. Cover boundaries, "
-            "concurrency, failure handling, observability, and testing."
-        ),
-        "database": (
-            f"Reason through {topic} for a high-traffic service. Cover schema design, query plans, "
-            "consistency, contention, failure recovery, and measurement."
-        ),
-        "os": (
-            f"Explain {topic} from an operating-system perspective and connect it to an application "
-            "performance incident, including diagnosis and mitigation."
-        ),
-        "network": (
-            f"Explain {topic} across a distributed request path. Cover timeouts, retry safety, "
-            "partial failure, observability, and security boundaries."
-        ),
-        "oop": (
-            f"Model {topic} using object-oriented design. Explain responsibilities, invariants, "
-            "extension points, testability, and where inheritance would be harmful."
-        ),
+        "technical_concept": f"How would you use {topic} in a real production system?",
+        "system_design": f"How would you design {topic} for a real production workload?",
+        "ml": f"How would you know {topic} is working in production?",
+        "backend": f"How would you build {topic} into a production backend?",
+        "database": f"How would you model {topic} for a busy service?",
+        "os": f"How could {topic} cause a production incident?",
+        "network": f"Where could {topic} fail during a distributed request?",
+        "oop": f"How would you split responsibilities when modelling {topic}?",
     }
     profile_type = normalize_technical_profile(context.get("profile_type"))
-    profile_frame = {
-        "top_tier": "Assume top-tier scale, ambiguous requirements, and strict reliability constraints. ",
-        "mid_tier": "Use a practical production scenario with clear delivery and testing constraints. ",
-        "startup": "Assume a small team, limited runway, fast iteration, and changing requirements. ",
-        "custom": "Anchor every choice to the selected job description and company context. ",
-    }[profile_type]
-    prompt = profile_frame + prompts.get(round_type, prompts["technical_concept"])
+    prompt = prompts.get(round_type, prompts["technical_concept"])
     expected_points = [
         {"point_id": f"{round_type}:mechanism", "label": "correct mechanism or architecture"},
         {"point_id": f"{round_type}:application", "label": "concrete application to the scenario"},
@@ -3527,21 +3497,23 @@ def _technical_response_decision(
     )
     if not needs_followup:
         return {"action": "complete", "reason": "expected_coverage_met", "finalize": True}
-    labels = {
-        str(point.get("point_id") or point.get("id")): str(point.get("label") or point.get("point_id") or "")
-        for point in expected_points
-        if isinstance(point, dict)
-    }
     target_id = missed[0] if missed else None
-    target_label = labels.get(str(target_id), "the key mechanism, trade-off, and failure evidence")
+    target_kind = str(target_id or "").rsplit(":", 1)[-1]
+    followups = {
+        "mechanism": "How does your design work from start to finish?",
+        "application": "Where would this fit in the real system?",
+        "tradeoffs": "What trade-off would you accept here?",
+        "failures": "How would your design recover from its most likely failure?",
+        "measurement": "How would you know it is working in production?",
+    }
     return {
         "action": "targeted_followup",
         "reason": "missing_or_low_confidence_technical_evidence",
         "finalize": False,
         "target_point_id": target_id,
-        "followup_prompt": (
-            f"Go one level deeper on {target_label}. Explain the mechanism, a concrete application, "
-            "the most important trade-off, and how you would detect or recover from failure."
+        "followup_prompt": followups.get(
+            target_kind,
+            "Which part of your answer would you make more concrete?",
         ),
     }
 
@@ -3596,17 +3568,39 @@ async def submit_technical_response(
         **(raw.get("rubric") or {}),
         "expected_points": raw.get("expected_points") or [],
     }
-    assessment = await evaluate_answer(
-        raw.get("question_text") or round_row[3],
-        request.response_text,
-        rubric,
-        context,
-        request.response_payload.get("response_seconds"),
-        [],
-        user_id=current_user["user_id"],
-        interview_id=round_row[1],
-        response_id=raw["response_id"],
-    )
+    try:
+        assessment = await asyncio.wait_for(
+            evaluate_answer(
+                raw.get("question_text") or round_row[3],
+                request.response_text,
+                rubric,
+                context,
+                request.response_payload.get("response_seconds"),
+                [],
+                user_id=current_user["user_id"],
+                interview_id=round_row[1],
+                response_id=raw["response_id"],
+            ),
+            timeout=8.0,
+        )
+    except asyncio.TimeoutError:
+        assessment = await evaluate_answer(
+            raw.get("question_text") or round_row[3],
+            request.response_text,
+            rubric,
+            {**context, "semantic_analysis_enabled": False},
+            request.response_payload.get("response_seconds"),
+            [],
+            user_id=current_user["user_id"],
+            interview_id=round_row[1],
+            response_id=raw["response_id"],
+        )
+        assessment["semantic_status"] = {
+            **(assessment.get("semantic_status") or {}),
+            "state": "failed",
+            "attempted": True,
+            "reason": "semantic_timeout",
+        }
     assessment["decision"] = _technical_response_decision(
         assessment,
         raw.get("expected_points") or [],
@@ -4250,6 +4244,33 @@ async def _execute_code(language: str, code: str, stdin: str) -> Dict[str, Any]:
         ) from None
 
 
+def _bound_execution_output(
+    stdout: str,
+    stderr: str,
+    *,
+    executor_truncated: bool = False,
+) -> tuple[str, str, bool]:
+    stdout_bytes = stdout.encode("utf-8", errors="replace")
+    stderr_without_marker = (
+        stderr.removesuffix(EXECUTION_OUTPUT_TRUNCATION_MARKER)
+        if stderr.endswith(EXECUTION_OUTPUT_TRUNCATION_MARKER)
+        else stderr
+    )
+    stderr_bytes = stderr_without_marker.encode("utf-8", errors="replace")
+    truncated = executor_truncated or len(stdout_bytes) + len(stderr_bytes) > MAX_EXECUTION_OUTPUT_BYTES
+    if not truncated:
+        return stdout, stderr, False
+
+    marker_bytes = EXECUTION_OUTPUT_TRUNCATION_MARKER.encode("utf-8")
+    content_budget = max(0, MAX_EXECUTION_OUTPUT_BYTES - len(marker_bytes))
+    bounded_stdout_bytes = stdout_bytes[:content_budget]
+    remaining = content_budget - len(bounded_stdout_bytes)
+    bounded_stderr_bytes = stderr_bytes[:remaining]
+    bounded_stdout = bounded_stdout_bytes.decode("utf-8", errors="ignore")
+    bounded_stderr = bounded_stderr_bytes.decode("utf-8", errors="ignore") + EXECUTION_OUTPUT_TRUNCATION_MARKER
+    return bounded_stdout, bounded_stderr, True
+
+
 async def _resolve_piston_runtime(language: str) -> Dict[str, str]:
     if language in PISTON_RUNTIME_CACHE:
         return PISTON_RUNTIME_CACHE[language]
@@ -4295,6 +4316,16 @@ async def _execute_piston(language: str, code: str, stdin: str) -> Dict[str, Any
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.PISTON_TIMEOUT_SECONDS)) as session:
             headers = {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"} if settings.PISTON_API_TOKEN else {}
             async with session.post(settings.PISTON_API_URL.rstrip("/") + "/execute", json=payload, headers=headers) as response:
+                if response.status == status.HTTP_429_TOO_MANY_REQUESTS:
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Code execution capacity is full; retry with backoff.",
+                    )
+                if response.status == status.HTTP_503_SERVICE_UNAVAILABLE:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The private code execution service is temporarily unavailable.",
+                    )
                 if response.status >= 400:
                     raise HTTPException(status_code=502, detail="Code execution service failed")
                 result = await response.json()
@@ -4306,13 +4337,11 @@ async def _execute_piston(language: str, code: str, stdin: str) -> Dict[str, Any
     compile_result = result.get("compile") or {}
     stdout = str(run.get("stdout") or "")
     stderr = str(run.get("stderr") or compile_result.get("stderr") or compile_result.get("output") or "")
-    combined = (stdout + stderr).encode("utf-8", errors="replace")
-    if len(combined) > MAX_EXECUTION_OUTPUT_BYTES:
-        stdout_bytes = stdout.encode("utf-8", errors="replace")[:MAX_EXECUTION_OUTPUT_BYTES]
-        stdout = stdout_bytes.decode("utf-8", errors="ignore")
-        remaining = max(0, MAX_EXECUTION_OUTPUT_BYTES - len(stdout.encode("utf-8")))
-        stderr = stderr.encode("utf-8", errors="replace")[:remaining].decode("utf-8", errors="ignore")
-        stderr = (stderr + "\n[output truncated at 64 KB]").strip()
+    stdout, stderr, truncated = _bound_execution_output(
+        stdout,
+        stderr,
+        executor_truncated=bool(run.get("truncated")),
+    )
     run_code = run.get("code")
     compile_code = compile_result.get("code")
     exit_code = int(run_code if run_code is not None else (compile_code if compile_code is not None else 0))
@@ -4330,6 +4359,7 @@ async def _execute_piston(language: str, code: str, stdin: str) -> Dict[str, Any
         "runtime_ms": wall_time_ms or int((time.time() - started) * 1000),
         "memory_kb": max(0, memory_bytes // 1024),
         "executor": "isolated_sandbox",
+        "truncated": truncated,
     }
 
 

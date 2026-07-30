@@ -2,6 +2,8 @@
 
 import { useState, useRef, useCallback, useEffect } from "react"
 
+import { withoutMediaPipeInfoNoise } from "@/lib/mediapipe-console"
+
 interface FaceMetrics {
   facePresent: boolean
   centered: boolean
@@ -119,7 +121,7 @@ export function useFaceCheck(videoRef: React.RefObject<HTMLVideoElement | null>)
     }
 
     try {
-      const result = landmarker.detectForVideo(video, now)
+      const result = withoutMediaPipeInfoNoise(() => landmarker.detectForVideo(video, now))
       const face = result.faceLandmarks?.[0]
       if (!face) {
         setMetrics(DEFAULTS)

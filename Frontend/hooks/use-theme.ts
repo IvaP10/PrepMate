@@ -1,16 +1,19 @@
 "use client"
 
-import { useState, useEffect, useLayoutEffect, useCallback } from "react"
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react"
+import { flushSync } from "react-dom"
 import { applyFavicon } from "@/lib/favicon"
 import { safeStorageGet, safeStorageSet } from "@/lib/safe-storage"
 
 type Theme = "light" | "dark"
 
 const STORAGE_KEY = "interai-theme"
-let themeTransitionTimeout: ReturnType<typeof setTimeout> | undefined
+const THEME_TRANSITION_MS = 1200
 
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>("dark")
+  const transitionFrameRef = useRef<number | undefined>(undefined)
+  const transitionTimeoutRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
   useEffect(() => {
     try {
@@ -33,34 +36,49 @@ export function useTheme() {
     applyTheme(theme)
   }, [theme])
 
-  const setTheme = useCallback((t: Theme) => {
-    setThemeState(t)
-    applyTheme(t, true)
-    safeStorageSet("local", STORAGE_KEY, t)
+  useEffect(() => () => {
+    if (transitionFrameRef.current !== undefined) cancelAnimationFrame(transitionFrameRef.current)
+    if (transitionTimeoutRef.current !== undefined) clearTimeout(transitionTimeoutRef.current)
+    document.documentElement.classList.remove("theme-transitioning")
   }, [])
 
-  const toggleTheme = useCallback(() => {
-    setThemeState((prev) => {
-      const next = prev === "dark" ? "light" : "dark"
-      applyTheme(next, true)
-      safeStorageSet("local", STORAGE_KEY, next)
-      return next
+  const transitionToTheme = useCallback((next: Theme) => {
+    const root = document.documentElement
+    if (transitionFrameRef.current !== undefined) cancelAnimationFrame(transitionFrameRef.current)
+    if (transitionTimeoutRef.current !== undefined) clearTimeout(transitionTimeoutRef.current)
+
+    root.classList.add("theme-transitioning")
+    void getComputedStyle(document.body).transitionDuration
+
+    transitionFrameRef.current = requestAnimationFrame(() => {
+      transitionFrameRef.current = requestAnimationFrame(() => {
+        applyTheme(next, true)
+        flushSync(() => setThemeState(next))
+        safeStorageSet("local", STORAGE_KEY, next)
+        transitionFrameRef.current = undefined
+        transitionTimeoutRef.current = setTimeout(() => {
+          root.classList.remove("theme-transitioning")
+          transitionTimeoutRef.current = undefined
+        }, THEME_TRANSITION_MS + 40)
+      })
     })
   }, [])
+
+  const setTheme = useCallback((next: Theme) => {
+    transitionToTheme(next)
+  }, [transitionToTheme])
+
+  const toggleTheme = useCallback(() => {
+    const current = document.documentElement.classList.contains("dark") ? "dark" : "light"
+    transitionToTheme(current === "dark" ? "light" : "dark")
+  }, [transitionToTheme])
 
   return { theme, setTheme, toggleTheme }
 }
 
-function applyTheme(theme: Theme, animate = false) {
+function applyTheme(theme: Theme, transitionPrepared = false) {
   const root = document.documentElement
-
-  if (animate) {
-    if (themeTransitionTimeout) {
-      clearTimeout(themeTransitionTimeout)
-    }
-    root.classList.add("theme-transition")
-    void root.offsetWidth
-  }
+  if (transitionPrepared && !root.classList.contains("theme-transitioning")) return
 
   if (theme === "dark") {
     root.classList.remove("light")
@@ -70,11 +88,4 @@ function applyTheme(theme: Theme, animate = false) {
     root.classList.add("light")
   }
   applyFavicon(theme)
-
-  if (animate) {
-    themeTransitionTimeout = setTimeout(() => {
-      root.classList.remove("theme-transition")
-      themeTransitionTimeout = undefined
-    }, 950)
-  }
 }

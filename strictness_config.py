@@ -90,7 +90,7 @@ STRICTNESS_LEVELS = {
 
 INTERVIEW_TYPES = {
     "technical": {
-        "name": "Technical Interview",
+        "name": "Technical Round",
         "focus_areas": [
             "coding",
             "algorithms",
@@ -107,7 +107,7 @@ INTERVIEW_TYPES = {
         ]
     },
     "behavioral": {
-        "name": "Behavioral Interview",
+        "name": "Interview Round",
         "focus_areas": [
             "past experiences",
             "teamwork",

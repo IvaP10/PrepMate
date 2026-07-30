@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { useParams, useRouter } from "next/navigation"
-import { AlertTriangle, ArrowLeft, RefreshCw } from "lucide-react"
+import { AlertTriangle, ArrowLeft, BriefcaseBusiness, Check, ChevronDown, ChevronUp, Loader2, RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { fetchInterviewAnalysisStatus, fetchInterviewReport, retryInterviewAnalysis, type InterviewAnalysisStatus } from "@/lib/api"
+import { createJobProfile, fetchInterviewAnalysisStatus, fetchInterviewReport, retryInterviewAnalysis, type InterviewAnalysisStatus } from "@/lib/api"
 import { buildImproveUrl } from "@/lib/improve-navigation"
 import { ReportShell } from "@/components/report/report-shell"
 import { SessionSummary } from "@/components/report/session-summary"
@@ -135,6 +135,12 @@ interface InterviewReport {
   completed_at: string | null
   status?: string
   analysis_pending?: boolean
+  job_target?: {
+    role: string
+    company?: string | null
+    job_description: string
+    saved_for_reuse: boolean
+  } | null
   detailed_responses: DetailedResponse[]
 }
 
@@ -191,6 +197,10 @@ export default function InterviewReportPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [retryingReport, setRetryingReport] = useState(false)
+  const [showRoleDetails, setShowRoleDetails] = useState(false)
+  const [savingRole, setSavingRole] = useState(false)
+  const [roleSaved, setRoleSaved] = useState(false)
+  const [roleSaveError, setRoleSaveError] = useState("")
 
   const loadReport = useCallback(async () => {
     if (!interviewId) return
@@ -239,6 +249,31 @@ export default function InterviewReportPage() {
   }, [interviewId, refreshAnalysis, retryingReport])
 
   useEffect(() => {
+    setRoleSaved(Boolean(report?.job_target?.saved_for_reuse))
+    setShowRoleDetails(false)
+    setRoleSaveError("")
+  }, [report?.interview_id, report?.job_target?.saved_for_reuse])
+
+  const reuseReportRole = useCallback(async () => {
+    const target = report?.job_target
+    if (!target || savingRole || roleSaved) return
+    setSavingRole(true)
+    setRoleSaveError("")
+    try {
+      await createJobProfile({
+        role: target.role,
+        company: target.company || "",
+        job_description: target.job_description,
+      })
+      setRoleSaved(true)
+    } catch (err) {
+      setRoleSaveError(err instanceof Error ? err.message : "We could not save this role for reuse.")
+    } finally {
+      setSavingRole(false)
+    }
+  }, [report?.job_target, roleSaved, savingRole])
+
+  useEffect(() => {
     refreshAnalysis()
   }, [refreshAnalysis])
 
@@ -246,7 +281,7 @@ export default function InterviewReportPage() {
     if (report || !analysisStatus || analysisStatus.report_ready || analysisStatus.report_state === "failed") return
     const timer = setInterval(() => {
       void refreshAnalysis()
-    }, 5000)
+    }, 30_000)
     return () => clearInterval(timer)
   }, [analysisStatus, refreshAnalysis, report])
 
@@ -287,7 +322,8 @@ export default function InterviewReportPage() {
   if (reportPending) {
     const progress = Math.max(0, Math.min(100, analysisStatus.job?.progress || 0))
     const stage = analysisStatus.job?.current_stage?.replace(/_/g, " ") || "queued"
-    const showTimeoutWarning = pendingElapsed > 300 // 5 minutes
+    const processingMinutes = analysisStatus.processing_sla_minutes || 15
+    const showTimeoutWarning = pendingElapsed > processingMinutes * 60
     return (
       <div className="min-h-screen bg-background p-6 text-foreground md:p-10">
         <div className="mx-auto flex max-w-5xl flex-col gap-6">
@@ -312,7 +348,7 @@ export default function InterviewReportPage() {
                     : "Your report is still being generated."}
                 </h1>
                 <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                  This usually takes 3-5 minutes. We&apos;ll automatically load it when it&apos;s ready. You can also leave this page and come back later.
+                  This usually completes within {processingMinutes} minutes. You can leave this page and come back later; the report and Performance data will use the same finalized analysis.
                 </p>
               </div>
               <Button onClick={refreshAnalysis} variant="outline" className="gap-2">
@@ -431,6 +467,8 @@ export default function InterviewReportPage() {
     { id: "summary", title: "Summary" }
   ]
 
+  if (report.job_target) sections.push({ id: "job-target", title: "Role used" })
+
   if (findings.length) sections.push({ id: "evidence-findings", title: "Evidence Findings" })
 
   if (isTechnical) {
@@ -468,7 +506,7 @@ export default function InterviewReportPage() {
     role: report.job_title || "General Candidate",
     itemCountLabel: isTechnical
       ? `${technicalProblems.length} Problem${technicalProblems.length === 1 ? "" : "s"} Attempted`
-      : `${detailTurns.length} Questions Asked`,
+      : `${detailTurns.length} Question${detailTurns.length === 1 ? "" : "s"} Asked`,
     overallScore,
   }
 
@@ -557,6 +595,41 @@ export default function InterviewReportPage() {
         summary={summary}
         interviewerSignal={reportV2?.student_summary?.interviewer_signal}
       />
+
+      {report.job_target && (
+        <section id="job-target" data-report-section className="scroll-mt-20 rounded-lg border border-border bg-card p-5">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                <BriefcaseBusiness className="h-4 w-4 text-primary" />
+                Role used for this round
+              </div>
+              <p className="mt-2 truncate text-base font-semibold text-foreground">
+                {report.job_target.role}{report.job_target.company ? ` at ${report.job_target.company}` : ""}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => setShowRoleDetails((visible) => !visible)}>
+                {showRoleDetails ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                {showRoleDetails ? "Hide role" : "View role"}
+              </Button>
+              <Button type="button" size="sm" disabled={savingRole || roleSaved} onClick={() => void reuseReportRole()}>
+                {savingRole ? <Loader2 className="h-4 w-4 animate-spin" /> : roleSaved ? <Check className="h-4 w-4" /> : <BriefcaseBusiness className="h-4 w-4" />}
+                {savingRole ? "Saving" : roleSaved ? "Saved for reuse" : "Reuse role"}
+              </Button>
+            </div>
+          </div>
+          {showRoleDetails && (
+            <div className="mt-4 border-t border-border/70 pt-4">
+              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Full job description</p>
+              <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
+                {report.job_target.job_description || "No job description was captured for this role."}
+              </p>
+            </div>
+          )}
+          {roleSaveError && <p className="mt-3 text-sm text-destructive">{roleSaveError}</p>}
+        </section>
+      )}
 
       {findings.length > 0 && (
         <section id="evidence-findings" data-report-section className="scroll-mt-20 space-y-3 rounded-lg border border-border bg-card p-5">

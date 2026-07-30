@@ -19,8 +19,7 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme, announcementVi
     window.addEventListener("scroll", handler)
     return () => window.removeEventListener("scroll", handler)
   }, [])
-  const handleScroll = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
-    e.preventDefault()
+  const scrollToSection = (href: string) => {
     const id = href.replace("#", "")
     const element = document.getElementById(id)
     if (element) {
@@ -36,10 +35,14 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme, announcementVi
       window.history.replaceState(null, "", href)
     }
   }
+  const handleScroll = (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+    e.preventDefault()
+    scrollToSection(href)
+  }
   const navLinks = [
     { label: "How It Works", href: "#how-it-works" },
-    { label: "Practice Modes", href: "#modes" },
-    { label: "Performance", href: "#performance" },
+    { label: "What You Practice", href: "#modes" },
+    { label: "Feedback", href: "#performance" },
     { label: "Pricing", href: "#pricing" },
   ]
   return (
@@ -50,7 +53,7 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme, announcementVi
           : "border-border/40 bg-background/60 backdrop-blur-[12px] dark:bg-background/70"
       }`}
     >
-      <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
+      <div className="mx-auto flex h-16 w-full max-w-7xl items-center justify-between px-6">
         <Link
           href="/"
           className="flex items-center gap-1.5 premium-transition hover:opacity-85"
@@ -127,8 +130,11 @@ export function Navbar({ onLogin, onSignUp, theme, onToggleTheme, announcementVi
                 href={link.href}
                 className="rounded-lg px-3 py-2.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 onClick={(e) => {
+                  e.preventDefault()
                   setMobileOpen(false)
-                  handleScroll(e, link.href)
+                  window.requestAnimationFrame(() => {
+                    window.requestAnimationFrame(() => scrollToSection(link.href))
+                  })
                 }}
               >
                 {link.label}

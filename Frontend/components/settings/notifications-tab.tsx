@@ -1,6 +1,6 @@
 "use client"
 import { useState, useEffect } from "react"
-import { Bell, Calendar, Flame, Mail, Loader2, Save } from "lucide-react"
+import { Loader2, Save } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -11,19 +11,14 @@ import {
 import { getNotificationPrefs, updateNotificationPrefs } from "@/lib/api"
 import type { NotificationPrefs } from "@/lib/api"
 
-function Toggle({ checked, onChange, label, description, icon: Icon }: {
-  checked: boolean; onChange: (v: boolean) => void; label: string; description: string; icon: any
+function Toggle({ checked, onChange, label, description }: {
+  checked: boolean; onChange: (v: boolean) => void; label: string; description: string
 }) {
   return (
     <div className="sub-card flex items-start justify-between gap-4 rounded-lg">
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-card ring-1 ring-border/50">
-          <Icon className="h-4 w-4 text-primary" />
-        </div>
-        <div>
-          <p className="text-sm font-medium text-foreground">{label}</p>
-          <p className="mt-0.5 text-xs text-muted-foreground leading-5">{description}</p>
-        </div>
+      <div>
+        <p className="text-sm font-medium text-foreground">{label}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground leading-5">{description}</p>
       </div>
       <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} aria-label={`Toggle ${label}`}
         className={`relative mt-1 h-6 w-11 shrink-0 rounded-full border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ${checked ? "bg-primary border-primary/60" : "bg-secondary border-border"}`}>
@@ -87,10 +82,10 @@ export function NotificationsTab() {
         <p className="mb-5 text-xs text-muted-foreground">Choose what emails you receive from InterAI.</p>
         <div className="space-y-3">
           <div className="space-y-3">
-            <Toggle checked={inactiveEnabled} onChange={setInactiveEnabled} icon={Mail}
+            <Toggle checked={inactiveEnabled} onChange={setInactiveEnabled}
               label="Inactivity reminder" description="Get an email if you haven't practiced in a while." />
             {inactiveEnabled && (
-              <div className="ml-11 flex items-center gap-2">
+              <div className="flex items-center gap-2">
                 <Label className="text-xs text-muted-foreground whitespace-nowrap">Remind after</Label>
                 <Select value={inactiveDays} onValueChange={setInactiveDays}>
                   <SelectTrigger className="h-8 w-24"><SelectValue /></SelectTrigger>
@@ -107,24 +102,19 @@ export function NotificationsTab() {
 
           <div className="space-y-3">
             <div className="sub-card flex items-start justify-between gap-4 rounded-lg">
-              <div className="flex items-start gap-3">
-                <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-card ring-1 ring-border/50">
-                  <Calendar className="h-4 w-4 text-primary" />
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-foreground">Interview target date</p>
-                  <p className="mt-0.5 text-xs text-muted-foreground leading-5">Set a date and get daily reminders as it approaches.</p>
-                </div>
+              <div>
+                <p className="text-sm font-medium text-foreground">Interview target date</p>
+                <p className="mt-0.5 text-xs text-muted-foreground leading-5">Set a date and get daily reminders as it approaches.</p>
               </div>
               <Input type="date" value={targetDate} onChange={e => setTargetDate(e.target.value)}
                 className="h-8 w-40 shrink-0 text-xs" />
             </div>
           </div>
 
-          <Toggle checked={weeklySummary} onChange={setWeeklySummary} icon={Bell}
+          <Toggle checked={weeklySummary} onChange={setWeeklySummary}
             label="Weekly performance summary" description="Receive a weekly email summarising your scores and progress." />
 
-          <Toggle checked={streakReminder} onChange={setStreakReminder} icon={Flame}
+          <Toggle checked={streakReminder} onChange={setStreakReminder}
             label="Streak reminder" description="Get a nudge if you're about to break your practice streak." />
         </div>
         <Button className="mt-5 gap-2" onClick={handleSave} disabled={saving}>

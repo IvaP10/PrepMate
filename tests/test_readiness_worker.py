@@ -62,17 +62,15 @@ class ReadinessContractTests(unittest.TestCase):
         app_module = self._app_module()
 
         class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
             @staticmethod
             def raise_for_status():
                 return None
 
-            @staticmethod
-            def json():
-                return [
-                    {"language": "python", "aliases": ["py"]},
-                    {"language": "javascript", "aliases": ["js"]},
-                    {"language": "java", "aliases": []},
-                ]
+            def json(self):
+                return self.payload
 
         class FakeClient:
             def __init__(self, **_kwargs):
@@ -84,8 +82,18 @@ class ReadinessContractTests(unittest.TestCase):
             async def __aexit__(self, *_args):
                 return False
 
-            async def get(self, _url, **_kwargs):
-                return FakeResponse()
+            async def get(self, url, **_kwargs):
+                if url.endswith("/health"):
+                    return FakeResponse({
+                        "ready": True,
+                        "oci_runtime": "runsc",
+                        "oci_runtime_available": True,
+                    })
+                return FakeResponse([
+                    {"language": "python", "aliases": ["py"]},
+                    {"language": "javascript", "aliases": ["js"]},
+                    {"language": "java", "aliases": []},
+                ])
 
         with (
             patch.object(app_module.settings, "PISTON_API_URL", "http://sandbox:8080/api/v2"),
@@ -95,6 +103,123 @@ class ReadinessContractTests(unittest.TestCase):
             result = asyncio.run(app_module._sandbox_executor_check())
         self.assertFalse(result["healthy"])
         self.assertEqual(result["missing_runtimes"], ["c++"])
+
+    def test_production_sandbox_rejects_runc_even_when_execution_works(self):
+        app_module = self._app_module()
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            def json(self):
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url, **_kwargs):
+                if url.endswith("/health"):
+                    return FakeResponse({
+                        "ready": True,
+                        "oci_runtime": "runc",
+                        "oci_runtime_available": True,
+                    })
+                return FakeResponse([
+                    {"language": "python", "aliases": ["py"]},
+                    {"language": "javascript", "aliases": ["js"]},
+                    {"language": "java", "aliases": []},
+                    {"language": "c++", "aliases": ["cpp"]},
+                ])
+
+            async def post(self, *_args, **_kwargs):
+                return FakeResponse({
+                    "run": {"stdout": "interai-ready\n", "code": 0},
+                })
+
+        with (
+            patch.object(app_module.settings, "ENVIRONMENT", "production"),
+            patch.object(app_module.settings, "PISTON_API_URL", "http://sandbox:8080/api/v2"),
+            patch.object(app_module.settings, "PISTON_EXPECTED_RUNTIMES", "python,javascript,java,c++"),
+            patch.object(app_module.httpx, "AsyncClient", FakeClient),
+        ):
+            result = asyncio.run(app_module._sandbox_executor_check())
+        self.assertTrue(result["execution_probe"])
+        self.assertFalse(result["secure_runtime"])
+        self.assertFalse(result["healthy"])
+
+    def test_sandbox_execution_probe_is_cached_to_avoid_competing_with_user_runs(self):
+        app_module = self._app_module()
+        calls = {"execute": 0}
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            def json(self):
+                return self.payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url, **_kwargs):
+                if url.endswith("/health"):
+                    return FakeResponse({
+                        "ready": True,
+                        "oci_runtime": "runc",
+                        "oci_runtime_available": True,
+                    })
+                return FakeResponse([{"language": "python", "aliases": ["py"]}])
+
+            async def post(self, *_args, **_kwargs):
+                calls["execute"] += 1
+                return FakeResponse({"run": {"stdout": "interai-ready\n", "code": 0}})
+
+        async def scenario():
+            app_module._sandbox_probe_cache.update({
+                "checked_at": 0.0,
+                "key": None,
+                "result": None,
+            })
+            first = await app_module._sandbox_executor_check()
+            second = await app_module._sandbox_executor_check()
+            return first, second
+
+        with (
+            patch.object(app_module.settings, "ENVIRONMENT", "development"),
+            patch.object(app_module.settings, "PISTON_API_URL", "http://cached-sandbox:8080/api/v2"),
+            patch.object(app_module.settings, "PISTON_API_TOKEN", "test-token"),
+            patch.object(app_module.settings, "PISTON_EXPECTED_RUNTIMES", "python"),
+            patch.object(app_module.httpx, "AsyncClient", FakeClient),
+        ):
+            first, second = asyncio.run(scenario())
+
+        self.assertTrue(first["healthy"])
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["healthy"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(calls["execute"], 1)
 
     def test_flow_preflight_keeps_internal_dependency_names_out_of_user_message(self):
         from readiness_contract import build_flow_readiness_payload

@@ -1,5 +1,5 @@
 "use client"
-import { useState, useEffect, useRef, useCallback } from "react"
+import { lazy, Suspense, useState, useEffect, useRef, useCallback } from "react"
 import { createPortal } from "react-dom"
 import { useRouter } from "next/navigation"
 import { ThemeLogo } from "@/components/theme-logo"
@@ -13,15 +13,8 @@ import {
   Sun,
   Moon,
   Upload,
-  Mail,
-  Phone,
-  Linkedin,
-  Globe,
-  GraduationCap,
   Briefcase,
   Code,
-  Award,
-  Languages,
   X,
   Check,
   Edit3,
@@ -31,8 +24,6 @@ import {
   CreditCard,
   Eye,
   Loader2,
-  Bug,
-  MessageCircle,
   Send,
   Star,
   Target,
@@ -40,14 +31,12 @@ import {
   GitBranch,
   BadgeCheck,
   PanelLeft,
+  Copy,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { SlidingSegmentControl } from "@/components/sliding-segment-control"
 import { SlidingSidebarNav } from "@/components/sliding-sidebar-nav"
-import { ImproveContent as MissionImproveContent } from "@/components/improve/improve-content"
-import { PerformanceContent } from "@/components/performance/performance-content"
 import { InterviewSetupWizard, type BlueprintRuntimeChoice } from "@/components/interview-setup-wizard"
-import { ResumeAssetsManager } from "@/components/resume-assets-manager"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
@@ -99,11 +88,30 @@ import {
   fetchLearningDashboard,
   reconcilePerformance,
   prepareTechnicalRounds,
+  copyInterviewJobProfile,
 } from "@/lib/api"
 import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileOption, InterviewProfileType, LearningDashboard, NotificationPrefs, TechnicalRoundHistoryItem, TechnicalRoundSession } from "@/lib/api"
 import { useResume } from "@/context/resume-context"
 import type { ResumeData } from "@/types/resume"
 import { RESUME_MAX_FILE_BYTES } from "@/lib/config"
+
+const LazyMissionImproveContent = lazy(() =>
+  import("@/components/improve/improve-content").then((module) => ({ default: module.ImproveContent }))
+)
+const LazyPerformanceContent = lazy(() =>
+  import("@/components/performance/performance-content").then((module) => ({ default: module.PerformanceContent }))
+)
+const LazyResumeAssetsManager = lazy(() =>
+  import("@/components/resume-assets-manager").then((module) => ({ default: module.ResumeAssetsManager }))
+)
+
+function WorkspacePanelFallback() {
+  return (
+    <div className="flex flex-1 items-center justify-center p-10">
+      <Loader2 className="h-5 w-5 animate-spin text-primary" aria-label="Loading section" />
+    </div>
+  )
+}
 
 function isSupportedResumeFile(file: File) {
   const name = file.name.toLowerCase()
@@ -221,6 +229,14 @@ export interface PastInterview {
   }
   duration?: number | null
   created_at?: string | null
+  job_target?: {
+    profile_type?: InterviewProfileType | string | null
+    is_custom?: boolean
+    role?: string | null
+    company?: string | null
+    saved_profile_id?: number | null
+    can_copy?: boolean
+  } | null
 }
 function getPlanLabel(planType?: string | null) {
   const normalized = (planType || "starter").toLowerCase()
@@ -229,12 +245,9 @@ function getPlanLabel(planType?: string | null) {
   return "Free"
 }
 
-function getDashboardBackgroundMode(planType?: string | null): "base" | "comets" {
+function isPaidPlanType(planType?: string | null) {
   const normalized = (planType || "starter").toLowerCase()
-  if (normalized === "free") return "base"
-  if (normalized.includes("premium")) return "comets"
-  if (normalized.includes("pro")) return "comets"
-  return "base"
+  return normalized.includes("premium") || normalized.includes("pro")
 }
 
 function renderPlanBadge(planType?: string | null) {
@@ -351,12 +364,14 @@ function InterviewContent({
   interviews = [],
   setActiveNav,
   mode = "interview",
-  user
+  user,
+  onProfilesChanged,
 }: {
   interviews?: PastInterview[]
   setActiveNav: (nav: ActiveNav) => void
   mode?: "interview" | "technical"
   user?: AuthUser | null
+  onProfilesChanged?: () => void
 }) {
   const router = useRouter()
   const [isStartingMock, setIsStartingMock] = useState(false)
@@ -378,6 +393,9 @@ function InterviewContent({
   const [companyName, setCompanyName] = useState("")
   const [readyBlueprint, setReadyBlueprint] = useState<InterviewBlueprint | null>(null)
   const [runtimeChoice, setRuntimeChoice] = useState<BlueprintRuntimeChoice>({ inputMode: "voice", cameraEnabled: true, interviewMode: "mock" })
+  const [profileRevision, setProfileRevision] = useState(0)
+  const [copyingInterviewId, setCopyingInterviewId] = useState<string | number | null>(null)
+  const [copiedInterviewIds, setCopiedInterviewIds] = useState<Set<string | number>>(() => new Set())
   const openBillingSettings = () => {
     if (typeof window !== "undefined") {
       safeStorageSet("session", "settings_tab", "billing")
@@ -575,7 +593,7 @@ function InterviewContent({
   }
 
   const formatDuration = (seconds: number | null | undefined) => {
-    if (seconds === undefined || seconds === null) return "\u2014"
+    if (seconds === undefined || seconds === null) return "0m 0s"
     const m = Math.floor(seconds / 60)
     const s = seconds % 60
     return `${m}m ${s}s`
@@ -592,14 +610,34 @@ function InterviewContent({
           : <Briefcase className="h-4 w-4" />,
   }))
 
+  const profilesChanged = () => {
+    setProfileRevision((value) => value + 1)
+    onProfilesChanged?.()
+  }
+
+  const copyPastProfile = async (interview: PastInterview) => {
+    setCopyingInterviewId(interview.id)
+    try {
+      await copyInterviewJobProfile(String(interview.id))
+      setCopiedInterviewIds((current) => new Set(current).add(interview.id))
+      toast.success("Profile saved")
+      profilesChanged()
+    } catch (error: any) {
+      toast.error(error?.message || "Failed to copy this profile.")
+    } finally {
+      setCopyingInterviewId(null)
+    }
+  }
+
   return (
-    <div className="flex-1 overflow-y-auto p-6 md:p-8">
+    <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
       <div className="mb-8 rounded-xl card-elevated p-7">
         <InterviewSetupWizard
-          key={mode}
+          key={`${mode}-${profileRevision}`}
           mode={mode}
           disabled={isStartingMock || isStartingTechnical}
           onReady={handleBlueprintReady}
+          onProfilesChanged={profilesChanged}
         />
         {false && (
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -691,13 +729,8 @@ function InterviewContent({
         <div className="dashboard-card overflow-hidden p-0">
           <div className={!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
             <h3 className="text-base font-semibold text-foreground">Technical Rounds</h3>
-            {!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 && (
-              <p className="mt-1 text-sm text-muted-foreground">
-                Your completed technical rounds will appear here.
-              </p>
-            )}
           </div>
-          {(loadingTechnicalRounds || Boolean(technicalHistoryError) || technicalSessions.length > 0) && <div className="overflow-x-auto">
+          {(loadingTechnicalRounds || Boolean(technicalHistoryError) || technicalSessions.length > 0) && <div className="max-w-full overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="border-b border-border">
@@ -743,17 +776,20 @@ function InterviewContent({
                       totalRuns += round.run_count || 0
                       totalSuccessfulRuns += round.successful_runs || 0
                     }
-                    const successRate: number | null = totalTests > 0
+                    const observedRunRate = totalTests > 0
                       ? Math.round((totalPassed / totalTests) * 100)
                       : totalRuns > 0
                         ? Math.round((totalSuccessfulRuns / totalRuns) * 100)
-                        : null
+                        : 0
+                    const officialScore = typeof session.official_score === "number"
+                      ? Math.round(session.official_score)
+                      : null
 
                     // Start time from first round
                     const sessionCreatedAt = firstRound.created_at
                     const startTime = sessionCreatedAt
                       ? new Date(sessionCreatedAt).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })
-                      : "Unknown"
+                      : "Not recorded"
 
                     // Duration: compute from session start to completion/last activity
                     let duration = typeof session.duration_seconds === "number"
@@ -777,9 +813,12 @@ function InterviewContent({
                         duration = `${diffMins}m ${diffSecs}s`
                       }
                     }
-                    if (!duration) duration = "—"
+                    if (!duration) duration = "0m 0s"
 
-                    const profileTypeFormatted = (session.profile_type || firstRound.profile_type || "technical")
+                    const profileTypeValue = session.profile_type || firstRound.profile_type || "technical"
+                    const profileTypeFormatted = (profileTypeValue === "custom" && session.job_title
+                      ? `Custom (${session.job_title})`
+                      : profileTypeValue)
                       .replace(/_/g, " ")
                       .replace(/\b\w/g, (char: string) => char.toUpperCase())
 
@@ -793,13 +832,13 @@ function InterviewContent({
                         <td className="whitespace-nowrap px-6 py-4 text-sm text-foreground">{duration}</td>
                         <td className="whitespace-nowrap px-6 py-4">
                           <div className="flex items-center gap-2">
-                            <div className="h-2 w-16 overflow-hidden rounded-full bg-border">
+                            <div className="h-2 w-16 overflow-hidden rounded-full bg-border" title={officialScore == null && observedRunRate > 0 ? "Runs saved; no official score" : undefined}>
                               <div
-                                className={`h-full rounded-full ${successRate === null ? "bg-muted-foreground/30" : successRate >= 80 ? "bg-green-500" : successRate >= 50 ? "bg-amber-500" : "bg-red-500"}`}
-                                style={{ width: `${successRate ?? 0}%` }}
+                                className={`h-full rounded-full ${officialScore != null && officialScore >= 80 ? "bg-green-500" : officialScore != null && officialScore >= 50 ? "bg-amber-500" : "bg-red-500"}`}
+                                style={{ width: `${officialScore ?? 0}%` }}
                               />
                             </div>
-                            <span className="text-sm font-medium text-foreground">{successRate === null ? "Unknown" : `${successRate}%`}</span>
+                            <span className="text-sm font-medium text-foreground">{officialScore == null ? "—" : `${officialScore}%`}</span>
                           </div>
                         </td>
                         <td className="whitespace-nowrap px-6 py-4 text-right">
@@ -829,13 +868,8 @@ function InterviewContent({
       <div className="dashboard-card overflow-hidden p-0">
         <div className={interviews.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
           <h3 className="text-base font-semibold text-foreground">Past Interviews</h3>
-          {interviews.length === 0 && (
-            <p className="mt-1 text-sm text-muted-foreground">
-              Your completed interviews will appear here.
-            </p>
-          )}
         </div>
-        {interviews.length > 0 && <div className="overflow-x-auto">
+        {interviews.length > 0 && <div className="max-w-full overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border">
@@ -847,12 +881,38 @@ function InterviewContent({
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
-              {interviews.map((interview) => (
+              {interviews.map((interview) => {
+                const customProfile = Boolean(
+                  interview.job_target?.is_custom || interview.job_target?.profile_type === "custom"
+                )
+                const role = interview.job_target?.role || interview.role
+                const profileSaved = Boolean(interview.job_target?.saved_profile_id || copiedInterviewIds.has(interview.id))
+                return (
                   <tr key={interview.id} className="transition-colors hover:bg-secondary/30">
                     <td className="whitespace-nowrap px-6 py-4 text-sm text-foreground">
                       {formatActivityDate(interview.created_at)}
                     </td>
-                    <td className="whitespace-nowrap px-6 py-4 text-sm text-foreground">{interview.role}</td>
+                    <td className="whitespace-nowrap px-6 py-4 text-sm text-foreground">
+                      <div className="flex items-center gap-2">
+                        <span>{customProfile ? `Custom (${role})` : role}</span>
+                        {customProfile && profileSaved && (
+                          <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">Saved</span>
+                        )}
+                        {customProfile && !profileSaved && interview.job_target?.can_copy && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 gap-1 px-2 text-xs text-primary"
+                            disabled={copyingInterviewId === interview.id}
+                            onClick={() => void copyPastProfile(interview)}
+                          >
+                            {copyingInterviewId === interview.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Copy className="h-3.5 w-3.5" />}
+                            Copy profile
+                          </Button>
+                        )}
+                      </div>
+                    </td>
                     <td className="whitespace-nowrap px-6 py-4 text-sm text-foreground">
                       {formatDuration(interview.duration)}
                     </td>
@@ -860,12 +920,12 @@ function InterviewContent({
                       <div className="flex items-center gap-2">
                         <div className="h-2 w-16 overflow-hidden rounded-full bg-border">
                           <div
-                            className={`h-full rounded-full ${interview.score === null ? "bg-muted-foreground/30" : interview.score >= 80 ? "bg-green-500" : interview.score >= 60 ? "bg-amber-500" : "bg-red-500"
+                            className={`h-full rounded-full ${(interview.score ?? 0) >= 80 ? "bg-green-500" : (interview.score ?? 0) >= 60 ? "bg-amber-500" : "bg-red-500"
                               }`}
                             style={{ width: `${interview.score ?? 0}%` }}
                           />
                         </div>
-                        <span className="text-sm font-medium text-foreground">{interview.score === null ? "Unknown" : `${interview.score}%`}</span>
+                        <span className="text-sm font-medium text-foreground">{interview.score == null ? "—" : `${interview.score}%`}</span>
                       </div>
                     </td>
                     <td className="whitespace-nowrap px-6 py-4 text-right">
@@ -908,7 +968,8 @@ function InterviewContent({
                       </Button>
                     </td>
                   </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         </div>}
@@ -964,6 +1025,7 @@ function ResumeContent() {
   const [editData, setEditData] = useState<DashboardResumeData>(emptyResumeData)
   const [assetsRefreshKey, setAssetsRefreshKey] = useState(0)
   const [activeResumeId, setActiveResumeId] = useState<string | null>(contextResumeData?.metadata?.resumeId || null)
+  const [uploadFailure, setUploadFailure] = useState<{ message: string; requestId?: string; retryable?: boolean } | null>(null)
   const hasData = Boolean(contextResumeData)
 
   const openFilePicker = () => {
@@ -973,27 +1035,37 @@ function ResumeContent() {
 
   const handleFileSelected = async (file: File) => {
     if (!isSupportedResumeFile(file)) {
+      setUploadFailure({ message: "Please upload a PDF or DOCX file." })
       toast.error("Please upload a PDF or DOCX file")
       return
     }
     if (file.size > RESUME_MAX_FILE_BYTES) {
+      setUploadFailure({ message: "File size must be 4MB or less." })
       toast.error("File size must be 4MB or less")
       return
     }
 
     setIsUploading(true)
+    setUploadFailure(null)
     try {
       const { parsedData } = await uploadResume(file)
       setContextResumeData(parsedData)
       setActiveResumeId(parsedData.metadata?.resumeId || null)
       setAssetsRefreshKey((value) => value + 1)
       setJustParsed(true)
+      setUploadFailure(null)
       toast.success("Your profile is ready", {
         description: "We've updated your details.",
       })
     } catch (err) {
-      const error = err as { message?: string }
-      toast.error(error.message || "Something went wrong. Please try again.")
+      const error = err as { message?: string; details?: { request_id?: string; retryable?: boolean } }
+      const message = error.message || "Something went wrong. Please try again."
+      setUploadFailure({
+        message,
+        requestId: error.details?.request_id,
+        retryable: error.details?.retryable,
+      })
+      toast.error(message)
     } finally {
       setIsUploading(false)
     }
@@ -1064,7 +1136,7 @@ function ResumeContent() {
     setIsEditing(false)
   }
   return (
-    <div className="relative flex-1 overflow-y-auto p-6 md:p-8">
+    <div className="relative min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
       <input
         ref={fileInputRef}
         type="file"
@@ -1076,14 +1148,29 @@ function ResumeContent() {
           if (file) void handleFileSelected(file)
         }}
       />
-      <ResumeAssetsManager
-        refreshKey={assetsRefreshKey}
-        onActiveResumeId={setActiveResumeId}
-        onResumeActivated={(nextResume) => {
-          setContextResumeData(nextResume)
-          setJustParsed(false)
-        }}
-      />
+      <Suspense fallback={<WorkspacePanelFallback />}>
+        <LazyResumeAssetsManager
+          refreshKey={assetsRefreshKey}
+          onActiveResumeId={setActiveResumeId}
+          onResumeActivated={(nextResume) => {
+            setContextResumeData(nextResume)
+            setJustParsed(false)
+          }}
+        />
+      </Suspense>
+      {uploadFailure && (
+        <div role="alert" className="mb-5 flex items-start justify-between gap-4 rounded-xl border border-destructive/30 bg-destructive/10 p-4 text-destructive">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold">Resume upload failed</p>
+            <p className="mt-1 text-sm leading-6">{uploadFailure.message}</p>
+            {uploadFailure.requestId && <p className="mt-2 break-all font-mono text-xs opacity-80">Request ID: {uploadFailure.requestId}</p>}
+            {uploadFailure.retryable && <p className="mt-1 text-xs opacity-80">You can retry without losing your saved profile.</p>}
+          </div>
+          <Button type="button" variant="ghost" size="icon" className="h-8 w-8 shrink-0" aria-label="Dismiss resume upload error" onClick={() => setUploadFailure(null)}>
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      )}
       {!hasData ? (
         <div
           className="relative flex min-h-[400px] cursor-pointer flex-col items-center justify-center rounded-2xl empty-state-premium p-12 transition-all duration-300 hover:opacity-90"
@@ -1109,13 +1196,10 @@ function ResumeContent() {
       ) : (
         <>
           <div className="flex flex-col gap-6 lg:flex-row">
-          <div className="flex-1 space-y-6">
+          <div className="flex-1">
             <div className="dashboard-card">
-              <div className="mb-4 flex items-center justify-between">
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <User className="h-4 w-4 text-primary" />
-                  Personal Profile
-                </h3>
+              <div className="mb-6 flex items-center justify-between">
+                <h2 className="text-lg font-semibold text-foreground">Current Resume Preview</h2>
                 <div className="flex items-center gap-2">
                   {!isEditing ? (
                     <Button variant="outline" size="sm" onClick={() => setIsEditing(true)} className="gap-1.5">
@@ -1133,7 +1217,10 @@ function ResumeContent() {
                   )}
                 </div>
               </div>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="divide-y divide-border/60">
+                <section className="pb-6">
+                  <h3 className="mb-4 text-sm font-semibold text-foreground">Personal Profile</h3>
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">Full Name</Label>
                   {isEditing ? (
@@ -1143,7 +1230,7 @@ function ResumeContent() {
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Play className="inline h-3 w-3 mr-1" />Target Role</Label>
+                  <Label className="text-xs text-muted-foreground">Target Role</Label>
                   {isEditing ? (
                     <Input value={editData.targetRole} onChange={(e) => setEditData({ ...editData, targetRole: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
@@ -1151,7 +1238,7 @@ function ResumeContent() {
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Mail className="inline h-3 w-3 mr-1" />Email</Label>
+                  <Label className="text-xs text-muted-foreground">Email</Label>
                   {isEditing ? (
                     <Input value={editData.email} onChange={(e) => setEditData({ ...editData, email: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
@@ -1159,23 +1246,20 @@ function ResumeContent() {
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Phone className="inline h-3 w-3 mr-1" />Phone</Label>
+                  <Label className="text-xs text-muted-foreground">Phone</Label>
                   {isEditing ? (
                     <Input value={editData.phone} onChange={(e) => setEditData({ ...editData, phone: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
                     <p className="text-sm text-foreground">{resumeData.phone}</p>
                   )}
                 </div>
-              </div>
-            </div>
-            <div className="dashboard-card">
-              <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-                <Globe className="h-4 w-4 text-primary" />
-                Links
-              </h3>
+                  </div>
+                </section>
+            <section className="py-6">
+              <h3 className="mb-4 text-sm font-semibold text-foreground">Links</h3>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Linkedin className="inline h-3 w-3 mr-1" />LinkedIn</Label>
+                  <Label className="text-xs text-muted-foreground">LinkedIn</Label>
                   {isEditing ? (
                     <Input value={editData.linkedin} onChange={(e) => setEditData({ ...editData, linkedin: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
@@ -1183,7 +1267,7 @@ function ResumeContent() {
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Code className="inline h-3 w-3 mr-1" />GitHub</Label>
+                  <Label className="text-xs text-muted-foreground">GitHub</Label>
                   {isEditing ? (
                     <Input value={editData.github} onChange={(e) => setEditData({ ...editData, github: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
@@ -1191,7 +1275,7 @@ function ResumeContent() {
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground"><Globe className="inline h-3 w-3 mr-1" />Portfolio</Label>
+                  <Label className="text-xs text-muted-foreground">Portfolio</Label>
                   {isEditing ? (
                     <Input value={editData.portfolio} onChange={(e) => setEditData({ ...editData, portfolio: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
@@ -1199,24 +1283,18 @@ function ResumeContent() {
                   )}
                 </div>
               </div>
-            </div>
-            <div className="dashboard-card">
-              <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-                <FileText className="h-4 w-4 text-primary" />
-                Summary / About
-              </h3>
+            </section>
+            <section className="py-6">
+              <h3 className="mb-4 text-sm font-semibold text-foreground">Summary / About</h3>
               {isEditing ? (
                 <Textarea value={editData.summary} onChange={(e) => setEditData({ ...editData, summary: e.target.value })} rows={3} className="bg-secondary/50" />
               ) : (
                 <p className="text-sm leading-relaxed text-muted-foreground">{resumeData.summary}</p>
               )}
-            </div>
-            <div className="dashboard-card">
+            </section>
+            <section className="py-6">
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <GraduationCap className="h-4 w-4 text-primary" />
-                  Education
-                </h3>
+                <h3 className="text-sm font-semibold text-foreground">Education</h3>
                 {isEditing && (
                   <Button
                     variant="ghost"
@@ -1254,13 +1332,10 @@ function ResumeContent() {
                   </div>
                 ))}
               </div>
-            </div>
-            <div className="dashboard-card">
+            </section>
+            <section className="py-6">
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Briefcase className="h-4 w-4 text-primary" />
-                  Experience
-                </h3>
+                <h3 className="text-sm font-semibold text-foreground">Experience</h3>
                 {isEditing && (
                   <Button
                     variant="ghost"
@@ -1298,13 +1373,10 @@ function ResumeContent() {
                   </div>
                 ))}
               </div>
-            </div>
-            <div className="dashboard-card" >
+            </section>
+            <section className="py-6">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Code className="h-4 w-4 text-primary" />
-                  Projects
-                </h3>
+                <h3 className="text-sm font-semibold text-foreground">Projects</h3>
                 {isEditing && (
                   <Button
                     variant="ghost"
@@ -1334,7 +1406,7 @@ function ResumeContent() {
                     </div>
                   </div>
                 )) : resumeData.projects.map((proj, i) => (
-                  <div key={i} className="sub-card rounded-lg p-4">
+                  <div key={i} className="flex flex-col gap-1">
                     <p className="text-sm font-medium text-foreground">{proj.name}</p>
                     <div className="mt-1.5 flex flex-wrap gap-1.5">
                       {proj.techStack.split(",").map((tech) => tech.trim()).filter(Boolean).map((tech) => (
@@ -1345,13 +1417,10 @@ function ResumeContent() {
                   </div>
                 ))}
               </div>
-            </div>
-            <div className="dashboard-card">
+            </section>
+            <section className="py-6">
               <div className="mb-4 flex items-center justify-between">
-                <h3 className="flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Code className="h-4 w-4 text-primary" />
-                  Technical Skills
-                </h3>
+                <h3 className="text-sm font-semibold text-foreground">Technical Skills</h3>
                 {!isEditing && (() => {
                   const allSkills = resumeData.technicalSkills.split(",").map(s => s.trim()).filter(Boolean)
                   return allSkills.length > 0 ? (
@@ -1373,13 +1442,10 @@ function ResumeContent() {
               ) : (
                 <SkillsDisplay skills={resumeData.technicalSkills} />
               )}
-            </div>
+            </section>
             <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
-              <div className="dashboard-card">
-                <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Award className="h-4 w-4 text-primary" />
-                  Certifications
-                </h3>
+              <section className="py-6 sm:pr-6">
+                <h3 className="mb-4 text-sm font-semibold text-foreground">Certifications</h3>
                 {isEditing ? (
                   <div className="flex flex-col gap-2">
                     <Textarea
@@ -1401,12 +1467,9 @@ function ResumeContent() {
                     )) : <p className="text-xs text-muted-foreground italic">None listed</p>}
                   </div>
                 )}
-              </div>
-              <div className="dashboard-card">
-                <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-foreground">
-                  <Languages className="h-4 w-4 text-primary" />
-                  Languages Known
-                </h3>
+              </section>
+              <section className="border-t border-border/60 py-6 sm:border-l sm:border-t-0 sm:pl-6">
+                <h3 className="mb-4 text-sm font-semibold text-foreground">Languages Known</h3>
                 {isEditing ? (
                   <div className="flex flex-col gap-2">
                     <Textarea
@@ -1425,8 +1488,10 @@ function ResumeContent() {
                     )) : <p className="text-xs text-muted-foreground italic">None listed</p>}
                   </div>
                 )}
-              </div>
+              </section>
             </div>
+            </div>
+          </div>
           </div>
           <div className="w-full lg:w-72 xl:w-80">
             <div className="sticky top-24 space-y-4">
@@ -1576,7 +1641,7 @@ function SettingsContent({
   ]
 
   return (
-    <div className="flex-1 overflow-y-auto p-6 md:p-8">
+    <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
       <Tabs value={settingsTab} onValueChange={(value) => setSettingsTab(value as typeof settingsTab)} className="w-full">
         <SlidingSegmentControl
           ariaLabel="Settings sections"
@@ -1601,10 +1666,7 @@ function SettingsContent({
         <TabsContent value="support">
           <div className="space-y-6">
             <div className="dashboard-card">
-              <div className="mb-1 flex items-center gap-2">
-                <Bug className="h-4 w-4 text-red-400" />
-                <h3 className="text-sm font-semibold text-foreground">Report a Bug</h3>
-              </div>
+              <h3 className="mb-1 text-sm font-semibold text-foreground">Report a Bug</h3>
               <p className="mb-5 text-xs text-muted-foreground">Found something broken? Send it into the support inbox with enough detail to reproduce it. Valid bug reports can earn a reward.</p>
               <div className="space-y-4">
                 <div className="flex flex-col gap-1.5">
@@ -1631,17 +1693,14 @@ function SettingsContent({
             </div>
 
             <div className="dashboard-card">
-              <div className="mb-1 flex items-center gap-2">
-                <MessageCircle className="h-4 w-4 text-primary" />
-                <h3 className="text-sm font-semibold text-foreground">Send Feedback</h3>
-              </div>
+              <h3 className="mb-1 text-sm font-semibold text-foreground">Send Feedback</h3>
               <p className="mb-5 text-xs text-muted-foreground">Tell us what is helping, what is weak, and what students need more of.</p>
               <div className="space-y-4">
                 <div className="flex flex-col gap-1.5">
                   <Label className="text-xs text-muted-foreground">How would you rate your experience?</Label>
                   <div className="flex gap-1">
                     {[1, 2, 3, 4, 5].map((n) => (
-                      <button key={n} type="button" onClick={() => setFeedbackRating(n)}
+                      <button key={n} type="button" onClick={() => setFeedbackRating(n)} aria-label={`Rate ${n} out of 5`} aria-pressed={feedbackRating === n}
                         className={`group flex h-10 w-10 items-center justify-center rounded-lg border transition-all ${feedbackRating >= n ? "border-primary/40 bg-primary/10" : "border-border/40 bg-secondary/20 hover:bg-primary/10 hover:border-primary/30"}`}>
                         <Star className={`h-4 w-4 transition-colors ${feedbackRating >= n ? "fill-primary text-primary" : "text-muted-foreground group-hover:text-primary"}`} />
                       </button>
@@ -1678,10 +1737,14 @@ function MembershipContent() {
   const router = useRouter()
   const [billing, setBilling] = useState<"monthly" | "annual">("monthly")
   const [plans, setPlans] = useState<any[]>([])
+  const [checkoutReady, setCheckoutReady] = useState(true)
   const isAnnual = billing === "annual"
   useEffect(() => {
     fetchPaymentPlans()
-      .then((data) => setPlans(Array.isArray(data) ? data : data.plans || []))
+      .then((data) => {
+        setPlans(Array.isArray(data) ? data : data.plans || [])
+        setCheckoutReady(Array.isArray(data) ? true : data.checkout_ready !== false)
+      })
       .catch(() => setPlans([]))
   }, [])
   const planByType = Object.fromEntries(plans.map((plan) => [plan.plan_type, plan]))
@@ -1708,23 +1771,32 @@ function MembershipContent() {
       "Custom Mock Interview (JD-Based)",
       "Personalised Performance Reports",
     ]).map((feature: any) => typeof feature === "string" ? { text: feature, included: true } : feature),
-    { text: "Custom Technical Interview (JD-Based)", included: false, upgradeText: "Premium" },
+    { text: "Custom Technical Round (JD-Based)", included: false, upgradeText: "Premium" },
   ]
 
   const premiumFeatures: FeatureItem[] = (planByType.premium?.features || [
     "5 AI Mock Interviews per week",
     "3 Technical Assessments per week",
     "Custom Mock Interview (JD-Based)",
-    "Custom Technical Interview (JD-Based)",
+    "Custom Technical Round (JD-Based)",
   ]).map((feature: any) => typeof feature === "string" ? { text: feature, included: true } : feature)
 
   const proPricing = { monthly: planByType.pro?.amount || 999, annual: Math.round((planByType.pro_annual?.amount || 9588) / 12), annualBilled: planByType.pro_annual?.amount || 9588 }
   const premiumPricing = { monthly: planByType.premium?.amount || 1499, annual: Math.round((planByType.premium_annual?.amount || 14388) / 12), annualBilled: planByType.premium_annual?.amount || 14388 }
 
   const fmt = (n: number) => `₹${n.toLocaleString("en-IN")}`
+  const selectedProType = isAnnual ? "pro_annual" : "pro"
+  const selectedPremiumType = isAnnual ? "premium_annual" : "premium"
+  const purchaseLabel = (planType: string, upgradeLabel: string) => {
+    const state = planByType[planType]?.purchase_state
+    if (state === "current") return "Current plan"
+    if (state === "unavailable") return "Available after current term"
+    return checkoutReady ? upgradeLabel : "Checkout unavailable"
+  }
+  const canPurchase = (planType: string) => checkoutReady && planByType[planType]?.purchase_state === "upgrade"
 
   return (
-    <div className="flex-1 overflow-y-auto p-6 md:p-8">
+    <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
       <div className="mb-6 rounded-xl card-elevated p-7">
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
@@ -1734,7 +1806,7 @@ function MembershipContent() {
               Free gives you one AI mock interview per week. Upgrade when you need technical assessments, custom JD-based rounds, and higher weekly limits.
             </p>
             <p className="mt-3 text-sm font-medium text-primary">
-              Early Bird: register by 30 July 2026 to get Premium free for 1 month.
+              Early Bird: register by 30 July 2026 to get Premium free for 30 days.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs font-medium text-muted-foreground">
@@ -1795,8 +1867,8 @@ function MembershipContent() {
               </div>
             ))}
           </div>
-          <Button className="mt-6 w-full rounded-lg" variant="outline" onClick={() => router.push("/?tab=interview")}>
-            Use Free
+          <Button className="mt-6 w-full rounded-lg" variant="outline" disabled={planByType.starter?.purchase_state !== "current"} onClick={() => router.push("/?tab=interview")}>
+            {planByType.starter?.purchase_state === "current" ? "Current plan" : "Available after current term"}
           </Button>
         </div>
 
@@ -1850,8 +1922,8 @@ function MembershipContent() {
               </div>
             ))}
           </div>
-          <Button className="mt-6 w-full rounded-lg" variant="default" onClick={() => router.push(`/checkout?plan=${isAnnual ? "pro_annual" : "pro"}`)}>
-            Get Pro
+          <Button className="mt-6 w-full rounded-lg" variant="default" disabled={!canPurchase(selectedProType)} onClick={() => router.push(`/checkout?plan=${selectedProType}`)}>
+            {purchaseLabel(selectedProType, "Upgrade to Pro")}
           </Button>
         </div>
 
@@ -1886,7 +1958,7 @@ function MembershipContent() {
           </div>
           <p className="mb-5 text-sm text-muted-foreground">The ultimate solution with custom rounds for elite preparation.</p>
           <div className="mb-5 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-primary">
-            Register by 30 July 2026 and your first Premium month is free.
+            Register by 30 July 2026 and your first 30 days of Premium are free.
           </div>
           <div className="flex-1 space-y-2.5">
             {premiumFeatures.map((f) => (
@@ -1908,8 +1980,8 @@ function MembershipContent() {
               </div>
             ))}
           </div>
-          <Button className="mt-6 w-full rounded-lg" variant="default" onClick={() => router.push(`/checkout?plan=${isAnnual ? "premium_annual" : "premium"}`)}>
-            Get Premium
+          <Button className="mt-6 w-full rounded-lg" variant="default" disabled={!canPurchase(selectedPremiumType)} onClick={() => router.push(`/checkout?plan=${selectedPremiumType}`)}>
+            {purchaseLabel(selectedPremiumType, "Upgrade to Premium")}
           </Button>
         </div>
       </div>
@@ -2050,7 +2122,8 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
   useEffect(() => {
     if (typeof window === "undefined") return
     if (activeNav !== "improve") {
-      window.history.replaceState({}, "", `/?tab=${activeNav}`)
+      const publicTab = activeNav === "coding" ? "technical" : activeNav
+      window.history.replaceState({}, "", `/?tab=${publicTab}`)
       return
     }
     if (!improveTarget) {
@@ -2137,11 +2210,14 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               date: act.created_at ? new Date(act.created_at).toLocaleDateString() : "Not recorded",
               role: act.subtitle || act.job_title || act.title || "General",
               type: act.type ? String(act.type).replace(/_/g, " ") : act.interview_type === "mock" ? "Full" : "Quick",
-              score: act.score == null && act.overall_score == null ? null : Math.round(act.score ?? act.overall_score),
+              score: act.score == null && act.overall_score == null
+                ? null
+                : Math.round(Number(act.score ?? act.overall_score)),
               status: act.status,
               cta: act.cta,
-              duration: act.duration_seconds || null,
+              duration: act.duration_seconds ?? 0,
               created_at: act.created_at || null,
+              job_target: act.job_target || null,
             }))
           )
         }
@@ -2173,11 +2249,14 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
             date: act.created_at ? new Date(act.created_at).toLocaleDateString() : "Not recorded",
             role: act.subtitle || act.job_title || act.title || "General",
             type: act.type ? String(act.type).replace(/_/g, " ") : act.interview_type === "mock" ? "Full" : "Quick",
-            score: act.score == null && act.overall_score == null ? null : Math.round(act.score ?? act.overall_score),
+            score: act.score == null && act.overall_score == null
+              ? null
+              : Math.round(Number(act.score ?? act.overall_score)),
             status: act.status,
             cta: act.cta,
-            duration: act.duration_seconds || null,
+            duration: act.duration_seconds ?? 0,
             created_at: act.created_at || null,
+            job_target: act.job_target || null,
           }))
 
           // Check if any generating interview changed to something else
@@ -2220,25 +2299,12 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
       default: return "Interview Round"
     }
   }
-  const backgroundMode = getDashboardBackgroundMode(user?.plan_type)
-  const isPaidPlan = backgroundMode === "comets"
-  const hasSpaceEffects = theme === "dark" && isPaidPlan
-
-  useEffect(() => {
-    if (hasSpaceEffects) {
-      document.documentElement.classList.add("premium-theme")
-    } else {
-      document.documentElement.classList.remove("premium-theme")
-    }
-    return () => {
-      document.documentElement.classList.remove("premium-theme")
-    }
-  }, [hasSpaceEffects])
+  const isPaidPlan = isPaidPlanType(user?.plan_type)
 
   return (
     <>
-      <PremiumBackground theme={theme} mode={backgroundMode} />
-      <div className={`relative z-10 flex min-h-screen bg-transparent text-foreground ${hasSpaceEffects ? "premium-theme" : ""}`}>
+      <PremiumBackground theme={theme} mode="base" />
+      <div className="relative z-10 flex min-h-screen bg-transparent text-foreground">
         {/* Desktop Sidebar Spacer/Placeholder to prevent main content layout shifts */}
         <div className={`hidden md:block shrink-0 transition-all duration-300 ease-in-out ${sidebarCollapsed ? "w-[68px]" : "w-56"}`} />
 
@@ -2433,8 +2499,8 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
             </div>
           </div>
         </aside>
-        <main className="flex flex-1 flex-col bg-transparent">
-          <header className="flex h-16 items-center justify-between bg-card/40 backdrop-blur-xl px-4 md:px-8 shadow-[0_1px_12px_-2px_rgba(0,0,0,0.15)]">
+        <main className="flex min-w-0 flex-1 flex-col bg-transparent">
+          <header className="flex h-16 min-w-0 items-center justify-between bg-card/40 px-4 shadow-[0_1px_12px_-2px_rgba(0,0,0,0.15)] backdrop-blur-xl md:px-8">
             <div className="flex items-center gap-3">
               <Button
                 variant="ghost"
@@ -2482,18 +2548,20 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               switch (activeNav) {
                 case "improve":
                   return (
-                    <MissionImproveContent
-                      learning={learning}
-                      loading={learningLoading}
-                      error={learningError}
-                      setActiveNav={setActiveNav}
-                      onLearningRefresh={refreshLearning}
-                      isPremium={isPaidPlan}
-                      navigationTarget={improveTarget}
-                      onNavigationConsumed={() => {
-                        setImproveTarget(null)
-                      }}
-                    />
+                    <Suspense fallback={<WorkspacePanelFallback />}>
+                      <LazyMissionImproveContent
+                        learning={learning}
+                        loading={learningLoading}
+                        error={learningError}
+                        setActiveNav={setActiveNav}
+                        onLearningRefresh={refreshLearning}
+                        isPremium={isPaidPlan}
+                        navigationTarget={improveTarget}
+                        onNavigationConsumed={() => {
+                          setImproveTarget(null)
+                        }}
+                      />
+                    </Suspense>
                   )
                 case "interview":
                 case "coding":
@@ -2503,12 +2571,17 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                       setActiveNav={setActiveNav}
                       mode={activeNav === "coding" ? "technical" : "interview"}
                       user={user}
+                      onProfilesChanged={() => setRefreshTrigger((value) => value + 1)}
                     />
                   )
                 case "resume":
                   return <ResumeContent />
                 case "performance":
-                  return <PerformanceContent onOpenPractice={(tab) => setActiveNav(tab)} />
+                  return (
+                    <Suspense fallback={<WorkspacePanelFallback />}>
+                      <LazyPerformanceContent onOpenPractice={(tab) => setActiveNav(tab)} />
+                    </Suspense>
+                  )
                 case "membership":
                   return <MembershipContent />
                 case "settings":

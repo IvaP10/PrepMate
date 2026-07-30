@@ -55,6 +55,7 @@ class Settings:
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    REDIS_URL: str = os.getenv("REDIS_URL", "")
     REDIS_MAX_CONNECTIONS: int = int(os.getenv("REDIS_MAX_CONNECTIONS", "20"))
 
     DB_POOL_MIN: int = int(os.getenv("DB_POOL_MIN", "2"))
@@ -152,6 +153,12 @@ class Settings:
     WORKER_HEARTBEAT_MAX_AGE_SECONDS: int = int(
         os.getenv("WORKER_HEARTBEAT_MAX_AGE_SECONDS", "45")
     )
+    DEVELOPMENT_AUTO_WORKER: bool = os.getenv(
+        "DEVELOPMENT_AUTO_WORKER", "true"
+    ).lower() == "true"
+    DEVELOPMENT_AUTO_RELOAD: bool = os.getenv(
+        "DEVELOPMENT_AUTO_RELOAD", "false"
+    ).lower() == "true"
 
     TRIGGER_DEV_API_KEY: str = os.getenv("TRIGGER_DEV_API_KEY", "")
     TRIGGER_DEV_API_URL: str = os.getenv("TRIGGER_DEV_API_URL", "")
@@ -248,6 +255,14 @@ class Settings:
             if value:
                 cls._require_https(field, value)
 
+        if cls.ENVIRONMENT == "production":
+            local_origins = [origin for origin in origins if cls._is_local_url(origin)]
+            if local_origins:
+                raise RuntimeError("ALLOWED_ORIGINS cannot use localhost in production")
+            for field in ("APP_BASE_URL", "API_BASE_URL"):
+                if cls._is_local_url(getattr(cls, field)):
+                    raise RuntimeError(f"{field} cannot use localhost in production")
+
         if cls.ENVIRONMENT == "production" and not cls._is_private_service_url(cls.PISTON_API_URL):
             raise RuntimeError(
                 "PISTON_API_URL must point to the private isolated execution service"
@@ -291,6 +306,11 @@ class Settings:
             logger.warning("GOOGLE_CLIENT_ID not set - Google OAuth will be disabled")
 
         if not cls.SMTP_EMAIL or not cls.SMTP_PASSWORD:
+            if cls.ENVIRONMENT == "production":
+                raise RuntimeError(
+                    "SMTP_EMAIL and SMTP_PASSWORD must be set in production "
+                    "because email signup requires verification"
+                )
             logger.warning("SMTP credentials not set - email verification will not work")
 
         if cls.MODEL_DEFAULT_POLICY != "openai_required":

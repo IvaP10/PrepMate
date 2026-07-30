@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react"
 import { useRouter } from "next/navigation"
-import { AlertCircle, Loader2, ShieldAlert } from "lucide-react"
+import { AlertCircle, Loader2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
@@ -121,10 +121,7 @@ export default function AdminBugsPage() {
         </div>
 
         <div className="flex flex-col gap-3 rounded-2xl border border-border bg-card p-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
-            <ShieldAlert className="h-5 w-5 text-primary" />
-            <p className="text-sm text-muted-foreground">Access is controlled by the `is_admin` flag in `UserInfo`.</p>
-          </div>
+          <p className="text-sm text-muted-foreground">Access is controlled by the `is_admin` flag in `UserInfo`.</p>
           <div className="flex items-center gap-3">
             <Select
               value={selectedStatus}

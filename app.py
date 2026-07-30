@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import ipaddress
 from urllib.parse import urlparse
 import uvicorn
@@ -48,6 +48,9 @@ import logging
 import asyncio
 import httpx
 import threading
+import sys
+from pathlib import Path
+from typing import Any, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response as StarletteResponse
 
@@ -58,7 +61,11 @@ from redis_client import init_redis_client, close_redis
 from auth import CSRF_COOKIE_NAME, COOKIE_NAME, get_current_user, router as auth_router
 from user_profile import router as profile_router
 from workspace_api import router as workspace_router
-from payment import router as payment_router
+from payment import (
+    _razorpay_checkout_ready,
+    _razorpay_missing_config,
+    router as payment_router,
+)
 from interview import router as interview_router
 from blueprint_api import router as blueprint_router
 from pre_interview import router as pre_interview_router
@@ -87,9 +94,21 @@ async def periodic_connection_cleanup(ws_mgr: ConnectionManager) -> None:
         except Exception as e:
             logger.error("Error in periodic connection cleanup: %s", str(e))
 
+
+async def warm_interview_speech() -> None:
+    try:
+        await asyncio.wait_for(
+            prewarm_speech_pipeline(),
+            timeout=max(10, settings.KOKORO_PREWARM_TIMEOUT_SECONDS),
+        )
+    except asyncio.TimeoutError:
+        logger.error("Interview speech warmup timed out; text fallback remains available")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
 
+    development_worker_process = None
     init_connection_pool()
     if settings.ENVIRONMENT in {"development", "test"}:
         ensure_runtime_schema()
@@ -98,6 +117,15 @@ async def lifespan(app: FastAPI):
         verify_schema_migrations()
     init_redis_client()
     _background_tasks.clear()
+
+    if settings.ENVIRONMENT == "development" and settings.DEVELOPMENT_AUTO_WORKER:
+        worker_path = Path(__file__).resolve().with_name("worker.py")
+        development_worker_process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(worker_path),
+            cwd=str(worker_path.parent),
+        )
+        logger.info("Development durable worker process started")
 
     task = asyncio.create_task(check_expired_subscriptions())
     _background_tasks.append(task)
@@ -116,20 +144,25 @@ async def lifespan(app: FastAPI):
     logger.info("Background stale interview cleaner started")
 
     if settings.ENVIRONMENT != "test":
-        logger.info("Warming interview speech before accepting sessions")
-        try:
-            await asyncio.wait_for(
-                prewarm_speech_pipeline(),
-                timeout=max(10, settings.KOKORO_PREWARM_TIMEOUT_SECONDS),
-            )
-        except asyncio.TimeoutError:
-            logger.error("Interview speech warmup timed out; text fallback remains available")
+        speech_warmup_task = asyncio.create_task(
+            warm_interview_speech(),
+            name="interview-speech-warmup",
+        )
+        _background_tasks.append(speech_warmup_task)
+        logger.info("Interview speech warmup started in the background")
 
     logger.info("Application started successfully")
 
     try:
         yield
     finally:
+        if development_worker_process and development_worker_process.returncode is None:
+            development_worker_process.terminate()
+            try:
+                await asyncio.wait_for(development_worker_process.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                development_worker_process.kill()
+                await development_worker_process.wait()
         for task in _background_tasks:
             task.cancel()
             try:
@@ -349,14 +382,24 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    public_errors = [
+        {
+            "type": str(error.get("type") or "validation_error"),
+            "loc": [str(value) for value in (error.get("loc") or [])],
+            "msg": str(error.get("msg") or "Invalid request"),
+        }
+        for error in exc.errors()
+    ]
+    detail = public_errors[0]["msg"] if public_errors else "Request validation failed"
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "detail": exc.errors(),
+            "detail": detail,
+            "errors": public_errors,
             "request_id": _request_id(request),
             "error": {
                 "code": "validation_error",
-                "message": "Request validation failed",
+                "message": detail,
                 "retryable": False,
             },
         },
@@ -425,7 +468,7 @@ def _worker_and_job_check() -> dict:
         cursor.execute(
             """
             SELECT worker_type,
-                   ROUND(EXTRACT(EPOCH FROM (NOW() - MAX(heartbeat_at)))::numeric, 3)
+                   ROUND(EXTRACT(EPOCH FROM (clock_timestamp() - MAX(heartbeat_at)))::numeric, 3)
             FROM WorkerHeartbeats
             WHERE worker_type IN ('analysis', 'technical')
             GROUP BY worker_type
@@ -482,8 +525,12 @@ def _worker_and_job_check() -> dict:
 
     workers = {
         worker_type: {
-            "healthy": worker_type in ages and 0 <= ages[worker_type] <= max_age,
-            "heartbeat_age_seconds": ages.get(worker_type),
+            # PostgreSQL NOW() is fixed at transaction start. A heartbeat
+            # committed after that point can therefore appear fractionally in
+            # the future on a reused pooled connection. Treat that harmless
+            # race as age zero instead of failing the public preflight.
+            "healthy": worker_type in ages and ages[worker_type] <= max_age,
+            "heartbeat_age_seconds": max(0.0, ages[worker_type]) if worker_type in ages else None,
             "max_age_seconds": max_age,
         }
         for worker_type in ("analysis", "technical")
@@ -508,8 +555,18 @@ def _worker_and_job_check() -> dict:
 
 
 _OPENAI_PROBE_TTL_SECONDS = 60.0
+_OPENAI_PROBE_FAILURE_TTL_SECONDS = 5.0
 _openai_probe_cache: dict = {"checked_at": 0.0, "result": None}
 _openai_probe_lock = threading.Lock()
+_SANDBOX_PROBE_TTL_SECONDS = 30.0
+_sandbox_probe_cache: dict = {"checked_at": 0.0, "key": None, "result": None}
+
+
+def _openai_probe_cache_fresh(cached: Optional[dict], checked_at: Any, now: float) -> bool:
+    if not cached:
+        return False
+    ttl = _OPENAI_PROBE_TTL_SECONDS if cached.get("healthy") else _OPENAI_PROBE_FAILURE_TTL_SECONDS
+    return now - float(checked_at or 0) < ttl
 
 
 def _openai_configuration_check() -> dict:
@@ -528,13 +585,13 @@ def _openai_configuration_check() -> dict:
 
     now = time.monotonic()
     cached = _openai_probe_cache.get("result")
-    if cached and now - float(_openai_probe_cache.get("checked_at") or 0) < _OPENAI_PROBE_TTL_SECONDS:
+    if _openai_probe_cache_fresh(cached, _openai_probe_cache.get("checked_at"), now):
         return {**base, **cached, "cached": True}
 
     with _openai_probe_lock:
         now = time.monotonic()
         cached = _openai_probe_cache.get("result")
-        if cached and now - float(_openai_probe_cache.get("checked_at") or 0) < _OPENAI_PROBE_TTL_SECONDS:
+        if _openai_probe_cache_fresh(cached, _openai_probe_cache.get("checked_at"), now):
             return {**base, **cached, "cached": True}
         try:
             response = httpx.get(
@@ -585,15 +642,46 @@ async def _sandbox_executor_check() -> dict:
             "missing_runtimes": sorted(expected),
         }
 
-    timeout = min(3.0, max(0.5, float(settings.PISTON_TIMEOUT_SECONDS)))
+    cache_key = (
+        base_url,
+        tuple(sorted(expected)),
+        settings.ENVIRONMENT,
+        settings.PISTON_API_TOKEN,
+    )
+    now = time.monotonic()
+    cached = _sandbox_probe_cache.get("result")
+    if (
+        cached
+        and _sandbox_probe_cache.get("key") == cache_key
+        and now - float(_sandbox_probe_cache.get("checked_at") or 0) < _SANDBOX_PROBE_TTL_SECONDS
+    ):
+        return {**cached, "cached": True}
+
+    # A real probe includes isolated-container startup. Keep it bounded, but do
+    # not use the normal request timeout: cold gVisor/Docker starts can exceed
+    # three seconds even when the executor is healthy.
+    timeout = min(7.0, max(1.0, float(settings.PISTON_TIMEOUT_SECONDS)))
     headers = (
         {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"}
         if settings.PISTON_API_TOKEN else {}
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
+        health_response = await client.get(
+            f"{base_url.removesuffix('/api/v2')}/health",
+            headers=headers,
+        )
+        health_response.raise_for_status()
+        health_payload = health_response.json()
         response = await client.get(f"{base_url}/runtimes", headers=headers)
         response.raise_for_status()
         payload = response.json()
+    if not isinstance(health_payload, dict) or not health_payload.get("ready"):
+        raise RuntimeError("sandbox_health_contract_invalid")
+    oci_runtime = str(health_payload.get("oci_runtime") or "").strip().lower()
+    secure_runtime = (
+        oci_runtime == "runsc"
+        and bool(health_payload.get("oci_runtime_available"))
+    )
     if not isinstance(payload, list):
         raise RuntimeError("sandbox_runtime_contract_invalid")
     available = set()
@@ -607,21 +695,68 @@ async def _sandbox_executor_check() -> dict:
             if str(alias).strip()
         )
     missing = sorted(expected - available)
-    return {
-        "healthy": private and not missing,
+    execution_probe = False
+    if not missing:
+        async with httpx.AsyncClient(timeout=timeout) as probe_client:
+            probe_response = await probe_client.post(
+                f"{base_url}/execute",
+                headers=headers,
+                json={
+                    "language": "python",
+                    "version": "3.12",
+                    "files": [{"name": "main.py", "content": "print('interai-ready')"}],
+                    "stdin": "",
+                    "run_timeout": 1_000,
+                    "compile_timeout": 1_000,
+                },
+            )
+        probe_response.raise_for_status()
+        probe_payload = probe_response.json()
+        execution_probe = (
+            isinstance(probe_payload, dict)
+            and str((probe_payload.get("run") or {}).get("stdout") or "").strip() == "interai-ready"
+            and int((probe_payload.get("run") or {}).get("code") or 0) == 0
+        )
+    result = {
+        "healthy": (
+            private
+            and not missing
+            and execution_probe
+            and (settings.ENVIRONMENT != "production" or secure_runtime)
+        ),
         "private": private,
+        "oci_runtime": oci_runtime or None,
+        "secure_runtime": secure_runtime,
         "available_runtimes": sorted(runtime for runtime in available if runtime),
         "missing_runtimes": missing,
+        "execution_probe": execution_probe,
     }
+    _sandbox_probe_cache.update({
+        "checked_at": time.monotonic(),
+        "key": cache_key,
+        "result": result,
+    })
+    return {**result, "cached": False}
 
 
 async def _safe_readiness_check(name: str, awaitable) -> tuple[str, dict]:
     try:
-        result = await asyncio.wait_for(awaitable, timeout=3.5)
+        timeout = 8.0 if name == "sandbox_executor" else 3.5
+        result = await asyncio.wait_for(awaitable, timeout=timeout)
         return name, result
     except Exception as exc:
         logger.warning("Readiness check failed: %s (%s)", name, type(exc).__name__)
         return name, {"healthy": False, "error": f"{name}_unavailable"}
+
+
+def _payment_configuration_check() -> dict:
+    missing = _razorpay_missing_config()
+    return {
+        "healthy": _razorpay_checkout_ready(),
+        "provider": "razorpay",
+        "missing": missing,
+        "error": None if not missing else "payment_configuration_incomplete",
+    }
 
 
 async def collect_readiness() -> dict:
@@ -631,6 +766,7 @@ async def collect_readiness() -> dict:
         _safe_readiness_check("workers_jobs", asyncio.to_thread(_worker_and_job_check)),
         _safe_readiness_check("openai", asyncio.to_thread(_openai_configuration_check)),
         _safe_readiness_check("sandbox_executor", _sandbox_executor_check()),
+        _safe_readiness_check("payments", asyncio.to_thread(_payment_configuration_check)),
     ))
     ready = all(bool(check.get("healthy")) for check in checks.values())
     return {
@@ -646,6 +782,14 @@ def _flow_readiness_payload(flow: str, checks: dict) -> dict:
         flow,
         checks,
         recovery_grace_seconds=settings.SESSION_RECOVERY_GRACE_SECONDS,
+    )
+
+
+def _development_auto_reload_enabled() -> bool:
+    """Avoid recursive repository polling unless local reload is requested."""
+    return (
+        settings.ENVIRONMENT == "development"
+        and settings.DEVELOPMENT_AUTO_RELOAD
     )
 
 
@@ -724,21 +868,23 @@ async def persist_flow_preflight(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Browser preflight requirements are incomplete")
 
     preflight_id = str(uuid.uuid4())
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
         cursor.execute(
-            "SELECT interview_type, status, expires_at FROM InterviewBlueprints WHERE blueprint_id = %s AND user_id = %s",
+            """
+            SELECT interview_type, status, expires_at,
+                   (expires_at IS NULL OR expires_at > NOW()) AS is_unexpired
+            FROM InterviewBlueprints
+            WHERE blueprint_id = %s AND user_id = %s
+            """,
             (request.blueprint_id, current_user["user_id"]),
         )
         blueprint = cursor.fetchone()
         if not blueprint:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview blueprint not found")
         blueprint_flow = "technical" if "technical" in str(blueprint[0] or "").lower() else "interview"
-        blueprint_expiry = blueprint[2]
-        expiry_now = datetime.now(timezone.utc) if getattr(blueprint_expiry, "tzinfo", None) else datetime.now()
-        if str(blueprint[1] or "").lower() != "ready" or (blueprint_expiry and blueprint_expiry <= expiry_now):
+        if str(blueprint[1] or "").lower() != "ready" or not bool(blueprint[3]):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interview blueprint is not ready")
         if blueprint_flow != request.flow:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight flow does not match the blueprint")
@@ -750,7 +896,8 @@ async def persist_flow_preflight(
                 microphone_ready, microphone_level_detected, screen_share_ready,
                 network_ready, backend_ready, openai_ready, sandbox_ready,
                 worker_ready, error_codes, created_at, expires_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, NOW(), %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, NOW(), NOW() + INTERVAL '5 minutes')
+            RETURNING expires_at
             """,
             (
                 preflight_id, current_user["user_id"], request.blueprint_id, request.flow,
@@ -759,9 +906,10 @@ async def persist_flow_preflight(
                 bool(selected.get("openai", {}).get("healthy")),
                 bool(selected.get("sandbox_executor", {}).get("healthy")),
                 bool(selected.get("workers", {}).get("healthy")),
-                json.dumps(request.error_codes), expires_at,
+                json.dumps(request.error_codes),
             ),
         )
+        expires_at = cursor.fetchone()[0]
         connection.commit()
     except Exception:
         connection.rollback()
@@ -804,8 +952,9 @@ async def public_status():
             "database_migrations": "operational" if checks["database_migrations"]["healthy"] else "degraded",
             "redis": "operational" if checks["redis"]["healthy"] else "degraded",
             "workers": "operational" if checks["workers_jobs"]["healthy"] else "degraded",
-            "llm_router": "configured" if checks["openai"]["healthy"] else "degraded",
+            "llm_router": "operational" if checks["openai"]["healthy"] else "degraded",
             "code_runner": "operational" if checks["sandbox_executor"]["healthy"] else "degraded",
+            "payments": "operational" if checks["payments"]["healthy"] else "degraded",
         },
     }
 
@@ -822,6 +971,7 @@ if __name__ == "__main__":
         "app:app",
         host="0.0.0.0",
         port=settings.PORT,
-        reload=settings.ENVIRONMENT == "development",
+        reload=_development_auto_reload_enabled(),
+        reload_delay=1.0,
         log_level="info",
     )

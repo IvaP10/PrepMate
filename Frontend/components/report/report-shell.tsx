@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState } from "react"
 import Link from "next/link"
-import { ArrowLeft, Printer, Calendar, Clock, Briefcase, FileText, CheckCircle2 } from "lucide-react"
+import { ArrowLeft, Printer } from "lucide-react"
 import { ThemeLogo } from "@/components/theme-logo"
 
 export interface ReportSectionMeta {
@@ -32,7 +32,7 @@ export function ReportShell({
   children,
 }: ReportShellProps) {
   const [activeSection, setActiveSection] = useState<string>("")
-  const backHref = reportType === "technical" ? "/?tab=coding" : "/?tab=interview"
+  const backHref = reportType === "technical" ? "/?tab=technical" : "/?tab=interview"
   const backLabel = reportType === "technical" ? "Back to Coding" : "Back to Interview"
 
   useEffect(() => {
@@ -88,7 +88,7 @@ export function ReportShell({
               className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
             >
               <Printer className="h-4 w-4" />
-              Download PDF
+              Print / Save PDF
             </button>
             <Link
               href={backHref}
@@ -128,40 +128,28 @@ export function ReportShell({
         {/* Content Column */}
         <article className="max-w-3xl report-prose space-y-12">
           {/* Metadata Block */}
-          <div className="report-metadata pb-8 border-b border-border">
+          <div className="pb-8 border-b border-border">
             <h1 className="text-4xl font-semibold tracking-tight text-foreground sm:text-5xl leading-none">
               {title}
             </h1>
 
-            <div className="mt-6 flex flex-wrap items-center gap-y-2 gap-x-4 text-sm text-muted-foreground">
-              <span className="inline-flex items-center gap-1.5">
-                <Calendar className="h-4 w-4" />
-                {metadata.date}
-              </span>
+            <div className="report-metadata mt-6 flex flex-wrap items-center gap-y-2 gap-x-4 text-sm text-muted-foreground">
+              <span>{metadata.date}</span>
               {metadata.duration && (
                 <>
                   <span className="sep" />
-                  <span className="inline-flex items-center gap-1.5">
-                    <Clock className="h-4 w-4" />
-                    {metadata.duration}
-                  </span>
+                  <span>{metadata.duration}</span>
                 </>
               )}
               {metadata.role && (
                 <>
                   <span className="sep" />
-                  <span className="inline-flex items-center gap-1.5">
-                    <Briefcase className="h-4 w-4" />
-                    {metadata.role}
-                  </span>
+                  <span>{metadata.role}</span>
                 </>
               )}
               <>
                 <span className="sep" />
-                <span className="inline-flex items-center gap-1.5">
-                  <FileText className="h-4 w-4" />
-                  {metadata.itemCountLabel}
-                </span>
+                <span>{metadata.itemCountLabel}</span>
               </>
             </div>
 
@@ -169,7 +157,7 @@ export function ReportShell({
               <div className="mt-6 flex items-center gap-3">
                 <div className="report-score-badge">
                   <span className="score">{Math.round(metadata.overallScore)}%</span>
-                  <span className="label">Overall Score</span>
+                  <span className="label ml-2">Overall Score</span>
                 </div>
               </div>
             )}

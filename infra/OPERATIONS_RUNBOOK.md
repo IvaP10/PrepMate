@@ -4,18 +4,22 @@ Every command in this runbook is a gate. Store its timestamped JSON/text output 
 
 ## Pre-deploy
 
-1. Render deployment configuration using production secrets without printing them:
+1. Run `git fetch --prune` and `python scripts/release_source_guard.py`; require
+   a clean commit synchronized with the deployment branch upstream.
+2. Render deployment configuration using production secrets without printing them:
    `docker compose --env-file key.env config --quiet`.
-2. Run backend tests, evaluation gates, frontend unit/browser tests, lint and build.
-3. Prove the current migration can downgrade one revision and upgrade to head on a disposable database.
-4. Run `python scripts/openai_canary.py`; require `ok=true`, `store=false`, and cost below the configured cap.
-5. On the dedicated Linux gVisor executor, run `python scripts/verify_sandbox.py`. Every line must be `PASS`.
+3. Run backend tests, evaluation gates, frontend unit/browser tests, lint and build.
+4. Prove the current migration can downgrade one revision and upgrade to head on a disposable database.
+5. Run `python scripts/openai_canary.py --env-file key.env`; require
+   `ok=true`, `store=false`, and cost below the configured cap. On managed
+   services where the environment is already injected, omit `--env-file`.
+6. On the dedicated Linux gVisor executor, run `python scripts/verify_sandbox.py`. Every line must be `PASS`.
 
 ## Backup and restore
 
 - The backup container writes AES-256-GCM authenticated `.dump.enc` files and checksum manifests. Its health check fails when the latest backup is older than 26 hours or corrupt.
 - Weekly, copy one encrypted backup to the isolated drill host and run:
-  `python scripts/restore_drill.py /backups/FILE.dump.enc --target-db interai_restore_drill --expected-revision 015_improve_graph_invariants`.
+  `python scripts/restore_drill.py /backups/FILE.dump.enc --target-db interai_restore_drill --expected-revision 020_resume_version_detach`.
 - A restore passes only when authentication, `pg_restore`, Alembic revision and all four core tables validate. The drill database is deleted automatically.
 
 ## Canary and rollback

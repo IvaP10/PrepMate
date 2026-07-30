@@ -7,6 +7,7 @@ const requireAuth = process.env.E2E_REQUIRE_AUTH === "true"
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: false,
+  workers: requireAuth ? 1 : undefined,
   retries: process.env.CI ? 2 : 0,
   reporter: process.env.CI ? [["line"], ["html", { open: "never" }]] : "line",
   globalSetup: "./e2e/global-setup.ts",

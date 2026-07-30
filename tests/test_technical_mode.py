@@ -35,6 +35,39 @@ def _valid_problem(title="Pair Sum"):
 
 
 class TechnicalModePureTests(unittest.TestCase):
+    def test_noncoding_questions_sound_spoken_instead_of_exposing_the_rubric(self):
+        context = {
+            "job_title": "Backend Engineer",
+            "technical_topics": ["API reliability"],
+            "profile_type": "top_tier",
+        }
+
+        for round_type in ("technical_concept", "system_design", "ml", "backend", "database", "os", "network", "oop"):
+            question = technical_mode._noncoding_authored_spec(round_type, context)["statement"]
+            self.assertTrue(question.endswith("?"))
+            self.assertEqual(question.count("?"), 1)
+            self.assertLessEqual(len(question.split()), 18)
+            self.assertNotIn("Cover ", question)
+            self.assertNotIn("Assume ", question)
+            self.assertNotIn("Walk through", question)
+
+    def test_noncoding_followup_targets_one_missing_point(self):
+        decision = technical_mode._technical_response_decision(
+            {
+                "overall_score": 60,
+                "evidence": {"missed_points": ["backend:failures"]},
+            },
+            [{"point_id": "backend:failures", "label": "failure modes and mitigations"}],
+            phase="initial",
+        )
+
+        self.assertEqual(decision["action"], "targeted_followup")
+        self.assertEqual(
+            decision["followup_prompt"],
+            "How would your design recover from its most likely failure?",
+        )
+        self.assertNotIn("Go one level deeper", decision["followup_prompt"])
+
     def test_execution_poll_contract_never_exposes_hidden_case_details(self):
         row = (
             "job-hidden", "round-1", "submit", "full", "python", "completed",
@@ -509,6 +542,30 @@ class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         piston.assert_awaited_once()
         self.assertEqual(result["executor"], "isolated_sandbox")
+
+    def test_execution_output_cap_includes_truncation_marker(self):
+        stdout, stderr, truncated = technical_mode._bound_execution_output(
+            "x" * 100_000,
+            "candidate stderr",
+        )
+
+        self.assertTrue(truncated)
+        self.assertTrue(stderr.endswith("[output truncated at 64 KB]"))
+        self.assertLessEqual(
+            len((stdout + stderr).encode("utf-8")),
+            technical_mode.MAX_EXECUTION_OUTPUT_BYTES,
+        )
+
+    def test_executor_truncation_flag_restores_missing_marker(self):
+        stdout, stderr, truncated = technical_mode._bound_execution_output(
+            "partial output",
+            "",
+            executor_truncated=True,
+        )
+
+        self.assertTrue(truncated)
+        self.assertEqual(stdout, "partial output")
+        self.assertTrue(stderr.endswith("[output truncated at 64 KB]"))
 
     async def test_execute_code_ignores_judge0_and_uses_private_piston(self):
         from unittest.mock import AsyncMock

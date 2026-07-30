@@ -77,9 +77,9 @@ services:
         condition: service_healthy
     networks: [app]
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/ready"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=10)"]
       interval: 10s
-      timeout: 4s
+      timeout: 12s
       retries: 12
     security_opt: ["no-new-privileges:true"]
 
@@ -112,6 +112,10 @@ services:
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_BASE_URL: /api
+        NEXT_PUBLIC_RAZORPAY_KEY_ID: ${NEXT_PUBLIC_RAZORPAY_KEY_ID:?Set the public Razorpay checkout key}
+        NEXT_PUBLIC_SUPPORT_EMAIL: ${NEXT_PUBLIC_SUPPORT_EMAIL:?Set the public support email}
+        NEXT_PUBLIC_PRIVACY_EMAIL: ${NEXT_PUBLIC_PRIVACY_EMAIL:?Set the public privacy email}
+        NEXT_PUBLIC_LEGAL_EMAIL: ${NEXT_PUBLIC_LEGAL_EMAIL:?Set the public legal notices email}
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -125,7 +129,7 @@ services:
     image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
     restart: unless-stopped
     environment:
-      APP_DOMAIN: ${APP_DOMAIN:-localhost}
+      APP_DOMAIN: ${APP_DOMAIN:?Set the public HTTPS domain}
     ports:
       - "80:80"
       - "443:443"

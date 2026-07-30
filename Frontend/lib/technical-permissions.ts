@@ -43,6 +43,29 @@ const runtime = runtimeHost[runtimeKey] ||= {
   preflightDone: false,
 }
 const listeners = new Set<PermissionListener>()
+const MEDIA_PERMISSION_TIMEOUT_MS = 60_000
+
+async function requestMediaWithTimeout(
+  request: Promise<MediaStream>,
+  timeoutMessage: string,
+): Promise<MediaStream> {
+  let timedOut = false
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      timedOut = true
+      reject(new Error(timeoutMessage))
+    }, MEDIA_PERMISSION_TIMEOUT_MS)
+  })
+  void request.then((stream) => {
+    if (timedOut) stream.getTracks().forEach((track) => track.stop())
+  }).catch(() => undefined)
+  try {
+    return await Promise.race([request, timeout])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
 
 function isBrowser() {
   return typeof window !== "undefined" && typeof document !== "undefined"
@@ -205,10 +228,13 @@ export async function requestTechnicalScreenShare(): Promise<TechnicalPermission
 
   if (!hasLiveDisplayStream()) {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "monitor" } as MediaTrackConstraints,
-        audio: false,
-      })
+      const stream = await requestMediaWithTimeout(
+        navigator.mediaDevices.getDisplayMedia({
+          video: { displaySurface: "monitor" } as MediaTrackConstraints,
+          audio: false,
+        }),
+        "Screen sharing timed out. Click Start again and choose Entire screen within one minute.",
+      )
       const settings = stream.getVideoTracks()[0]?.getSettings?.() as MediaTrackSettings & { displaySurface?: string }
       if (settings?.displaySurface && settings.displaySurface !== "monitor") {
         stream.getTracks().forEach((track) => track.stop())
@@ -221,12 +247,14 @@ export async function requestTechnicalScreenShare(): Promise<TechnicalPermission
       }
       runtime.permissionsReleased = false
       holdDisplayStream(stream)
-    } catch {
+    } catch (error) {
       emitPermissionState()
       return {
         ok: false,
         reason: "screen-share",
-        message: "Share your full screen to continue. Choose “Entire screen” when prompted.",
+        message: error instanceof Error && /timed out/i.test(error.message)
+          ? error.message
+          : "Share your full screen to continue. Choose “Entire screen” when prompted.",
       }
     }
   }
@@ -269,17 +297,22 @@ export async function requestTechnicalCamera(): Promise<TechnicalPermissionResul
 
   if (!hasLiveCameraStream()) {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
-        audio: false,
-      })
+      const stream = await requestMediaWithTimeout(
+        navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          audio: false,
+        }),
+        "Camera permission timed out. Click Start again and allow camera access within one minute.",
+      )
       holdCameraStream(stream)
-    } catch {
+    } catch (error) {
       emitPermissionState()
       return {
         ok: false,
         reason: "camera",
-        message: "Camera access is required. Your video is monitored for integrity during the round.",
+        message: error instanceof Error && /timed out/i.test(error.message)
+          ? error.message
+          : "Camera access is required. Your video is monitored for integrity during the round.",
       }
     }
   }
@@ -293,16 +326,25 @@ export async function requestTechnicalMicrophone(): Promise<TechnicalPermissionR
   }
   if (!hasLiveMicrophoneStream()) {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      const stream = await requestMediaWithTimeout(
+        navigator.mediaDevices.getUserMedia({ audio: true, video: false }),
+        "Microphone permission timed out. Click Start again and allow microphone access within one minute.",
+      )
       const readiness = await verifyMediaReadiness(stream, { requireAudio: true, requireVideo: false })
       if (!readiness.ok) {
         stream.getTracks().forEach((track) => track.stop())
         return { ok: false, reason: "microphone", message: readiness.message }
       }
       holdMicrophoneStream(stream)
-    } catch (error) {
-      emitPermissionState()
-      return { ok: false, reason: "microphone", message: mediaCaptureErrorMessage(error, "microphone") }
+  } catch (error) {
+    emitPermissionState()
+    return {
+      ok: false,
+      reason: "microphone",
+      message: error instanceof Error && /timed out/i.test(error.message)
+        ? error.message
+        : mediaCaptureErrorMessage(error, "microphone"),
+    }
     }
   }
   return { ok: true, state: computeState() }
@@ -316,10 +358,13 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
     return { ok: true, state: computeState() }
   }
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
-      audio: true,
-    })
+    const stream = await requestMediaWithTimeout(
+      navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: true,
+      }),
+      "Camera and microphone permission timed out. Click Start again and allow access within one minute.",
+    )
     const readiness = await verifyMediaReadiness(stream, { requireAudio: true, requireVideo: true })
     if (!readiness.ok) {
       stream.getTracks().forEach((track) => track.stop())
@@ -336,7 +381,13 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
     return { ok: true, state: computeState() }
   } catch (error) {
     emitPermissionState()
-    return { ok: false, reason: "camera", message: mediaCaptureErrorMessage(error, "media") }
+    return {
+      ok: false,
+      reason: "camera",
+      message: error instanceof Error && /timed out/i.test(error.message)
+        ? error.message
+        : mediaCaptureErrorMessage(error, "media"),
+    }
   }
 }
 

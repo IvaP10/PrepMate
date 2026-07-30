@@ -7,8 +7,8 @@ const footerLinks = [
     links: [
       { label: "About", href: "/about" },
       { label: "How It Works", href: "/#how-it-works" },
-      { label: "Practice Modes", href: "/#modes" },
-      { label: "Performance", href: "/#performance" },
+      { label: "What You Practice", href: "/#modes" },
+      { label: "Feedback", href: "/#performance" },
       { label: "Pricing", href: "/#pricing" },
     ],
   },
@@ -37,14 +37,12 @@ export function Footer({ theme = "dark" }: FooterProps) {
               <ThemeLogo size={36} />
               <span className="text-foreground text-base font-semibold">InterAI</span>
             </Link>
-            <p className="text-base leading-relaxed text-foreground/75">
-              AI-driven interview simulation that adapts to your professional background. Refine your communication skills with actionable, targeted feedback.
-            </p>
+            <p className="text-base leading-relaxed text-foreground/75">Interview practice tailored to your role, with feedback that turns into your next step.</p>
           </div>
           <div className="grid grid-cols-2 gap-8 sm:grid-cols-3">
             {footerLinks.map((group) => (
               <div key={group.heading} className="flex flex-col gap-3">
-                <span className="text-sm font-semibold uppercase tracking-[0.15em] text-foreground">
+                <span className="text-sm font-semibold text-foreground">
                   {group.heading}
                 </span>
                 {group.links.map((link) => (

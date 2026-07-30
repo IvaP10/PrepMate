@@ -320,16 +320,16 @@ def _decrypt_sensitive_json(encrypted: Any, legacy: Any = None) -> Dict[str, Any
 def _mission_title(skill_key: str, evidence_text: str) -> str:
     text = f"{skill_key} {evidence_text}".lower()
     if str(skill_key or "").startswith("communication:"):
-        return f"Strengthen {_label_from_key(skill_key)}"
+        return f"Give a Direct Answer About {_label_from_key(skill_key)}, Then Add Evidence"
     if "interai" in text:
-        return "Explain InterAI Convincingly"
+        return "Explain InterAI with Architecture, Decisions, and Results"
     if "technical" in text or "code" in text:
-        return "Improve Coding Problem Solving"
+        return "Plan and Test the Solution Before Coding"
     if "resume" in text:
-        return "Defend Resume Claims"
+        return "Support Every Resume Claim with Concrete Evidence"
     if "project" in text:
-        return "Explain Projects Clearly"
-    return "Improve Communication and Conciseness"
+        return "Explain Projects with Decisions, Ownership, and Results"
+    return "Answer Directly, Then Support the Answer with Evidence"
 
 
 def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: str = "mock") -> List[Dict[str, Any]]:
@@ -338,7 +338,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
         return [
             {
                 "activity_type": "baseline",
-                "title": "Previous Round Analysed",
+                "title": "The Main Failure in Your Previous Solution Has Been Identified",
                 "description": weakness,
                 "estimated_minutes": 1,
                 "expected_result": "The technical weakness was selected from attempted code, runs, submissions, hints, and test results.",
@@ -349,7 +349,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
             },
             {
                 "activity_type": "rewrite_answer",
-                "title": "Explain What Went Wrong",
+                "title": "Explain Your Approach, Why It Failed, and What You Will Change",
                 "description": "Name the approach you used, why it failed or was inefficient, and the better pattern.",
                 "estimated_minutes": 4,
                 "expected_result": "Separate approach choice, implementation, complexity, and edge-case failures.",
@@ -367,12 +367,12 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
             },
             {
                 "activity_type": "guided_spoken_response",
-                "title": "Retry Plan Before Coding",
+                "title": "State the Algorithm, Data Structure, Complexity, and Edge Cases Before Coding",
                 "description": "Plan the same question again without seeing a full solution.",
                 "estimated_minutes": 4,
                 "expected_result": "State the pattern, data structure, complexity, and edge cases before coding.",
                 "prompt": {
-                    "title": "State your retry plan",
+                    "title": "State the full solution plan before coding",
                     "question": f"Before coding, explain how you would retry the same {skill_label} problem.",
                     "input_type": "voice_or_text",
                     "timer_seconds": 90,
@@ -385,7 +385,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
             },
             {
                 "activity_type": "rewrite_answer",
-                "title": "Edge-Case Checklist",
+                "title": "List the Exact Edge Cases and Expected Outputs Before Submitting",
                 "description": "Write the checks that would catch the previous mistake before submitting.",
                 "estimated_minutes": 4,
                 "expected_result": "List concrete boundary, duplicate, empty, large-input, or hidden-test risks that apply to this attempted problem.",
@@ -401,13 +401,13 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
             },
             {
                 "activity_type": "unseen_checkpoint",
-                "title": "Transfer Checkpoint",
+                "title": "Solve a Related Problem Without Hints and State Its Complexity",
                 "description": "Verify the weakness on a related problem before asking for the next full Technical Round.",
                 "estimated_minutes": 6,
                 "expected_result": "Recognise a related pattern without high hint dependency.",
                 "is_checkpoint": True,
                 "prompt": {
-                    "title": "Related-pattern checkpoint",
+                    "title": "Solve a related problem without hints",
                     "question": f"Explain how you would recognise and solve a related {skill_label} problem without hints.",
                     "timer_seconds": 120,
                     "hide_hints": True,
@@ -423,7 +423,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
     return [
         {
             "activity_type": "baseline",
-            "title": "Baseline Analysed",
+            "title": "Your Weakest Answer from the Last Round Has Been Identified",
             "description": weakness,
             "estimated_minutes": 1,
             "expected_result": "The weak answer pattern has been identified from stored interview evidence.",
@@ -433,34 +433,26 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
             "mastery_status": "practising",
         },
         {
-            "activity_type": "compare_answers",
-            "title": "Learn the Stronger Answer Shape",
-            "description": "Learn the four-part repair, then identify why it works before practising it.",
-            "estimated_minutes": 3,
-            "expected_result": "Identify why a direct, structured answer is stronger.",
+            "activity_type": "rewrite_answer",
+            "title": "Write a 4-Part Answer: Direct Point, Decision, Proof, and Result",
+            "description": "Create a direct four-part answer instead of selecting from prepared choices.",
+            "estimated_minutes": 5,
+            "expected_result": "Write a direct answer with ownership, concrete proof, and a result or trade-off.",
             "prompt": {
-                "title": "Which answer is stronger?",
-                "question": f"Which answer better fixes this issue: {skill_label}?",
-                "learning_guide": [
-                    {"label": "Answer", "text": "Start with the direct answer in one sentence."},
-                    {"label": "Own", "text": "State exactly what you personally chose, built, fixed, or measured."},
-                    {"label": "Prove", "text": "Add one project detail, constraint, metric, or concrete example."},
-                    {"label": "Reflect", "text": "Close with the result, trade-off, limitation, or what you would change."},
-                ],
-                "answers": [
-                    {"id": "a", "label": "Answer A", "text": "I know the topic and have used it in projects, so I can explain it if needed."},
-                    {"id": "b", "label": "Answer B", "text": "First I define the concept, then explain how it works, give one example, and state where I used it."},
-                ],
-                "correct_option": "b",
+                "title": "Write a direct answer with a decision, proof, and result",
+                "question": f"Write a concise answer outline that fixes this issue: {skill_label}.",
+                "weak_answer": weakness,
+                "required_elements": ["direct_answer", "ownership", "evidence", "result"],
                 "pass_conditions": [
-                    {"id": "choose_problem_first", "label": "Select the structured answer", "weight": 2},
-                    {"id": "explain_reason", "label": "Explain why structure and an example make it stronger", "weight": 1},
+                    {"id": "states_problem_early", "label": "Starts with a direct answer", "weight": 1},
+                    {"id": "technical_decision", "label": "States ownership or a concrete decision", "weight": 1},
+                    {"id": "result", "label": "Includes evidence, a result, or a trade-off", "weight": 1},
                 ],
             },
         },
         {
             "activity_type": "arrange_blocks",
-            "title": "Arrange the Answer",
+            "title": "Place the Direct Answer First, Then Context, Proof, and Result",
             "description": "Put the answer blocks in interviewer-friendly order.",
             "estimated_minutes": 4,
             "expected_result": "Order the answer as direct point, context, working, example, result.",
@@ -484,7 +476,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
         },
         {
             "activity_type": "rewrite_answer",
-            "title": "Retry the Weak Answer",
+            "title": "Rewrite the Weak Answer with One Decision and One Measurable Result",
             "description": "Rewrite the previous weak answer using the correct structure.",
             "estimated_minutes": 4,
             "expected_result": "Answer directly, explain how it works, add one example, and close with a use case or result.",
@@ -502,7 +494,7 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
         },
         {
             "activity_type": "guided_spoken_response",
-            "title": "Open Mic: Explain It Aloud",
+            "title": "Explain the Repaired Answer Aloud in 60 Seconds",
             "description": "Speak the repaired answer out loud, review the transcript, and retry without consuming interview credits.",
             "estimated_minutes": 4,
             "expected_result": "Give a short, ordered answer with a direct point, example, and result.",
@@ -520,13 +512,13 @@ def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: 
         },
         {
             "activity_type": "unseen_checkpoint",
-            "title": "Transfer Checkpoint",
+            "title": "Answer a Related Question Without Hints Using the Same Structure",
             "description": "Answer a related question without hints to verify the skill.",
             "estimated_minutes": 5,
             "expected_result": "Pass a related answer without visible structure or model answer.",
             "is_checkpoint": True,
             "prompt": {
-                "title": "Unseen checkpoint",
+                "title": "Answer a related question without hints",
                 "question": f"Explain a related {skill_label} question using definition, working, example, and use case.",
                 "timer_seconds": 60,
                 "hide_hints": True,
@@ -1306,7 +1298,7 @@ def _ensure_active_improvement_mission(
     })
     mission_id = str(uuid.uuid4())
     mission_skill_id = str(uuid.uuid4())
-    title = f"Fix {skill_label}" if mode == "technical" else _mission_title(skill_key, evidence_text)
+    title = f"Plan and Test {skill_label} Solutions Before Coding" if mode == "technical" else _mission_title(skill_key, evidence_text)
     target = _clip(max(75, baseline_score + 18))
     assignment_reason = _bounded(
         evidence_text
@@ -1863,6 +1855,7 @@ def _validate_mission_with_analysis_sync(
                     source_node_id=held_out_checkpoint_id,
                     skill_key=weakness_key,
                     reason="The later interview did not yet demonstrate the target behaviour with sufficient confidence.",
+                    reassessment_mode=mode,
                 )
         connection.commit()
         return {
@@ -2855,6 +2848,20 @@ def _recalculate_mission_sync(cursor: Any, user_id: str, mission_id: str) -> Dic
     }
 
 
+def _reassessment_resource(mode: str) -> Dict[str, str]:
+    if mode == "technical":
+        return {
+            "title": "Read a focused data structures and algorithms guide before the next retry",
+            "url": "https://www.geeksforgeeks.org/dsa/dsa-tutorial-learn-data-structures-and-algorithms/",
+            "provider": "GeeksforGeeks",
+        }
+    return {
+        "title": "Watch a focused lesson on structuring stronger interview answers",
+        "url": "https://www.youtube.com/results?search_query=structured+interview+answers+STAR+method",
+        "provider": "YouTube",
+    }
+
+
 def _insert_recovery_node_sync(
     cursor: Any,
     *,
@@ -2864,6 +2871,7 @@ def _insert_recovery_node_sync(
     source_node_id: str,
     skill_key: str,
     reason: str,
+    reassessment_mode: Optional[str] = None,
 ) -> Optional[str]:
     cursor.execute(
         """
@@ -2901,20 +2909,19 @@ def _insert_recovery_node_sync(
     roadmap_node_id = str(uuid.uuid4())
     prompt = {
         "schema_version": "improve_activity_v1",
-        "activity_type": "compare_answers",
-        "title": "Reason Before Retrying",
-        "question": "Which answer explains the reasoning more clearly before you retry?",
-        "answers": [
-            {"id": "a", "label": "Answer A", "text": "We used PostgreSQL because it is scalable."},
-            {"id": "b", "label": "Answer B", "text": "We used PostgreSQL because the product needed relational candidate, interview, attempt, and report records with transactional consistency."},
-        ],
-        "correct_option": "b",
+        "activity_type": "rewrite_answer",
+        "title": "Write the Requirement, Your Decision, and the Expected Result Before Retrying",
+        "question": "Write the requirement, the decision you made, and the result you expected before retrying.",
+        "weak_answer": reason,
+        "required_elements": ["requirement", "decision", "result"],
         "pass_conditions": [
-            {"id": "choose_problem_first", "label": "Select the reasoning-backed answer", "weight": 2},
-            {"id": "explain_reason", "label": "Explain the requirement behind the choice", "weight": 1},
+            {"id": "technical_decision", "label": "Names a concrete decision and why it fits", "weight": 1},
+            {"id": "result", "label": "States the intended result or trade-off", "weight": 1},
         ],
         "source_evidence": [{"summary": reason}],
     }
+    if reassessment_mode:
+        prompt["recommended_resource"] = _reassessment_resource(reassessment_mode)
     exercise_id = _create_improve_exercise_sync(
         cursor,
         user_id=user_id,
@@ -2923,7 +2930,7 @@ def _insert_recovery_node_sync(
         roadmap_node_id=roadmap_node_id,
         interview_id=None,
         skill_key=skill_key,
-        activity_type="compare_answers",
+        activity_type="rewrite_answer",
         prompt=prompt,
         order_index=order_index,
     )
@@ -2935,8 +2942,8 @@ def _insert_recovery_node_sync(
             availability_status, attempt_status, result_status, mastery_status,
             estimated_minutes, expected_result, evidence_json
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'Reason Before Retrying', %s,
-                'compare_answers', 'current', 'draft', 'not_attempted',
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'Write the Requirement, Your Decision, and the Expected Result Before Retrying', %s,
+                'rewrite_answer', 'current', 'draft', 'not_attempted',
                 'needs_reinforcement', 2, %s, %s)
         """,
         (
@@ -3040,11 +3047,6 @@ async def _persist_mission_attempt_transaction(
                   AND idempotency_key = %s
                   AND status IN ('draft', 'in_progress', 'save_failed')
                   AND (expires_at IS NULL OR expires_at > NOW())
-                  AND (
-                      deadline_at > NOW()
-                      OR (deadline_at IS NULL AND status = 'in_progress')
-                      OR (deadline_at IS NULL AND COALESCE(remaining_seconds, 0) > 0)
-                  )
                 FOR UPDATE
                 """,
                 (
@@ -3180,7 +3182,7 @@ async def _persist_mission_attempt_transaction(
                     """
                     UPDATE ImprovementAttemptSessions
                     SET status = 'submitted', deadline_at = NULL,
-                        remaining_seconds = 0, updated_at = NOW()
+                        remaining_seconds = NULL, updated_at = NOW()
                     WHERE attempt_session_id = %s AND user_id = %s
                       AND mission_id = %s AND roadmap_node_id = %s
                       AND exercise_id = %s AND idempotency_key = %s
@@ -3729,11 +3731,6 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
                 AND node.exercise_id = ImprovementAttemptSessions.exercise_id
                 AND node.availability_status = 'current'
                 AND node.result_status NOT IN ('passed', 'strong_pass')
-          )
-          AND (
-              deadline_at > NOW()
-              OR (deadline_at IS NULL AND COALESCE(remaining_seconds, 0) > 0)
-              OR (deadline_at IS NULL AND remaining_seconds IS NULL)
           )
         ORDER BY updated_at DESC
         LIMIT 1

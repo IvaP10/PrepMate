@@ -185,27 +185,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false, 
           Back
         </Button>
       </div>
-      <div className="relative hidden flex-1 items-center justify-center overflow-hidden border-r border-border/80 bg-card/65 backdrop-blur-xl lg:flex">
-        <div
-          className="pointer-events-none absolute inset-0"
-          style={{
-            backgroundImage: `
-              linear-gradient(${theme === "dark" ? "rgba(255,255,255,0.045)" : "rgba(15,23,42,0.075)"} 1px, transparent 1px),
-              linear-gradient(90deg, ${theme === "dark" ? "rgba(255,255,255,0.045)" : "rgba(15,23,42,0.075)"} 1px, transparent 1px),
-              linear-gradient(135deg, transparent 0 48%, ${theme === "dark" ? "rgba(129,140,248,0.12)" : "rgba(79,70,229,0.13)"} 48.1%, transparent 48.6% 100%)
-            `,
-            backgroundSize: "72px 72px, 72px 72px, 100% 100%",
-          }}
-        />
-        <div
-          className="pointer-events-none absolute top-1/2 left-1/2 h-[560px] w-[560px] -translate-x-1/2 -translate-y-1/2 rounded-full"
-          style={{
-            background:
-              theme === "dark"
-                ? "radial-gradient(circle, rgba(129,140,248,0.08) 0%, rgba(129,140,248,0.03) 46%, transparent 72%)"
-                : "radial-gradient(circle, rgba(79,70,229,0.1) 0%, rgba(15,23,42,0.035) 48%, transparent 72%)",
-          }}
-        />
+      <div className="relative hidden flex-1 items-center justify-center overflow-hidden border-r border-border/65 bg-transparent lg:flex">
         <div className="relative z-10 flex max-w-md flex-col items-center px-12 text-center">
           <div className="mb-8 flex items-center gap-1.5">
             <ThemeLogo size={40} />
@@ -213,7 +193,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false, 
           </div>
           <div className="mb-8 grid w-full grid-cols-2 gap-3 text-left">
             {["Signal Map", "Question Model", "Score Trace", "Prep Loop"].map((item) => (
-              <div key={item} className="rounded-md border border-border/80 bg-background/55 p-3">
+              <div key={item} className="rounded-md border border-border/80 bg-card/70 p-3 backdrop-blur-lg">
                 <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-primary">
                   {item}
                 </span>
@@ -240,7 +220,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false, 
               {mode === "login"
                 ? "Sign in to continue your professional interview preparation"
                 : mode === "signup"
-                  ? "Create your account by 30 July 2026 to get Premium free for 1 month"
+                  ? "Create your account by 30 July 2026 to get Premium free for 30 days"
                   : "Enter your email to receive a secure password reset link"}
             </p>
           </div>

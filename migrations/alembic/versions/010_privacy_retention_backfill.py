@@ -13,8 +13,6 @@ from typing import Any, Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from security_utils import decrypt_json, encrypt_data
-
 
 revision: str = "010_privacy_retention_backfill"
 down_revision: Union[str, None] = "009_technical_runtime_integrity"
@@ -26,12 +24,24 @@ def _json_text(value: Any) -> str:
     return json.dumps(value if value is not None else {}, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
+def _encrypt_data(value: str) -> str:
+    from security_utils import encrypt_data
+
+    return encrypt_data(value)
+
+
+def _decrypt_json(value: Any) -> Any:
+    from security_utils import decrypt_json
+
+    return decrypt_json(value)
+
+
 def _encrypted_bytes(value: Any) -> bytes:
-    return encrypt_data(_json_text(value)).encode("utf-8")
+    return _encrypt_data(_json_text(value)).encode("utf-8")
 
 
 def _decoded_json(value: Any) -> Any:
-    decoded = decrypt_json(value)
+    decoded = _decrypt_json(value)
     return decoded if decoded is not None else {}
 
 
@@ -47,7 +57,7 @@ def _backfill_user_profiles(bind: Any) -> None:
             value = row[column]
             if value is None or isinstance(value, str):
                 continue
-            updates[column] = json.dumps(encrypt_data(_json_text(value)))
+            updates[column] = json.dumps(_encrypt_data(_json_text(value)))
             assignments.append(f"{column} = CAST(:{column} AS JSONB)")
         if assignments:
             bind.execute(
@@ -103,7 +113,7 @@ def _backfill_responses(bind: Any) -> None:
     bind.execute(sa.text("ALTER TABLE InterviewResponses DISABLE TRIGGER trg_interview_response_immutable"))
     try:
         for row in rows:
-            encrypted = encrypt_data(str(row["user_response"])).encode("utf-8")
+            encrypted = _encrypt_data(str(row["user_response"])).encode("utf-8")
             bind.execute(
                 sa.text(
                     """
@@ -262,11 +272,11 @@ def _backfill_improve_answers(bind: Any) -> None:
             ),
             {
                 "attempt_id": row["attempt_id"],
-                "answer_encrypted": encrypt_data(answer).encode("utf-8") if answer else None,
+                "answer_encrypted": _encrypt_data(answer).encode("utf-8") if answer else None,
                 "payload_encrypted": _encrypted_bytes(payload),
                 "payload_marker": _json_text({"encrypted": True}),
                 "feedback_encrypted": (
-                    encrypt_data(str(row["feedback"])).encode("utf-8")
+                    _encrypt_data(str(row["feedback"])).encode("utf-8")
                     if row["feedback"] else None
                 ),
             },

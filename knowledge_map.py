@@ -397,12 +397,22 @@ def validate_presented_question(
         fallback_clean = fallback_clean.rstrip(".! ") + "?"
     words = cleaned.split()
     normalized = re.sub(r"\W+", " ", cleaned).strip().lower()
-    blocked_phrases = ("please explain", "discuss in detail", "describe all", "write an essay")
+    blocked_phrases = (
+        "please explain",
+        "discuss in detail",
+        "describe all",
+        "write an essay",
+        "walk through requirements",
+        "go one level deeper",
+        "provide a comprehensive",
+    )
     valid = bool(
         12 <= len(cleaned) <= 280
-        and 3 <= len(words) <= 35
+        and 3 <= len(words) <= 28
         and cleaned.endswith("?")
         and cleaned.count("?") == 1
+        and cleaned.count(",") <= 1
+        and ";" not in cleaned
         and not any(phrase in normalized for phrase in blocked_phrases)
     )
     prior_questions = set()
@@ -479,7 +489,9 @@ STRICT RULES:
 2. Personalize it to the role, resume, job context, or recent conversation when evidence exists.
 3. Do not ask a generic textbook question unless no candidate-specific anchor exists.
 4. Match the company profile pressure and depth.
-5. Use at most 35 words and output one concise interviewer question.
+5. Use natural spoken English, one thought, and at most 28 words.
+6. Do not expose a rubric or give the candidate a checklist of points to cover.
+7. Avoid assessment language such as "go deeper", "demonstrate", or "provide a comprehensive answer".
 
 Return only the question text."""
 
@@ -510,7 +522,7 @@ Return only the question text."""
                 **_metadata_resume_anchors(resume_context),
             },
         )
-        fallback = seed_question or f"Walk me through your experience with {label}."
+        fallback = seed_question or f"What have you built using {label}?"
         return validate_presented_question(
             result.text,
             fallback=fallback,
@@ -518,7 +530,7 @@ Return only the question text."""
         )
     except Exception as e:
         logger.error("Failed to generate battleground question: %s", redact_text(e))
-        return seed_question or f"Walk me through your experience with {label}."
+        return seed_question or f"What have you built using {label}?"
 
 async def generate_contextual_followup(
     battleground_label: str,
@@ -589,8 +601,8 @@ STRICT RULES:
 2. If the candidate said something specific, reference it directly (e.g., "You mentioned X - can you explain how...")
 3. If the candidate gave a poor or off-topic answer, address that directly and re-probe the same topic area.
 4. Do NOT repeat a question that was already asked in the conversation history.
-5. Use at most 35 words.
-6. Ask one clear question without introductory commentary.
+5. Use natural spoken English and at most 28 words.
+6. Ask one focused question without a checklist, rubric language, or introductory commentary.
 
 Return only the follow-up question as plain text."""
 
@@ -661,11 +673,11 @@ def _fallback_knowledge_map(
 
     battlegrounds = []
     fallback_questions = [
-        "Which technically complex project best represents your own work?",
-        f"How would you design a scalable service for a core {job_title} workflow?",
-        "Tell me about a time you debugged a critical production issue under pressure.",
-        "How do you evaluate trade-offs between technical solutions?",
-        "How do you balance code quality with shipping speed?"
+        "What is the toughest technical project you built yourself?",
+        f"How would you design a core {job_title} service that needs to scale?",
+        "What production issue did you have to debug under pressure?",
+        "Which trade-off matters most when you compare technical options?",
+        "When have you traded code quality for shipping speed?"
     ]
     fallback_transitions = [
         "Moving from that project, let's discuss system design.",

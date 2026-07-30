@@ -1,7 +1,7 @@
 "use client"
 
 import React from "react"
-import { AlertTriangle, Zap, Target, Scale } from "lucide-react"
+import { AlertTriangle, Zap } from "lucide-react"
 import type { AnalysisSection, AnalysisDetail, Severity } from "@/types/premium-report"
 
 interface CodeForensicsBlockProps {
@@ -23,14 +23,11 @@ function SeverityStrip({ severity, label }: { severity: Severity; label: string 
   )
 }
 
-function SectionBlock({ section, icon }: { section: AnalysisSection; icon: React.ReactNode }) {
+function SectionBlock({ section }: { section: AnalysisSection }) {
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-base font-semibold text-foreground flex items-center gap-2">
-          {icon}
-          {section.title}
-        </h3>
+        <h3 className="text-base font-semibold text-foreground">{section.title}</h3>
         <SeverityStrip severity={section.severity} label={section.severity} />
       </div>
 
@@ -99,12 +96,7 @@ export function CodeForensicsBlock({
   optimalDelta,
   edgeCaseForensics,
 }: CodeForensicsBlockProps) {
-  const sections = [
-    { data: logicTeardown, icon: <Target className="h-4 w-4 text-muted-foreground" /> },
-    { data: complexityOverheads, icon: <Zap className="h-4 w-4 text-muted-foreground" /> },
-    { data: optimalDelta, icon: <Scale className="h-4 w-4 text-muted-foreground" /> },
-    { data: edgeCaseForensics, icon: <AlertTriangle className="h-4 w-4 text-muted-foreground" /> },
-  ].filter((s) => s.data)
+  const sections = [logicTeardown, complexityOverheads, optimalDelta, edgeCaseForensics].filter(Boolean)
 
   if (sections.length === 0) return null
 
@@ -120,10 +112,10 @@ export function CodeForensicsBlock({
       </div>
 
       <div className="space-y-8">
-        {sections.map(({ data, icon }, idx) => (
+        {sections.map((section, idx) => (
           <React.Fragment key={idx}>
             {idx > 0 && <div className="report-divider" />}
-            <SectionBlock section={data!} icon={icon} />
+            <SectionBlock section={section!} />
           </React.Fragment>
         ))}
       </div>

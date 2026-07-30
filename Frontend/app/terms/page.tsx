@@ -1,4 +1,5 @@
 import { LegalPageShell, type LegalSection } from "@/components/legal-page-shell"
+import { PublicContactDetails } from "@/components/public-contact-details"
 
 const sections: LegalSection[] = [
   { id: "acceptance", title: "Acceptance" },
@@ -142,8 +143,8 @@ export default function TermsPage() {
         <p>
           Technical rounds may include timed prompts, Monaco editor workspaces, code snapshots,
           stdout and stderr capture, hidden or visible tests, run history, compiler or runtime
-          errors, technical reports, and generated technical feedback. Code may be sent to configured
-          a private isolated sandbox to compile, run, validate, and return results.
+          errors, technical reports, and generated technical feedback. Code may be sent to a
+          configured private isolated sandbox to compile, run, validate, and return results.
         </p>
         <p>
           Strict technical or mock sessions may request fullscreen, screen sharing, microphone,
@@ -358,10 +359,7 @@ export default function TermsPage() {
           through the service, email, or another reasonable method. Continued use after an update
           means you accept the updated Terms.
         </p>
-        <p>
-          For support, contact [support email]. For privacy requests, contact [privacy email]. For
-          legal notices, contact [legal notices email].
-        </p>
+        <p><PublicContactDetails /></p>
       </section>
     </LegalPageShell>
   )

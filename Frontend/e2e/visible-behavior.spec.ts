@@ -57,33 +57,53 @@ test.describe.serial("visible system behavior", () => {
     await page.goto("/?tab=interview")
     await expect(page.getByRole("radiogroup", { name: "Interview profile" })).toBeVisible()
     await page.getByRole("button", { name: "Start Interview Round", exact: true }).click()
-    const dialog = page.getByRole("dialog")
-    await expect(dialog.getByRole("heading", { name: "Before you begin" })).toBeVisible()
-    await expect(dialog.getByText("Screen sharing")).toBeVisible()
-    await expect(dialog.getByText("Camera")).toBeVisible()
-    await dialog.getByRole("button", { name: "Start Interview Round", exact: true }).click()
 
     await expect(page).toHaveURL(/\/interview\/[a-f0-9-]+\?/, { timeout: 30_000 })
     await expect(page.getByRole("button", { name: /End Interview|Leave interview/ })).toBeVisible({ timeout: 30_000 })
     await expect(page.getByText("Warm-up", { exact: true })).toBeVisible({ timeout: 30_000 })
     await expect(page.getByText(/Camera/).first()).toBeVisible()
-    await expect(page.getByText(/Microphone/).first()).toBeVisible()
+    await expect(page.getByRole("button", { name: /microphone/i }).first()).toBeVisible()
     await capture(page, "new-interview-live")
   })
 
-  test("technical Run produces a visible result or a truthful executor blocker", async ({ page }) => {
-    test.setTimeout(60_000)
-    await page.goto(`/interview/${process.env.E2E_TECHNICAL_ID}/technical`)
-    await expect(page.locator(".monaco-editor")).toBeVisible({ timeout: 20_000 })
+  test("technical Run executes the browser-visible cases in the isolated sandbox", async ({ page }) => {
+    test.setTimeout(90_000)
+    await page.goto("/?tab=technical")
+    await expect(page.getByRole("radiogroup", { name: "Technical profile" })).toBeVisible()
+    await page.getByRole("button", { name: "Start Technical Round", exact: true }).click()
+    await expect(page).toHaveURL(/\/interview\/[a-f0-9-]+\/technical(?:\?.*)?$/, { timeout: 30_000 })
+    const editor = page.locator(".monaco-editor")
+    await expect(editor).toBeVisible({ timeout: 30_000 })
+    const inputLabels = await page.locator("main p").filter({ hasText: /^Input:\s/ }).allTextContents()
+    const outputLabels = await page.locator("main p").filter({ hasText: /^Output:\s/ }).allTextContents()
+    expect(inputLabels).toHaveLength(3)
+    expect(outputLabels).toHaveLength(3)
+    const visibleCases = Object.fromEntries(inputLabels.map((label, index) => [
+      label.replace(/^Input:\s*/, "").trim().split(/\s+/).join(" "),
+      outputLabels[index].replace(/^Output:\s*/, "").trim(),
+    ]))
+    const solution = [
+      "import sys",
+      "",
+      `visible_cases = ${JSON.stringify(visibleCases)}`,
+      "key = ' '.join(sys.stdin.read().split())",
+      "print(visible_cases[key])",
+    ].join("\n")
+    await editor.click()
+    await page.keyboard.press("Control+A")
+    await page.keyboard.press("Backspace")
+    await page.keyboard.press("Meta+A")
+    await page.keyboard.press("Backspace")
+    await page.keyboard.insertText(solution)
     await page.getByRole("button", { name: "Run", exact: true }).click()
-    await expect(page.getByText(/run completed|execution|executor|unavailable|failed|error/i).last()).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByText("Passed 3/3", { exact: true })).toBeVisible({ timeout: 30_000 })
     await capture(page, "technical-run-result")
   })
 
   test("uploading a DOCX through the visible Resume UI creates a persisted version", async ({ page }) => {
     test.setTimeout(90_000)
     await page.goto("/?tab=resume")
-    await expect(page.getByText("Immutable interview sources")).toBeVisible()
+    await expect(page.getByRole("heading", { name: "Resume versions" })).toBeVisible()
     await page.locator('input[type="file"]').setInputFiles(path.join(process.cwd(), "e2e", ".generated", "visual-system-resume.docx"))
     await expect(page.getByText("visual-system-resume.docx")).toBeVisible({ timeout: 45_000 })
     await page.reload()
@@ -91,11 +111,11 @@ test.describe.serial("visible system behavior", () => {
     await capture(page, "resume-upload-persisted")
   })
 
-  test("checkout visibly blocks payment when Razorpay is not configured", async ({ page }) => {
+  test("checkout visibly blocks an invalid current or lower-tier plan change", async ({ page }) => {
     await page.goto("/checkout?plan=pro")
     await expect(page.getByRole("heading", { name: "Pro membership" })).toBeVisible()
-    await expect(page.getByText("Payments are temporarily unavailable. Please try again later.")).toBeVisible()
-    await expect(page.getByRole("button", { name: "Checkout unavailable" })).toBeDisabled()
+    await expect(page.getByText("This is your current plan or a lower tier. Choose an upgrade or wait until the current term ends.")).toBeVisible()
+    await expect(page.getByRole("button", { name: "Plan change unavailable" })).toBeDisabled()
     await capture(page, "checkout-truthful-blocker")
   })
 })

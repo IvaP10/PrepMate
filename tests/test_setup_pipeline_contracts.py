@@ -120,6 +120,50 @@ def test_blueprint_question_shape_is_server_owned_for_all_four_profiles():
         }
 
 
+def test_preset_blueprint_uses_resume_context_without_a_saved_job_profile():
+    target = blueprint_api._resolve_blueprint_job_target(
+        job_row=None,
+        resume_payload={
+            "target_role": "Machine Learning Engineer",
+            "summary": "Built and evaluated production machine-learning systems.",
+            "skills": ["Python", "PyTorch", "PostgreSQL"],
+        },
+        profile_type="top_tier",
+        requested_job_profile_id=None,
+    )
+
+    assert target["job_profile_id"] is None
+    assert target["role"] == "Machine Learning Engineer"
+    assert target["source"] == "resume"
+    assert "production machine-learning systems" in target["job_description"]
+    assert "Python, PyTorch, PostgreSQL" in target["job_description"]
+
+
+def test_custom_blueprint_still_requires_a_saved_profile_with_full_jd():
+    with pytest.raises(blueprint_api.HTTPException) as exc:
+        blueprint_api._resolve_blueprint_job_target(
+            job_row=None,
+            resume_payload={"target_role": "Backend Engineer", "skills": ["Python"]},
+            profile_type="custom",
+            requested_job_profile_id=None,
+        )
+
+    assert exc.value.status_code == 422
+    assert "saved profile" in exc.value.detail
+
+
+def test_explicit_missing_job_profile_does_not_silently_fall_back_to_resume():
+    with pytest.raises(blueprint_api.HTTPException) as exc:
+        blueprint_api._resolve_blueprint_job_target(
+            job_row=None,
+            resume_payload={"target_role": "Backend Engineer", "skills": ["Python"]},
+            profile_type="mid_tier",
+            requested_job_profile_id=999,
+        )
+
+    assert exc.value.status_code == 404
+
+
 def test_interview_and_technical_setup_expose_exactly_four_supported_profiles():
     expected = {"top_tier", "mid_tier", "startup", "custom"}
 
@@ -251,10 +295,10 @@ def test_canonical_performance_groups_only_comparable_versions_and_keeps_unknown
     assert payload["evidence_status"] == "insufficient_evidence"
     assert payload["evidence_index"] == {"response_ids": ["response-1"]}
     assert payload["comparability"]["comparable_analysis_count"] == 1
-    assert payload["comparability"]["evidence_status"] == "insufficient_evidence"
+    assert payload["comparability"]["evidence_status"] == "sufficient"
     assert payload["comparability"]["excluded_incompatible_count"] == 2
     assert len(payload["trend"]) == 1
-    assert payload["trend"][0]["score"] is None
+    assert payload["trend"][0]["score"] == 74.0
     assert payload["confidence"] == "insufficient"
     assert payload["evidence_count"] == 1
     assert payload["empty_state_explanation"]

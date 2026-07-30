@@ -9,6 +9,8 @@ import { Button } from "@/components/ui/button"
 import { createPaymentSession, fetchPaymentPlans, verifyRazorpayPayment } from "@/lib/api"
 import { API_CONFIG, API_ENDPOINTS } from "@/lib/config"
 import { getAuthHeaders } from "@/lib/auth"
+import { bootstrapSession } from "@/lib/auth-bootstrap"
+import { safeStorageSet } from "@/lib/safe-storage"
 
 type CheckoutPlan = {
   plan_type: string
@@ -18,6 +20,7 @@ type CheckoutPlan = {
   duration_days?: number
   features?: string[]
   description?: string
+  purchase_state?: "current" | "upgrade" | "unavailable"
 }
 
 const FALLBACK_PLANS: Record<string, CheckoutPlan> = {
@@ -90,6 +93,11 @@ function CheckoutContent() {
       setAuthBlocked(false)
       setCheckoutReady(true)
       try {
+        const session = await bootstrapSession()
+        if (!session.authenticated) {
+          setAuthBlocked(true)
+          return
+        }
         const planPayload = await fetchPaymentPlans()
         setPlans(Array.isArray(planPayload?.plans) ? planPayload.plans : [])
         setCheckoutReady(planPayload?.checkout_ready !== false)
@@ -128,7 +136,8 @@ function CheckoutContent() {
   const features = isCreditsCheckout
     ? ["Instant credit activation", "Use credits for mock interviews", "Secure Razorpay checkout"]
     : selectedPlan?.features || []
-  const paymentBlocked = !checkoutReady && amount > 0
+  const transitionBlocked = !authBlocked && !isCreditsCheckout && selectedPlan?.purchase_state !== "upgrade"
+  const paymentBlocked = !authBlocked && ((!checkoutReady && amount > 0) || transitionBlocked)
 
   const openRazorpay = async (order: any) => {
     const loaded = await loadRazorpay()
@@ -174,7 +183,9 @@ function CheckoutContent() {
 
   const handlePay = async () => {
     if (authBlocked) {
-      router.push("/")
+      safeStorageSet("session", "interai_app_view", "auth")
+      safeStorageSet("session", "interai_auth_mode", "login")
+      window.location.assign("/?auth=login")
       return
     }
     if (!isCreditsCheckout && selectedPlan?.amount === 0) {
@@ -182,7 +193,9 @@ function CheckoutContent() {
       return
     }
     if (paymentBlocked) {
-      toast.error("Payments are temporarily unavailable. Please try again later.")
+      toast.error(transitionBlocked
+        ? "This plan cannot replace your active plan. Choose an upgrade or wait until the current term ends."
+        : "Payments are temporarily unavailable. Please try again later.")
       return
     }
     setProcessing(true)
@@ -227,7 +240,7 @@ function CheckoutContent() {
           <p className="mt-2 text-sm leading-6 text-muted-foreground">{description}</p>
           {!isCreditsCheckout && selectedPlan?.plan_type?.includes("premium") && (
             <div className="mt-4 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium leading-5 text-primary">
-              New accounts registered by 30 July 2026 get their first Premium month free automatically at signup.
+              New accounts registered by 30 July 2026 get 30 days of Premium free automatically at signup.
             </div>
           )}
 
@@ -281,13 +294,15 @@ function CheckoutContent() {
 
               {paymentBlocked && (
                 <div className="mt-5 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-700 dark:text-amber-300">
-                  Payments are temporarily unavailable. Please try again later.
+                  {transitionBlocked
+                    ? "This is your current plan or a lower tier. Choose an upgrade or wait until the current term ends."
+                    : "Payments are temporarily unavailable. Please try again later."}
                 </div>
               )}
 
               <Button className="mt-6 h-11 w-full gap-2 rounded-lg" onClick={handlePay} disabled={processing || loading || paymentBlocked}>
                 {processing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
-                {authBlocked ? "Go to login" : amount === 0 ? "Return to Improve" : paymentBlocked ? "Checkout unavailable" : "Continue to Razorpay"}
+                {authBlocked ? "Go to login" : amount === 0 ? "Return to Improve" : transitionBlocked ? "Plan change unavailable" : paymentBlocked ? "Checkout unavailable" : "Continue to Razorpay"}
               </Button>
             </>
           )}

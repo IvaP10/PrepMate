@@ -1,13 +1,22 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { BriefcaseBusiness, Check, FileText, Loader2, Plus, Play } from "lucide-react"
+import { BriefcaseBusiness, Check, FileText, Loader2, Plus, Play, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   createJobProfile,
   createInterviewBlueprint,
+  deleteJobProfile,
   fetchInterviewProfile,
   fetchFlowPreflight,
   fetchJobProfiles,
@@ -28,9 +37,19 @@ import {
   requestTechnicalMedia,
   requestTechnicalScreenShare,
 } from "@/lib/technical-permissions"
+import { requiresSavedJobProfile } from "@/lib/interview-setup-policy"
 import { rememberRecoveryGraceSeconds } from "@/lib/session-integrity"
 
 type SetupMode = "interview" | "technical"
+type CompileStage = "idle" | "camera" | "screen" | "blueprint" | "preflight" | "starting"
+
+const compileStageLabels: Record<Exclude<CompileStage, "idle">, string> = {
+  camera: "Checking camera and microphone...",
+  screen: "Waiting for full-screen sharing...",
+  blueprint: "Building your interview...",
+  preflight: "Verifying setup...",
+  starting: "Starting your round...",
+}
 
 export type BlueprintRuntimeChoice = {
   inputMode: "voice" | "text"
@@ -79,10 +98,12 @@ const profileChoices: {
 export function InterviewSetupWizard({
   mode,
   onReady,
+  onProfilesChanged,
   disabled,
 }: {
   mode: SetupMode
   onReady: (blueprint: InterviewBlueprint, runtime: BlueprintRuntimeChoice, preflightId: string) => void
+  onProfilesChanged?: () => void
   disabled?: boolean
 }) {
   const technical = mode === "technical"
@@ -95,22 +116,48 @@ export function InterviewSetupWizard({
   const [role, setRole] = useState("")
   const [company, setCompany] = useState("")
   const [jobDescription, setJobDescription] = useState("")
-  const [showCustomForm, setShowCustomForm] = useState(false)
+  const [showProfileForm, setShowProfileForm] = useState(false)
   const [profileType, setProfileType] = useState<InterviewProfileType>("mid_tier")
   const [savingProfile, setSavingProfile] = useState(false)
+  const [savingTarget, setSavingTarget] = useState(false)
+  const [deletingProfileId, setDeletingProfileId] = useState<number | null>(null)
+  const [deleteCandidate, setDeleteCandidate] = useState<JobProfile | null>(null)
   const [profileError, setProfileError] = useState("")
   const interviewMode = "mock" as const
   const [compiling, setCompiling] = useState(false)
   const [compileError, setCompileError] = useState("")
+  const [compileStage, setCompileStage] = useState<CompileStage>("idle")
+  const [serviceReadiness, setServiceReadiness] = useState<"checking" | "ready" | "blocked">("checking")
+  const [serviceReadinessMessage, setServiceReadinessMessage] = useState("")
+
+  useEffect(() => {
+    let cancelled = false
+    const flow = technical ? "technical" : "interview"
+    setServiceReadiness("checking")
+    setServiceReadinessMessage("")
+    void fetchFlowPreflight(flow)
+      .then((readiness) => {
+        if (cancelled) return
+        setServiceReadiness(readiness.ready ? "ready" : "blocked")
+        setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
+        if (readiness.ready) rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
+      })
+      .catch((error: any) => {
+        if (cancelled) return
+        setServiceReadiness("blocked")
+        setServiceReadinessMessage(error?.message || "Service readiness could not be checked.")
+      })
+    return () => { cancelled = true }
+  }, [technical])
 
   useEffect(() => {
     let cancelled = false
     void (async () => {
       setLoadingAssets(true)
-      const [resumeResult, jobResult, profileResult] = await Promise.allSettled([
+      const profilePromise = fetchInterviewProfile()
+      const [resumeResult, jobResult] = await Promise.allSettled([
         fetchResumeVersions(),
         fetchJobProfiles(),
-        fetchInterviewProfile(),
       ])
       if (cancelled) return
       if (resumeResult.status === "fulfilled") {
@@ -127,13 +174,15 @@ export function InterviewSetupWizard({
           setJobDescription(selected.job_description || "")
         }
       }
-      if (profileResult.status === "fulfilled") setProfileType(profileResult.value.profile_type)
       const failed = [resumeResult, jobResult].filter((result) => result.status === "rejected") as PromiseRejectedResult[]
       if (failed.length) setAssetError(failed.map((result) => result.reason?.message || "Failed to load setup assets").join(" "))
       setLoadingAssets(false)
+      void profilePromise.then((profile) => {
+        if (!cancelled) setProfileType(profile.profile_type)
+      }).catch(() => undefined)
     })()
     return () => { cancelled = true }
-  }, [])
+  }, [technical])
 
   const selectedJob = useMemo(() => jobs.find((item) => String(item.profile_id) === jobProfileId), [jobProfileId, jobs])
 
@@ -145,40 +194,42 @@ export function InterviewSetupWizard({
   }, [selectedJob])
 
   const selectProfile = async (nextProfile: InterviewProfileType) => {
-    if (nextProfile === profileType || savingProfile) return
+    if (savingProfile || deletingProfileId !== null) return
+    if (nextProfile === profileType) {
+      if (nextProfile === "custom" && jobs.length === 0) setShowProfileForm(true)
+      return
+    }
     const previousProfile = profileType
     setProfileType(nextProfile)
-    setShowCustomForm(nextProfile === "custom" && jobs.length === 0)
+    setShowProfileForm(nextProfile === "custom" && jobs.length === 0)
     setProfileError("")
     setSavingProfile(true)
     try {
       await updateInterviewProfile(nextProfile)
     } catch (error: any) {
       setProfileType(previousProfile)
-      setProfileError(error?.message || "We could not save your company environment. Please try again.")
+      setProfileError(error?.message || "We could not save this selection. Please try again.")
     } finally {
       setSavingProfile(false)
     }
   }
 
   const selectSavedTarget = async (job: JobProfile) => {
-    const previousProfile = profileType
-    setProfileType("custom")
+    if (savingProfile || deletingProfileId !== null) return
+    const previousJobProfileId = jobProfileId
     setJobProfileId(String(job.profile_id))
     setRole(job.role || "")
     setCompany(job.company || "")
     setJobDescription(job.job_description || "")
-    setShowCustomForm(false)
+    setShowProfileForm(false)
     setProfileError("")
     setSavingProfile(true)
     try {
-      await Promise.all([
-        previousProfile === "custom" ? Promise.resolve() : updateInterviewProfile("custom"),
-        selectJobProfile(job.profile_id),
-      ])
+      await selectJobProfile(job.profile_id)
+      setJobs((current) => current.map((item) => ({ ...item, is_selected: item.profile_id === job.profile_id })))
     } catch (error: any) {
-      setProfileType(previousProfile)
-      setProfileError(error?.message || "We could not select this company environment. Please try again.")
+      setJobProfileId(previousJobProfileId)
+      setProfileError(error?.message || "We could not select this profile. Please try again.")
     } finally {
       setSavingProfile(false)
     }
@@ -189,67 +240,104 @@ export function InterviewSetupWizard({
     setRole("")
     setCompany("")
     setJobDescription("")
-    setShowCustomForm(true)
+    setShowProfileForm(true)
+  }
+
+  const cancelNewCustomTarget = () => {
+    setShowProfileForm(false)
+    setRole(selectedJob?.role || "")
+    setCompany(selectedJob?.company || "")
+    setJobDescription(selectedJob?.job_description || "")
+  }
+
+  const saveCustomTarget = async () => {
+    if (!role.trim() || !company.trim() || !jobDescription.trim() || savingTarget) return
+    setSavingTarget(true)
+    setProfileError("")
+    try {
+      const created = await createJobProfile({
+        role: role.trim(),
+        company: company.trim(),
+        job_description: jobDescription.trim(),
+      })
+      await selectJobProfile(created.profile_id)
+      const selectedProfile = { ...created, is_selected: true }
+      setJobs((current) => [
+        ...current.filter((item) => item.profile_id !== created.profile_id).map((item) => ({ ...item, is_selected: false })),
+        selectedProfile,
+      ])
+      setJobProfileId(String(created.profile_id))
+      setRole(created.role || "")
+      setCompany(created.company || "")
+      setJobDescription(created.job_description || "")
+      setShowProfileForm(false)
+      onProfilesChanged?.()
+    } catch (error: any) {
+      setProfileError(error?.message || "We could not save this profile. Please try again.")
+    } finally {
+      setSavingTarget(false)
+    }
+  }
+
+  const removeSavedTarget = async (job: JobProfile) => {
+    if (savingProfile || deletingProfileId !== null) return
+    const deletingSelectedTarget = String(job.profile_id) === jobProfileId
+    setDeletingProfileId(job.profile_id)
+    setProfileError("")
+    try {
+      await deleteJobProfile(job.profile_id)
+      const remainingJobs = jobs.filter((item) => item.profile_id !== job.profile_id)
+      setJobs(remainingJobs)
+      if (deletingSelectedTarget) {
+        const next = remainingJobs[0]
+        if (next) {
+          await selectJobProfile(next.profile_id)
+          setJobs(remainingJobs.map((item) => ({ ...item, is_selected: item.profile_id === next.profile_id })))
+          setJobProfileId(String(next.profile_id))
+          setRole(next.role || "")
+          setCompany(next.company || "")
+          setJobDescription(next.job_description || "")
+        } else {
+          setJobProfileId("")
+          setRole("")
+          setCompany("")
+          setJobDescription("")
+        }
+      }
+      onProfilesChanged?.()
+    } catch (error: any) {
+      setProfileError(error?.message || "We could not delete this custom profile. Please try again.")
+    } finally {
+      setDeletingProfileId(null)
+      setDeleteCandidate(null)
+    }
   }
 
   const compile = async () => {
     if (!resumeId) return
+    if (serviceReadiness !== "ready") {
+      setCompileError(serviceReadinessMessage || "The round is not ready yet. Wait for the service check and try again.")
+      return
+    }
     setCompiling(true)
     setCompileError("")
     try {
-      let compiledJobProfileId = jobProfileId ? Number(jobProfileId) : null
-      if (profileType === "custom") {
-        if (!role.trim() || !jobDescription.trim()) {
-          throw new Error("Custom requires the role and full job description.")
-        }
-      } else if (!compiledJobProfileId) {
-        throw new Error("Add a role and full job description under Custom before starting this round.")
-      }
-      if (!compiledJobProfileId) {
-        // A new Custom target is saved after browser permissions are granted.
-        if (profileType !== "custom") throw new Error("A job target is required to prepare this interview.")
+      const compiledJobProfileId = jobProfileId ? Number(jobProfileId) : null
+      if (requiresSavedJobProfile(profileType) && !compiledJobProfileId) {
+        throw new Error("Add or select a saved profile before starting this round.")
       }
       if (!navigator.onLine) {
-        throw new Error(`A network connection is required before the ${technical ? "Technical" : "Interview"} Round can start.`)
+        throw new Error(`A network connection is required before the ${technical ? "Technical Round" : "Interview Round"} can start.`)
       }
-
-      // Start every browser-native permission request in the original Start
-      // button gesture. There is deliberately no custom permission screen in
-      // between: the browser prompts, then the round starts automatically.
       const flow = technical ? "technical" : "interview"
-      const readinessPromise = fetchFlowPreflight(flow)
-      const mediaPromise = requestTechnicalMedia()
-      const screenPromise = requestTechnicalScreenShare()
-      const [readiness, media, screen] = await Promise.all([
-        readinessPromise,
-        mediaPromise,
-        screenPromise,
-      ])
-      if (!readiness.ready) throw new Error(readiness.message)
+      setCompileStage("camera")
+      const media = await requestTechnicalMedia()
       if (!media.ok) throw new Error(media.message)
+      setCompileStage("screen")
+      const screen = await requestTechnicalScreenShare()
       if (!screen.ok) throw new Error(screen.message)
-      rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
 
-      if (profileType === "custom") {
-        const matchesSelectedTarget = Boolean(
-          selectedJob
-          && selectedJob.role.trim() === role.trim()
-          && (selectedJob.company || "").trim() === company.trim()
-          && (selectedJob.job_description || "").trim() === jobDescription.trim()
-        )
-        if (!matchesSelectedTarget) {
-          const created = await createJobProfile({
-            role: role.trim(),
-            company: company.trim(),
-            job_description: jobDescription.trim(),
-          })
-          await selectJobProfile(created.profile_id)
-          compiledJobProfileId = created.profile_id
-          setJobs((current) => [...current.map((item) => ({ ...item, is_selected: false })), { ...created, is_selected: true }])
-          setJobProfileId(String(created.profile_id))
-        }
-      }
-      if (!compiledJobProfileId) throw new Error("A job target is required to prepare this interview.")
+      setCompileStage("blueprint")
       const payload: InterviewBlueprintRequest = {
         resume_id: resumeId,
         job_profile_id: compiledJobProfileId,
@@ -259,6 +347,7 @@ export function InterviewSetupWizard({
       }
       const next = await createInterviewBlueprint(payload, newKey())
       if (!next.blueprint_id) throw new Error("We could not prepare your interview. Please try again.")
+      setCompileStage("preflight")
       const permissionState = getTechnicalPermissionState()
       const persisted = await persistBrowserPreflight({
         blueprint_id: next.blueprint_id,
@@ -270,6 +359,7 @@ export function InterviewSetupWizard({
         network_ready: navigator.onLine,
       })
       markPreflightCompleted()
+      setCompileStage("starting")
       onReady(next, {
         inputMode: technical ? "text" : "voice",
         cameraEnabled: true,
@@ -280,6 +370,7 @@ export function InterviewSetupWizard({
       setCompileError(err?.message || "We could not prepare your interview. Please try again.")
     } finally {
       setCompiling(false)
+      setCompileStage("idle")
     }
   }
 
@@ -330,67 +421,120 @@ export function InterviewSetupWizard({
                     <p className="text-sm font-semibold text-foreground">Saved roles and full job descriptions</p>
                     <p className="mt-1 text-xs text-muted-foreground">Choose the company-specific environment for this round.</p>
                   </div>
-                  <Button type="button" variant="outline" size="sm" onClick={startNewCustomTarget}>
-                    <Plus className="h-3.5 w-3.5" /> Add another
-                  </Button>
+                  {!showProfileForm && (
+                    <Button type="button" variant="outline" size="sm" disabled={savingProfile || deletingProfileId !== null} onClick={startNewCustomTarget}>
+                      <Plus className="h-3.5 w-3.5" /> Add another
+                    </Button>
+                  )}
                 </div>
 
-                {jobs.length > 0 && (
+                {!showProfileForm && jobs.length > 0 && (
                   <div className="grid gap-2 md:grid-cols-2">
                     {jobs.map((job) => {
-                      const selected = !showCustomForm && String(job.profile_id) === jobProfileId
+                      const selected = String(job.profile_id) === jobProfileId
                       return (
-                        <button
+                        <div
                           key={job.profile_id}
-                          type="button"
-                          disabled={savingProfile}
-                          onClick={() => void selectSavedTarget(job)}
-                          className={`rounded-lg border p-3 text-left transition-colors ${selected ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
+                          className={`flex w-full min-w-0 items-start rounded-lg border transition-colors ${selected ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
                         >
-                          <span className="flex items-start justify-between gap-3">
-                            <span className="min-w-0">
-                              <span className="block truncate text-sm font-semibold text-foreground">{job.role}{job.company ? ` at ${job.company}` : ""}</span>
-                              <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{job.job_description || "No job description saved"}</span>
+                          <button
+                            type="button"
+                            disabled={savingProfile || deletingProfileId !== null}
+                            onClick={() => void selectSavedTarget(job)}
+                            className="min-w-0 flex-1 p-3 text-left disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <span className="flex items-start justify-between gap-3">
+                              <span className="min-w-0">
+                                <span className="block truncate text-sm font-semibold text-foreground">{job.role}{job.company ? ` at ${job.company}` : ""}</span>
+                                <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{job.job_description || "No job description saved"}</span>
+                              </span>
+                              {selected ? <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : <BriefcaseBusiness className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />}
                             </span>
-                            {selected ? <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : <BriefcaseBusiness className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />}
-                          </span>
-                        </button>
+                          </button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-sm"
+                            className="m-2 text-muted-foreground hover:text-destructive"
+                            disabled={savingProfile || deletingProfileId !== null}
+                            onClick={() => setDeleteCandidate(job)}
+                            aria-label={`Delete ${job.role} job target`}
+                          >
+                            {deletingProfileId === job.profile_id
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Trash2 className="h-4 w-4" />}
+                          </Button>
+                        </div>
                       )
                     })}
                   </div>
                 )}
 
-                {!jobs.length && !showCustomForm && (
+                {!jobs.length && !showProfileForm && (
                   <p className="rounded-lg border border-dashed border-border px-3 py-4 text-sm text-muted-foreground">No saved role yet. Add the role and full job description here.</p>
+                )}
+
+                {showProfileForm && (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <Field label="Role title"><Input value={role} onChange={(event) => setRole(event.target.value)} placeholder="Backend Engineer" /></Field>
+                    <Field label="Company"><Input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="Company name" /></Field>
+                    <div className="md:col-span-2">
+                      <Field label="Job description">
+                        <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-28" />
+                      </Field>
+                    </div>
+                    <div className="flex justify-end gap-2 md:col-span-2">
+                      <Button type="button" variant="ghost" disabled={savingTarget} onClick={cancelNewCustomTarget}>Cancel</Button>
+                      <Button type="button" disabled={savingTarget || !role.trim() || !company.trim() || !jobDescription.trim()} onClick={() => void saveCustomTarget()}>
+                        {savingTarget ? <Loader2 className="h-4 w-4 animate-spin" /> : <SaveIcon />} Save job target
+                      </Button>
+                    </div>
+                  </div>
                 )}
               </div>
             )}
           </div>
 
-          {profileType === "custom" && showCustomForm && (
-            <div className="grid gap-4 border-t border-border pt-4 md:grid-cols-2">
-              <Field label="Role"><Input value={role} onChange={(event) => setRole(event.target.value)} placeholder="Backend Engineer" /></Field>
-              <Field label="Company name (optional)"><Input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="Company name" /></Field>
-              <div className="md:col-span-2">
-                <Field label="Full job description">
-                  <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-28" />
-                </Field>
-              </div>
-            </div>
-          )}
-
-          {!technical && <p className="text-xs text-muted-foreground">Voice · camera required</p>}
         </>
       )}
-      {(assetError || compileError || profileError) && <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{compileError || profileError || assetError}</div>}
+      {(assetError || compileError || profileError || serviceReadiness === "blocked") && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          {compileError || profileError || serviceReadinessMessage || assetError}
+        </div>
+      )}
+      {serviceReadiness === "checking" && (
+        <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-secondary/20 px-3 py-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" /> Checking service readiness...
+        </div>
+      )}
       {!loadingAssets && !resumes.length && <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"><FileText className="mr-2 inline h-4 w-4" />Upload and activate a resume before starting.</div>}
       <div className="flex justify-end border-t border-border/60 pt-4">
-        <Button disabled={disabled || compiling || savingProfile || !resumeId || (profileType === "custom" ? (!role.trim() || !jobDescription.trim()) : !jobProfileId)} onClick={() => void compile()}>
-          {compiling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} {compiling ? "Preparing..." : `Start ${technical ? "Technical Round" : "Interview Round"}`}
+        <Button disabled={disabled || compiling || serviceReadiness !== "ready" || savingProfile || savingTarget || deletingProfileId !== null || showProfileForm || !resumeId || (requiresSavedJobProfile(profileType) && !jobProfileId)} onClick={() => void compile()}>
+          {compiling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} {compiling && compileStage !== "idle" ? compileStageLabels[compileStage] : `Start ${technical ? "Technical Round" : "Interview Round"}`}
         </Button>
       </div>
+      <Dialog open={Boolean(deleteCandidate)} onOpenChange={(open) => { if (!open && deletingProfileId === null) setDeleteCandidate(null) }}>
+        <DialogContent showCloseButton={deletingProfileId === null}>
+          <DialogHeader>
+            <DialogTitle>Delete job target?</DialogTitle>
+            <DialogDescription>
+              {deleteCandidate ? `${deleteCandidate.role}${deleteCandidate.company ? ` at ${deleteCandidate.company}` : ""} will be removed from saved job targets.` : "This job target will be removed."}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="ghost" disabled={deletingProfileId !== null} onClick={() => setDeleteCandidate(null)}>Cancel</Button>
+            <Button type="button" variant="destructive" disabled={!deleteCandidate || deletingProfileId !== null} onClick={() => deleteCandidate && void removeSavedTarget(deleteCandidate)}>
+              {deletingProfileId !== null && <Loader2 className="h-4 w-4 animate-spin" />} Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
+}
+
+function SaveIcon() {
+  return <Check className="h-4 w-4" />
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {

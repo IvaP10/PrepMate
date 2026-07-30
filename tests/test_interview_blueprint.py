@@ -69,6 +69,9 @@ def test_blueprint_contains_no_placeholder_questions():
     assert all("[relevant" not in question.lower() for question in questions)
     assert any("Software Engineer" in question for question in questions)
     assert all(question.endswith("?") and question.count("?") == 1 for question in questions)
+    assert all(len(question.split()) <= 28 for question in questions)
+    assert all(question.count(",") <= 1 and ";" not in question for question in questions)
+    assert all("Engineer system" not in question for question in questions)
 
 
 def test_project_evidence_precedes_and_anchors_skill_questions():
@@ -88,4 +91,7 @@ def test_project_evidence_precedes_and_anchors_skill_questions():
     assert project_index < skill_index
     assert "InterAI" in sections[skill_index]["opening_question"]
     assert "trade-off" in sections[skill_index]["opening_question"]
+    assert sections[skill_index]["opening_question"] == (
+        "What was the toughest Python trade-off you made in InterAI?"
+    )
     assert "most important decision you made using Python" not in sections[skill_index]["opening_question"]

@@ -1,221 +1,76 @@
 "use client"
+
+import { ArrowDown, ArrowRight, BarChart3, ClipboardCheck, FileUp, MessageSquareText, Target } from "lucide-react"
 import { useScrollReveal } from "@/hooks/use-scroll-reveal"
-import { Shuffle, Wrench, Video, Mic, FileText, Settings, ArrowRight } from "lucide-react"
 
-/* ── Step 1 Visual: Contextualize ── */
-function StepOneVisual() {
-  return (
-    <div className="relative w-full h-[150px] bg-secondary/25 border border-border/40 rounded-lg flex items-center justify-center p-4 overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(20,21,23,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(20,21,23,0.02)_1px,transparent_1px)] bg-[size:16px_16px] dark:bg-[linear-gradient(rgba(255,255,255,0.01)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.01)_1px,transparent_1px)]" />
+const steps = [
+  {
+    icon: FileUp,
+    number: "01",
+    title: "Add your context",
+    description: "Add a resume and job description.",
+  },
+  {
+    icon: MessageSquareText,
+    number: "02",
+    title: "Take the interview",
+    description: "Choose Interview Round or Technical Round.",
+  },
+  {
+    icon: ClipboardCheck,
+    number: "03",
+    title: "Review the evidence",
+    description: "See feedback tied to your work.",
+  },
+]
 
-      <div className="relative flex items-center gap-3 w-full max-w-[280px] justify-between">
-        {/* Left: Input Files */}
-        <div className="flex flex-col gap-2 shrink-0">
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-primary/10 border border-primary/20 text-primary text-[9px] font-bold">
-            <FileText className="w-3.5 h-3.5" />
-            resume.pdf
-          </div>
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-primary/10 border border-primary/20 text-primary text-[9px] font-bold">
-            <FileText className="w-3.5 h-3.5" />
-            job_desc.md
-          </div>
-        </div>
-
-        {/* Center: Connector Arrow */}
-        <div className="flex items-center justify-center text-muted-foreground animate-pulse">
-          <ArrowRight className="w-4 h-4" />
-        </div>
-
-        {/* Right: Settings Control panel */}
-        <div className="landing-solid-card shadow-sm border border-border/80 rounded-md p-2 flex flex-col gap-1.5 w-[110px]">
-          <div className="flex items-center gap-1 text-[8px] font-bold text-muted-foreground uppercase">
-            <Settings className="w-2.5 h-2.5" />
-            Config
-          </div>
-          <div className="h-px bg-border/50" />
-          <div className="flex items-center justify-between text-[9px] font-semibold text-foreground/85">
-            <span>Startup</span>
-            <span className="w-5 h-3 bg-primary/20 border border-primary/30 rounded-full flex items-center px-0.5 justify-end">
-              <span className="w-2 h-2 rounded-full bg-primary" />
-            </span>
-          </div>
-          <div className="text-[9px] font-bold text-primary">
-            Top Tier
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-/* ── Step 2 Visual: Simulate ── */
-function StepTwoVisual() {
-  return (
-    <div className="relative w-full h-[150px] bg-secondary/25 border border-border/40 rounded-lg flex items-center justify-center p-4 overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(20,21,23,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(20,21,23,0.02)_1px,transparent_1px)] bg-[size:16px_16px] dark:bg-[linear-gradient(rgba(255,255,255,0.01)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.01)_1px,transparent_1px)]" />
-
-      <div className="relative flex items-center gap-3 w-full max-w-[280px] justify-between">
-        {/* Left: Webcam Placeholder */}
-        <div className="relative w-[110px] h-[75px] rounded-lg bg-secondary border border-border shadow-md flex items-center justify-center overflow-hidden">
-          <div className="absolute top-1.5 left-1.5 flex items-center gap-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
-            <span className="text-[6.5px] font-mono text-muted-foreground uppercase tracking-widest leading-none">Live</span>
-          </div>
-          <div className="w-5 h-5 rounded-full bg-secondary border border-border flex items-center justify-center">
-            <Video className="w-2.5 h-2.5 text-muted-foreground" />
-          </div>
-        </div>
-
-        {/* Right: Audio Waveform Panel */}
-        <div className="landing-solid-card shadow-sm border border-border/80 rounded-md p-2 flex flex-col gap-1.5 w-[130px] h-[75px] justify-between transition-all duration-300 hover:border-primary/40 hover:shadow-[0_0_15px_rgba(115,86,197,0.1)]">
-          <div className="flex items-center justify-between text-[8px] font-bold text-muted-foreground uppercase">
-            <div className="flex items-center gap-1">
-              <Mic className="w-2.5 h-2.5 text-primary group-hover:scale-110 transition-transform duration-300" />
-              Mic State
-            </div>
-            <span className="text-primary group-hover:animate-pulse">Active</span>
-          </div>
-          {/* Wave heights */}
-          <div className="flex items-end justify-between h-5 gap-0.5 px-0.5">
-            {[40, 70, 30, 90, 50, 80, 20, 60, 40, 75, 15, 50].map((h, i) => (
-              <div
-                key={i}
-                className="w-1.5 bg-primary/70 rounded-full landing-wave-bar"
-                style={{ height: `${h}%`, animationDelay: `${i * 80}ms` }}
-              />
-            ))}
-          </div>
-          <div className="text-[7.5px] text-muted-foreground text-center font-mono group-hover:text-primary transition-colors duration-300">
-            Analyzing speech pacing...
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-/* ── Step 3 Visual: Repair ── */
-function StepThreeVisual() {
-  return (
-    <div className="relative w-full h-[150px] bg-secondary/25 border border-border/40 rounded-lg flex items-center justify-center p-4 overflow-hidden">
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(20,21,23,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(20,21,23,0.02)_1px,transparent_1px)] bg-[size:16px_16px] dark:bg-[linear-gradient(rgba(255,255,255,0.01)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.01)_1px,transparent_1px)]" />
-
-      <div className="relative flex gap-3 w-full max-w-[280px] justify-between">
-        {/* Blind Start Card */}
-        <div className="landing-solid-card shadow-sm border border-border/80 rounded-md p-2.5 flex flex-col gap-1 w-[125px] h-[80px] justify-between">
-          <div className="flex items-center gap-1.5 text-[10.5px] font-bold text-foreground">
-            <Shuffle className="w-3.5 h-3.5 text-muted-foreground" />
-            Blind Start
-          </div>
-          <div className="text-[7.5px] leading-relaxed text-muted-foreground">
-            No context, rapid-fire drills.
-          </div>
-          <span className="text-[8px] font-semibold text-primary bg-primary/10 border border-primary/20 px-1.5 py-0.5 rounded w-fit">
-            3 drills queued
-          </span>
-        </div>
-
-        {/* Fix It Card */}
-        <div className="landing-solid-card shadow-sm border border-border/80 rounded-md p-2.5 flex flex-col gap-1 w-[125px] h-[80px] justify-between">
-          <div className="flex items-center gap-1.5 text-[10.5px] font-bold text-foreground">
-            <Wrench className="w-3.5 h-3.5 text-muted-foreground" />
-            Fix It
-          </div>
-          <div className="text-[7.5px] leading-relaxed text-muted-foreground">
-            Guided response revisions.
-          </div>
-          <span className="text-[8px] font-semibold text-primary/70 bg-primary/5 border border-primary/15 px-1.5 py-0.5 rounded w-fit">
-            5 errors flagged
-          </span>
-        </div>
-      </div>
-    </div>
-  )
-}
+const loop = [
+  { icon: Target, title: "Weakness detected", description: "A gap is saved from your session." },
+  { icon: ClipboardCheck, title: "Drill created", description: "One focused retry is ready." },
+  { icon: MessageSquareText, title: "Answer retried", description: "New evidence replaces the guesswork." },
+  { icon: BarChart3, title: "Improvement measured", description: "See what changed on the next attempt." },
+]
 
 export function HowItWorksSection() {
-  const { ref: sectionRef, isVisible } = useScrollReveal({ threshold: 0.15 })
+  const { ref, isVisible } = useScrollReveal({ threshold: 0.12 })
 
   return (
-    <section
-      id="how-it-works"
-      className="relative px-6 py-28 md:py-36 border-t border-border/40"
-    >
-      <div ref={sectionRef} className="mx-auto max-w-6xl">
-        {/* Section Header */}
-        <div className="mx-auto mb-20 max-w-2xl text-center">
-          <span
-            className={`mb-4 inline-block text-xs font-semibold uppercase tracking-[0.25em] text-primary ${
-              isVisible ? "animate-fade-in-up" : "opacity-0"
-            }`}
-          >
-            The Process
-          </span>
-          <h2
-            className={`text-balance text-4xl sm:text-5xl md:text-6xl font-semibold tracking-[-0.03em] leading-[1.05] text-foreground transition-all duration-700 ${
-              isVisible ? "animate-blur-in delay-100" : "opacity-0"
-            }`}
-          >
-            How InterAI works.
-          </h2>
-          <p
-            className={`mt-6 text-base text-muted-foreground leading-[1.7] ${
-              isVisible ? "animate-fade-in-up delay-300" : "opacity-0"
-            }`}
-          >
-            Three steps. Your resume, the job description, and an AI that builds the interview around both. No generic question banks.
-          </p>
+    <section id="how-it-works" className="landing-chapter-gap landing-screen-section relative border-b border-border/40 px-6 py-12 md:py-14">
+      <div ref={ref} className="mx-auto max-w-6xl">
+        <div className="max-w-2xl">
+          <h2 className={`text-balance text-3xl font-semibold tracking-[-0.035em] text-foreground sm:text-4xl ${isVisible ? "animate-fade-in-up" : "opacity-0"}`}>Every practice session has a clear next step.</h2>
+          <p className={`mt-3 max-w-xl text-base leading-7 text-muted-foreground ${isVisible ? "animate-fade-in-up delay-100" : "opacity-0"}`}>Set the context once, then turn each answer into a more useful retry.</p>
         </div>
 
-        {/* 3-Step Timeline Grid */}
-        <div
-          className={`grid grid-cols-1 lg:grid-cols-3 gap-8 transition-all duration-700 ${
-            isVisible ? "animate-fade-in-up delay-300" : "opacity-0"
-          }`}
-        >
-          {/* Step 1: Contextualize */}
-          <div className="landing-solid-card p-6 border border-border/80 flex flex-col gap-6 justify-between min-h-[380px] rounded-xl hover:scale-[1.01] hover:shadow-xl hover:border-border transition-all duration-300">
-            <div>
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-sm font-bold uppercase tracking-wider text-primary">Step 01</span>
-                <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-primary/10 text-primary">Setup</span>
+        <div className={`mt-8 grid gap-4 md:grid-cols-3 ${isVisible ? "animate-fade-in-up delay-100" : "opacity-0"}`}>
+          {steps.map((step) => (
+            <article key={step.number} className="landing-solid-card rounded-xl border border-border p-5 sm:p-6">
+              <div className="flex items-center justify-between">
+                <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary"><step.icon className="h-5 w-5" /></span>
+                <span className="text-xs font-semibold text-muted-foreground">{step.number}</span>
               </div>
-              <h3 className="text-xl font-bold text-foreground tracking-tight mb-3">Upload Your Profile</h3>
-              <p className="text-sm text-muted-foreground leading-[1.6]">
-                Paste your resume and the job description. The engine maps your experience against the role requirements to build a custom interview.
-              </p>
-            </div>
-            <StepOneVisual />
-          </div>
+              <h3 className="mt-5 text-lg font-semibold text-foreground">{step.title}</h3>
+              <p className="mt-2 text-sm leading-6 text-muted-foreground">{step.description}</p>
+            </article>
+          ))}
+        </div>
 
-          {/* Step 2: Simulate */}
-          <div className="group landing-solid-card p-6 border border-border/80 flex flex-col gap-6 justify-between min-h-[380px] rounded-xl hover:scale-[1.01] hover:shadow-xl hover:border-border transition-all duration-300">
-            <div>
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-sm font-bold uppercase tracking-wider text-primary">Step 02</span>
-                <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-primary/10 text-primary">Execution</span>
-              </div>
-              <h3 className="text-xl font-bold text-foreground tracking-tight mb-3">Run the Simulation</h3>
-              <p className="text-sm text-muted-foreground leading-[1.6]">
-                The AI builds a custom interview loop for your exact role. Every question targets your profile gaps. No two sessions are the same.
-              </p>
-            </div>
-            <StepTwoVisual />
+        <div className={`mt-6 overflow-hidden rounded-2xl border border-primary/20 bg-primary/[0.045] p-5 sm:p-6 ${isVisible ? "animate-fade-in-up delay-200" : "opacity-0"}`}>
+          <div className="flex items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground"><Target className="h-4 w-4" /></span>
+            <div><p className="font-semibold text-foreground">The improvement loop</p><p className="mt-0.5 text-sm text-muted-foreground">One answer becomes a measurable next move.</p></div>
           </div>
-
-          {/* Step 3: Repair */}
-          <div className="landing-solid-card p-6 border border-border/80 flex flex-col gap-6 justify-between min-h-[380px] rounded-xl hover:scale-[1.01] hover:shadow-xl hover:border-border transition-all duration-300">
-            <div>
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-sm font-bold uppercase tracking-wider text-primary">Step 03</span>
-                <span className="text-[9px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-primary/10 text-primary">Feedback</span>
-              </div>
-              <h3 className="text-xl font-bold text-foreground tracking-tight mb-3">Fix Your Weaknesses</h3>
-              <p className="text-sm text-muted-foreground leading-[1.6]">
-                Get evidence-backed feedback for the areas you actually completed. Communication and technical evidence stay separate, and missing evidence is never invented.
-              </p>
+          <div className="relative mt-7">
+            <div className="absolute left-5 top-5 h-[calc(100%-2.5rem)] w-px bg-primary/25 md:left-[12.5%] md:top-5 md:h-px md:w-[75%]" aria-hidden="true" />
+            <div className="grid gap-5 md:grid-cols-4 md:gap-3">
+              {loop.map((item, index) => (
+                <div key={item.title} className="relative z-10 flex gap-3 bg-transparent md:flex-col md:items-center md:text-center">
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-primary/25 bg-card text-primary shadow-sm"><item.icon className="h-4 w-4" /></span>
+                  <div className="min-w-0 md:max-w-[11rem]"><p className="text-sm font-semibold text-foreground">{item.title}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{item.description}</p></div>
+                  {index < loop.length - 1 && <><ArrowRight className="absolute -right-2 top-3 hidden h-4 w-4 rounded-full bg-primary/[0.045] text-primary md:block" aria-hidden="true" /><ArrowDown className="absolute left-3 top-11 h-4 w-4 bg-primary/[0.045] text-primary md:hidden" aria-hidden="true" /></>}
+                </div>
+              ))}
             </div>
-            <StepThreeVisual />
           </div>
         </div>
       </div>

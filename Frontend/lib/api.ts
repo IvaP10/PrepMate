@@ -151,6 +151,11 @@ export async function persistBrowserPreflight(payload: {
 }
 
 export async function uploadResume(file: File): Promise<{ uploadResponse: UploadResponse; parsedData: ResumeData }> {
+  const requestId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `resume-${Date.now()}`
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 45_000)
   try {
     const formData = new FormData()
     formData.append('file', file)
@@ -162,14 +167,25 @@ export async function uploadResume(file: File): Promise<{ uploadResponse: Upload
         credentials: 'include',
         headers: {
           ...getAuthHeaders(),
+          'X-Request-ID': requestId,
         },
         body: formData,
+        signal: controller.signal,
       }
     )
 
     if (!response.ok) {
       const body = await response.json().catch(() => ({}))
-      throw new Error(friendlyMessage(body.detail || body.message || 'Upload failed'))
+      const responseRequestId = response.headers.get('X-Request-ID') || body.request_id || requestId
+      throw {
+        code: body.error?.code || 'UPLOAD_FAILED',
+        message: friendlyMessage(body.error?.message || body.detail || body.message || 'Upload failed'),
+        details: {
+          request_id: responseRequestId,
+          retryable: Boolean(body.error?.retryable),
+          status: response.status,
+        },
+      } as ApiError
     }
 
     const data = await response.json()
@@ -234,10 +250,21 @@ export async function uploadResume(file: File): Promise<{ uploadResponse: Upload
 
     return { uploadResponse, parsedData }
   } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && 'message' in error) throw error
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw {
+        code: 'UPLOAD_TIMEOUT',
+        message: 'Resume processing took too long. Try again with a text-based PDF or DOCX.',
+        details: { request_id: requestId, retryable: true },
+      } as ApiError
+    }
     throw {
       code: 'UPLOAD_FAILED',
       message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to upload resume',
+      details: { request_id: requestId, retryable: true },
     } as ApiError
+  } finally {
+    clearTimeout(timeoutId)
   }
 }
 
@@ -452,6 +479,20 @@ export async function activateResumeVersion(resumeId: string): Promise<ResumeVer
     throw {
       code: 'RESUME_ACTIVATE_FAILED',
       message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to activate resume version',
+    } as ApiError
+  }
+}
+
+export async function deleteResumeVersion(resumeId: string): Promise<void> {
+  try {
+    await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.VERSIONS}/${encodeURIComponent(resumeId)}`,
+      { method: 'DELETE', headers: { ...getAuthHeaders() } },
+    )
+  } catch (error) {
+    throw {
+      code: 'RESUME_DELETE_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to delete resume version',
     } as ApiError
   }
 }
@@ -1275,6 +1316,21 @@ export async function deleteJobProfile(profileId: number): Promise<void> {
   }
 }
 
+export async function copyInterviewJobProfile(interviewId: string): Promise<{ profile: JobProfile; created: boolean }> {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}/workspace/interviews/${encodeURIComponent(interviewId)}/copy-profile`,
+      { method: 'POST', headers: { ...getAuthHeaders() } },
+    )
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'JOB_PROFILE_COPY_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to copy interview profile',
+    } as ApiError
+  }
+}
+
 export async function selectJobProfile(profileId: number): Promise<JobProfile> {
   try {
     const response = await fetchWithRetry(
@@ -1418,6 +1474,35 @@ export async function cancelInterviewSession(interviewId: string) {
   }
 }
 
+export async function abandonInterviewSession(
+  interviewId: string,
+  options: { keepalive?: boolean } = {},
+) {
+  try {
+    const response = await fetch(
+      `${API_CONFIG.BASE_URL}/interview/${interviewId}/abandon`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          ...getAuthHeaders(),
+        },
+        keepalive: options.keepalive,
+      },
+    )
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}))
+      throw new Error(friendlyMessage(error.detail || error.message || 'Failed to end interview attempt'))
+    }
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'ABANDON_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to end interview attempt',
+    } as ApiError
+  }
+}
+
 export async function fetchInterviewStatus(interviewId: string) {
   try {
     const response = await fetchWithRetry(
@@ -1469,6 +1554,7 @@ export interface InterviewAnalysisStatus {
   report_state?: "generating" | "retrying" | "ready" | "partial" | "failed" | "ungradable" | string
   analysis_status?: string
   attempt_status?: string
+  processing_sla_minutes?: number
   retry_in_progress?: boolean
   retryable?: boolean
   job: {
@@ -1563,6 +1649,118 @@ export interface DynamicPerformanceSection {
   }[]
 }
 
+export interface PerformanceTrendPoint {
+  label?: string | null
+  date?: string | null
+  score?: number | null
+  interview_id?: string
+  round_id?: string
+  response_id?: string
+  evidence_id?: string
+  evidence_url?: string
+  source_kind?: "canonical_v4" | "recorded_evidence" | "legacy_report" | string
+  score_state?: "ready" | "processing" | "blocked" | "failed" | "insufficient" | "run_only" | "legacy" | "missing" | string
+  included_in_trend?: boolean
+  detail?: string | null
+  mode?: "interview" | "technical" | string
+  role?: string | null
+}
+
+export interface PerformancePattern {
+  label: string
+  detail?: string | null
+  count?: number
+  session_count?: number
+  recurring?: boolean
+  score?: number | null
+}
+
+export interface PerformanceDirection {
+  label: string
+  delta: number
+  latest_score?: number | null
+  session_count?: number
+}
+
+export interface PerformanceScoreDetail {
+  score?: number | null
+  detail?: string | null
+}
+
+export interface PerformanceProjectExplanation extends PerformanceScoreDetail {
+  answer_count?: number
+  session_count?: number
+  breakdown?: { label: string; score?: number | null }[]
+}
+
+export interface PerformancePagePayload {
+  role: {
+    role?: string | null
+    company?: string | null
+  }
+  interview_view?: {
+    latest_score?: number | null
+    trend: PerformanceTrendPoint[]
+    communication: {
+      fluency_clarity: PerformanceScoreDetail
+      confidence: PerformanceScoreDetail
+      patterns: PerformancePattern[]
+    }
+    project_explanation: PerformanceProjectExplanation
+    insights: {
+      recurring_mistakes: PerformancePattern[]
+      improving: PerformanceDirection[]
+      declining: PerformanceDirection[]
+    }
+    strengths: string[]
+  }
+  technical_view?: {
+    latest_score?: number | null
+    trend: PerformanceTrendPoint[]
+    knowledge_gaps: PerformancePattern[]
+    insights: {
+      recurring_mistakes: PerformancePattern[]
+      improving: PerformanceDirection[]
+      declining: PerformanceDirection[]
+    }
+    strengths: string[]
+  }
+  overall: {
+    latest_interview_score?: number | null
+    performance_trend: PerformanceTrendPoint[]
+    readiness: {
+      score?: number | null
+      label: string
+      role?: string | null
+      detail?: string | null
+      components?: {
+        key: string
+        label: string
+        score?: number | null
+        weight: number
+      }[]
+    }
+  }
+  communication: {
+    fluency_clarity: PerformanceScoreDetail
+    confidence: PerformanceScoreDetail
+    patterns: PerformancePattern[]
+  }
+  technical: {
+    trend: PerformanceTrendPoint[]
+    latest_score?: number | null
+    knowledge_gaps: PerformancePattern[]
+    project_explanation: PerformanceProjectExplanation
+  }
+  insights: {
+    recurring_mistakes: PerformancePattern[]
+    improving: PerformanceDirection[]
+    declining: PerformanceDirection[]
+    ai_insights: string[]
+  }
+  strengths: string[]
+}
+
 export interface DynamicPerformancePayload {
   mode: 'interview' | 'technical' | string
   has_data: boolean
@@ -1577,6 +1775,10 @@ export interface DynamicPerformancePayload {
   source?: 'canonical' | 'legacy' | string
   analysis_id?: string | null
   interview_id?: string | null
+  official_analysis_id?: string | null
+  official_interview_id?: string | null
+  official_score?: number | null
+  official_scored_at?: string | null
   overall_score?: number | null
   duration_seconds?: number | null
   evidence_status?: string | null
@@ -1599,23 +1801,71 @@ export interface DynamicPerformancePayload {
     excluded_incompatible_count?: number
   } | null
   trend?: DynamicPerformanceSection['trend']
+  page_summary?: Record<string, unknown>
+  has_evidence?: boolean
+  has_official_score?: boolean
+  score_state?: "ready" | "processing" | "blocked" | "failed" | "insufficient" | "run_only" | "legacy" | "missing" | string
+  source_kind?: "canonical_v4" | "recorded_evidence" | "legacy_report" | "unavailable" | string
+  included_in_trend?: boolean
 }
 
 export interface PerformanceData {
   interview: DynamicPerformancePayload
   technical: DynamicPerformancePayload
+  page?: PerformancePagePayload
+  history?: {
+    official: PerformanceTrendPoint[]
+    legacy: PerformanceTrendPoint[]
+  }
   availability?: {
     completed_count: number
     missing_canonical_count: number
     pending_count: number
+    blocked_count?: number
     failed_count: number
+    worker_available?: boolean
+    processing_sla_minutes?: number
+    by_mode?: Record<string, {
+      completed_count: number
+      ready: number
+      processing: number
+      blocked: number
+      failed: number
+      insufficient: number
+      run_only: number
+      legacy: number
+      missing: number
+    }>
+    sessions?: {
+      interview_id: string
+      mode: string
+      score_state: string
+      analysis_id?: string | null
+      job_status?: string | null
+      retry_count?: number
+      has_evidence?: boolean
+      has_official_score?: boolean
+    }[]
   }
 }
 
-export async function reconcilePerformance(): Promise<{ status: string; queued_count: number }> {
+export interface PerformanceReconcileResult {
+  status: string
+  queued_count: number
+  already_running_count?: number
+  retry_exhausted_count?: number
+  rejected_count?: number
+  ready_count?: number
+  processing_sla_minutes?: number
+  next_cursor?: string | null
+  has_more?: boolean
+}
+
+export async function reconcilePerformance(cursor?: string | null): Promise<PerformanceReconcileResult> {
   try {
+    const search = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""
     const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.ANALYSIS.RECONCILE_PERFORMANCE}`,
+      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.ANALYSIS.RECONCILE_PERFORMANCE}${search}`,
       { method: 'POST', headers: { ...getAuthHeaders() } },
     )
     return await response.json()
@@ -1674,9 +1924,11 @@ export interface TechnicalRoundHistoryItem {
 export interface TechnicalRoundSession {
   interview_id: string
   profile_type?: string | null
+  job_title?: string | null
   interview_status?: string | null
   interview_completed_at?: string | null
   duration_seconds?: number | null
+  official_score?: number | null
   cta?: {
     label?: string
     nav?: string
@@ -1821,6 +2073,17 @@ export async function fetchPaymentPlans() {
       message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load payment plans',
     } as ApiError
   }
+}
+
+export async function fetchPaymentSubscription() {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.GET_SUBSCRIPTION}`,
+    {
+      method: 'GET',
+      headers: { ...getAuthHeaders() },
+    },
+  )
+  return await response.json()
 }
 
 export async function fetchEntitlements() {

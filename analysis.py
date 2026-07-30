@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
+from datetime import datetime
 from typing import Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from analysis_pipeline import enqueue_analysis
+from analysis_pipeline import (
+    SESSION_PERFORMANCE_VERSION,
+    enqueue_analysis,
+)
 from auth import get_current_user
 from database import async_execute
 
 router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
 logger = logging.getLogger("analysis")
 
-_REPORT_READY_STATUSES = {"completed", "partial", "failed"}
+_REPORT_READY_STATUSES = {"completed", "report_ready", "partial", "failed"}
 _ANALYSIS_STATUSES = {"analysis_pending", "analysis_running"}
 
 
@@ -31,69 +37,124 @@ class AnalysisTriggerRequest(BaseModel):
     reason: Optional[str] = "manual_trigger"
 
 
+def _decode_reconcile_cursor(value: Optional[str]) -> tuple[Optional[datetime], Optional[str]]:
+    if not value:
+        return None, None
+    try:
+        padded = value + ("=" * (-len(value) % 4))
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        return datetime.fromisoformat(str(payload["completed_at"])), str(payload["interview_id"])
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid reconciliation cursor.",
+        ) from exc
+
+
+def _encode_reconcile_cursor(completed_at: datetime, interview_id: str) -> str:
+    payload = json.dumps({
+        "completed_at": completed_at.isoformat(),
+        "interview_id": interview_id,
+    }, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
 @router.post("/reconcile-performance", status_code=status.HTTP_202_ACCEPTED)
-async def reconcile_performance(current_user: Dict = Depends(get_current_user)):
+async def reconcile_performance(
+    cursor: Optional[str] = Query(default=None),
+    limit: int = Query(default=25, ge=1, le=100),
+    current_user: Dict = Depends(get_current_user),
+):
+    cursor_value = cursor if isinstance(cursor, str) else None
+    limit_value = limit if isinstance(limit, int) else 25
+    cursor_completed_at, cursor_interview_id = _decode_reconcile_cursor(cursor_value)
     rows = await async_execute(
         """
-        SELECT i.interview_id
+        SELECT i.interview_id, COALESCE(i.completed_at, i.created_at) AS ordering_time
         FROM Interviews i
         WHERE i.user_id = %s
-          AND i.status IN ('completed', 'partial', 'failed')
+          AND i.status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
+          AND i.attempt_status = 'completed'
           AND (
-              i.attempt_status = 'completed'
-              OR EXISTS (
-                  SELECT 1 FROM InterviewResponses response
-                  WHERE response.interview_id = i.interview_id
-              )
-              OR EXISTS (
-                  SELECT 1 FROM TechnicalSubmissions submission
-                  WHERE submission.interview_id = i.interview_id
-                    AND submission.user_id = i.user_id
-              )
-              OR EXISTS (
-                  SELECT 1 FROM TechnicalRunEvents event
-                  JOIN TechnicalInterviewRounds round ON round.round_id = event.round_id
-                  WHERE round.interview_id = i.interview_id
-                    AND event.user_id = i.user_id
-              )
-              OR EXISTS (
-                  SELECT 1 FROM TechnicalCodeSnapshots snapshot
-                  WHERE snapshot.interview_id = i.interview_id
-                    AND snapshot.user_id = i.user_id
-                    AND snapshot.source_chars > 0
-              )
-              OR EXISTS (
-                  SELECT 1 FROM TechnicalExecutionJobs execution
-                  WHERE execution.interview_id = i.interview_id
-                    AND execution.user_id = i.user_id
-                    AND execution.status IN ('queued', 'leased', 'running', 'completed')
-              )
+              %s::timestamp IS NULL
+              OR (COALESCE(i.completed_at, i.created_at), i.interview_id)
+                 < (%s::timestamp, %s)
           )
           AND NOT EXISTS (
               SELECT 1 FROM SessionPerformanceAnalyses spa
               WHERE spa.interview_id = i.interview_id
                 AND spa.user_id = i.user_id
-                AND spa.schema_version = 'session-performance-v3'
+                AND spa.schema_version = %s
                 AND spa.status = 'ready'
+                AND spa.is_current = TRUE
                 AND spa.analysis_json_encrypted IS NOT NULL
+                AND spa.evidence_index_encrypted IS NOT NULL
           )
-        ORDER BY i.completed_at DESC NULLS LAST
-        LIMIT 25
+        ORDER BY COALESCE(i.completed_at, i.created_at) DESC, i.interview_id DESC
+        LIMIT %s
         """,
-        (current_user["user_id"],),
+        (
+            current_user["user_id"],
+            cursor_completed_at, cursor_completed_at, cursor_interview_id,
+            SESSION_PERFORMANCE_VERSION, limit_value,
+        ),
         fetchall=True,
     )
-    queued = []
+    results = []
+    counts = {
+        "queued": 0,
+        "already_running": 0,
+        "ready": 0,
+        "report_ready": 0,
+        "retry_exhausted": 0,
+        "rejected": 0,
+    }
     for row in rows or []:
-        job_id = await enqueue_analysis(
+        enqueue_result = await enqueue_analysis(
             str(row[0]),
             current_user["user_id"],
             "performance_reconciliation",
             force_canonical_rebuild=True,
+            return_result=True,
         )
-        if job_id:
-            queued.append({"interview_id": str(row[0]), "job_id": job_id})
-    return {"status": "queued" if queued else "up_to_date", "queued": queued, "queued_count": len(queued)}
+        result = (
+            enqueue_result
+            if isinstance(enqueue_result, dict)
+            else {
+                "state": "queued" if enqueue_result else "rejected",
+                "job_id": enqueue_result,
+                "reason": None if enqueue_result else "analysis_not_queued",
+            }
+        )
+        state_name = str(result.get("state") or "rejected")
+        counts[state_name] = counts.get(state_name, 0) + 1
+        results.append({
+            "interview_id": str(row[0]),
+            "job_id": result.get("job_id"),
+            "state": state_name,
+            "reason": result.get("reason"),
+        })
+
+    next_cursor = None
+    if rows and len(rows) == limit_value and len(rows[-1]) > 1:
+        next_cursor = _encode_reconcile_cursor(rows[-1][1], str(rows[-1][0]))
+    active_count = counts.get("queued", 0) + counts.get("already_running", 0)
+    return {
+        "status": "queued" if active_count else ("attention_required" if counts.get("retry_exhausted") else "up_to_date"),
+        "results": results,
+        "queued": [
+            item for item in results
+            if item["state"] in {"queued", "already_running"}
+        ],
+        "queued_count": counts.get("queued", 0),
+        "already_running_count": counts.get("already_running", 0),
+        "retry_exhausted_count": counts.get("retry_exhausted", 0),
+        "rejected_count": counts.get("rejected", 0),
+        "ready_count": counts.get("ready", 0) + counts.get("report_ready", 0),
+        "next_cursor": next_cursor,
+        "has_more": next_cursor is not None,
+        "processing_sla_minutes": 15,
+    }
 
 
 @router.post("/trigger")
@@ -124,13 +185,13 @@ async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict =
         UPDATE Interviews
         SET analysis_job_id = %s,
             status = CASE
-                WHEN status IN ('completed', 'partial', 'failed')
+                WHEN status IN ('completed', 'report_ready', 'partial', 'failed')
                      AND report_json IS NULL AND report_json_encrypted IS NULL
                 THEN 'analysis_pending'
                 ELSE status
             END
         WHERE interview_id = %s AND user_id = %s
-          AND status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
+          AND status IN ('analysis_pending', 'analysis_running', 'completed', 'report_ready', 'partial', 'failed')
         """,
         (job_id, request.interview_id, current_user["user_id"]),
     )

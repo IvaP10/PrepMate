@@ -1,5 +1,5 @@
 "use client"
-import { useState, useEffect, useLayoutEffect, useCallback, useRef, type CSSProperties } from "react"
+import { lazy, Suspense, useState, useEffect, useLayoutEffect, useCallback, useRef, type CSSProperties } from "react"
 import { Navbar } from "@/components/landing/navbar"
 import { AnnouncementBar } from "@/components/landing/announcement-bar"
 import { HeroSection } from "@/components/landing/hero-section"
@@ -10,9 +10,7 @@ import { PerformanceSection } from "@/components/landing/performance-section"
 import { PricingSection } from "@/components/landing/pricing-section"
 import { CtaSection } from "@/components/landing/cta-section"
 import { Footer } from "@/components/landing/footer"
-import { AuthScreen } from "@/components/auth-screen"
 import { ThemeLogo } from "@/components/theme-logo"
-import { AppShell } from "@/components/app-shell"
 import { ResumeProvider } from "@/context/resume-context"
 import { PremiumBackground } from "@/components/premium-background"
 import { useTheme } from "@/hooks/use-theme"
@@ -23,7 +21,7 @@ import { readImproveTarget } from "@/lib/improve-navigation"
 import type { ExactImproveTarget } from "@/lib/api"
 import { toast } from "sonner"
 
-type AppView = "checking" | "landing" | "auth" | "authenticating" | "dashboard"
+type AppView = "checking" | "landing" | "auth" | "dashboard"
 type AuthMode = "login" | "signup"
 
 const APP_VIEW_KEY = "interai_app_view"
@@ -31,6 +29,12 @@ const AUTH_MODE_KEY = "interai_auth_mode"
 const LANDING_NAV_HEIGHT = 64
 const ANNOUNCEMENT_BAR_HEIGHT = 40
 const LANDING_ANCHOR_GAP = 12
+const loadAuthScreen = () =>
+  import("@/components/auth-screen").then((module) => ({ default: module.AuthScreen }))
+const loadAppShell = () =>
+  import("@/components/app-shell").then((module) => ({ default: module.AppShell }))
+const LazyAuthScreen = lazy(loadAuthScreen)
+const LazyAppShell = lazy(loadAppShell)
 
 function readPersistedAuthMode(): AuthMode {
   if (typeof window === "undefined") return "login"
@@ -46,6 +50,10 @@ function readPersistedAppView(): AppView | null {
 
 /** Client-only restore — must not run during SSR (causes hydration mismatch). */
 function readClientAppState(): { view: AppView; user: AuthUser | null; authMode: AuthMode } {
+  const requestedAuth = new URLSearchParams(window.location.search).get("auth")
+  if (requestedAuth === "login" || requestedAuth === "signup") {
+    return { view: "auth", user: null, authMode: requestedAuth }
+  }
   const user = getStoredUser()
   if (user) {
     return { view: "dashboard", user, authMode: "login" }
@@ -62,7 +70,7 @@ function readClientAppState(): { view: AppView; user: AuthUser | null; authMode:
 
 function persistAppView(view: AppView, authMode: AuthMode) {
   if (typeof window === "undefined") return
-  if (view === "checking" || view === "authenticating") return
+  if (view === "checking") return
   safeStorageSet("session", APP_VIEW_KEY, view)
   if (view === "auth") {
     safeStorageSet("session", AUTH_MODE_KEY, authMode)
@@ -95,6 +103,7 @@ export default function Home() {
 
   useLayoutEffect(() => {
     const state = readClientAppState()
+    if (state.user) void loadAppShell()
     setAuthUser(state.user)
     setAuthMode(state.authMode)
     setCurrentView(state.view)
@@ -107,7 +116,7 @@ export default function Home() {
     if (!silent) {
       setCurrentView((prev) => {
         if (prev === "dashboard" && getStoredUser()) return prev
-        if (prev === "auth" || prev === "authenticating") return prev
+        if (prev === "auth") return prev
         if (prev === "landing") return prev
         return "checking"
       })
@@ -124,7 +133,7 @@ export default function Home() {
 
     setAuthUser(null)
     setCurrentView((prev) => {
-      if (prev === "auth" || prev === "authenticating") return prev
+      if (prev === "auth") return prev
       return "landing"
     })
   }, [])
@@ -134,6 +143,7 @@ export default function Home() {
 
     const params = new URLSearchParams(window.location.search)
     const verified = params.get("verified")
+    const requestedAuth = params.get("auth")
     let showAuth = false
 
     if (verified === "true") {
@@ -153,6 +163,12 @@ export default function Home() {
             : "Something went wrong. Please try again.",
       })
       setAuthMode("signup")
+      showAuth = true
+      window.history.replaceState({}, "", window.location.pathname)
+    }
+
+    if (requestedAuth === "login" || requestedAuth === "signup") {
+      setAuthMode(requestedAuth)
       showAuth = true
       window.history.replaceState({}, "", window.location.pathname)
     }
@@ -191,7 +207,6 @@ export default function Home() {
 
     const onPageShow = (event: PageTransitionEvent) => {
       const view = currentViewRef.current
-      if (view === "authenticating") return
 
       if (view === "checking" || event.persisted) {
         resyncShellFromStorage()
@@ -228,6 +243,8 @@ export default function Home() {
   }, [currentView])
 
   const goToAuth = (mode: AuthMode = "login") => {
+    void loadAuthScreen()
+    void loadAppShell()
     setAuthMode(mode)
     setCurrentView("auth")
   }
@@ -242,12 +259,15 @@ export default function Home() {
   const handleLogin = (user: AuthUser) => {
     setAuthUser(user)
     if (typeof window !== "undefined") {
-      safeStorageSet("session", "dashboard_tab", initialTab === "improve" ? "improve" : "interview")
+      const requestedTab = (
+        initialTab
+        && ["improve", "interview", "coding", "technical", "resume", "performance", "analytics", "membership", "settings"].includes(initialTab)
+      )
+        ? initialTab
+        : "interview"
+      safeStorageSet("session", "dashboard_tab", requestedTab)
     }
-    setCurrentView("authenticating")
-    setTimeout(() => {
-      setCurrentView("dashboard")
-    }, 2000)
+    setCurrentView("dashboard")
   }
   const handleLogout = async () => {
     await logout()
@@ -277,30 +297,17 @@ export default function Home() {
     return (
       <>
         <PremiumBackground theme={theme} mode="base" />
-        <AuthScreen onLogin={handleLogin} onBack={goToLanding} theme={theme} verified={emailVerified} initialMode={authMode} />
+        <Suspense fallback={<AuthCheckingScreen theme={theme} />}>
+          <LazyAuthScreen onLogin={handleLogin} onBack={goToLanding} theme={theme} verified={emailVerified} initialMode={authMode} />
+        </Suspense>
       </>
-    )
-  }
-  if (currentView === "authenticating") {
-    return (
-      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-background">
-        <PremiumBackground theme={theme} mode="base" />
-        <div className="animate-blur-in flex flex-col items-center gap-8 relative z-10">
-          <ThemeLogo size={80} />
-          <div className="overflow-hidden">
-            <span className="animate-fade-in-up delay-300 block text-sm font-medium tracking-[0.3em] uppercase text-muted-foreground opacity-0">
-              Authenticating
-            </span>
-          </div>
-        </div>
-      </div>
     )
   }
   if (currentView === "dashboard") {
     return (
-      <>
+      <Suspense fallback={<AuthCheckingScreen theme={theme} />}>
         <ResumeProvider userId={authUser?.user_id ?? null}>
-          <AppShell
+          <LazyAppShell
             user={authUser}
             onLogout={handleLogout}
             onUserUpdate={handleUserUpdate}
@@ -310,7 +317,7 @@ export default function Home() {
             initialImproveTarget={initialImproveTarget}
           />
         </ResumeProvider>
-      </>
+      </Suspense>
     )
   }
 
@@ -323,10 +330,11 @@ export default function Home() {
         "--muted-foreground": theme === "dark" ? "#D4D4D8" : "#000000",
         "--color-foreground": theme === "dark" ? "#FFFFFF" : "#000000",
         "--color-muted-foreground": theme === "dark" ? "#D4D4D8" : "#000000",
+        "--landing-header-height": `${LANDING_NAV_HEIGHT + (announcementVisible ? ANNOUNCEMENT_BAR_HEIGHT : 0)}px`,
       } as CSSProperties}
     >
       <div className="scroll-progress" style={{ width: `${scrollProgress}%` }} />
-      <PremiumBackground theme={theme} mode={theme === "dark" ? "comets" : "base"} />
+      <PremiumBackground theme={theme} mode="base" />
       <div data-landing-header className="fixed top-0 left-0 right-0 z-50 flex flex-col">
         <Navbar
           onLogin={() => goToAuth("login")}
@@ -340,7 +348,7 @@ export default function Home() {
         )}
       </div>
       <main className="relative z-10">
-        <HeroSection key={`landing-hero-${theme}`} onGetStarted={goToSignup} theme={theme} />
+        <HeroSection onGetStarted={goToSignup} theme={theme} />
         <HowItWorksSection />
         <ModesSection onGetStarted={goToSignup} />
         <PerformanceSection />

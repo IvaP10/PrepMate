@@ -45,6 +45,7 @@ def _request(client: httpx.Client, method: str, path: str, **kwargs) -> httpx.Re
 
 def seed(api_base_url: str, output: Path) -> dict:
     _require_local(api_base_url)
+    output.parent.mkdir(parents=True, exist_ok=True)
     suffix = uuid.uuid4().hex[:10]
     email = f"release-e2e-{suffix}@example.test"
     password = f"E2e!{secrets.token_urlsafe(18)}aA1"
@@ -100,6 +101,21 @@ def seed(api_base_url: str, output: Path) -> dict:
                 "using idempotent jobs and database indexing."
             )
             document.save(resume_path)
+            visual_document = Document()
+            visual_document.add_heading(name, 0)
+            visual_document.add_paragraph(email)
+            visual_document.add_heading("Summary", level=1)
+            visual_document.add_paragraph(
+                "Backend engineer validating a second persisted resume version through the browser."
+            )
+            visual_document.add_heading("Skills", level=1)
+            visual_document.add_paragraph("Python, FastAPI, PostgreSQL, Playwright")
+            visual_document.add_heading("Experience", level=1)
+            visual_document.add_paragraph(
+                "Backend Engineer at Example Systems. Added browser-backed release gates "
+                "for authenticated interview workflows."
+            )
+            visual_document.save(output.with_name("visual-system-resume.docx"))
             with resume_path.open("rb") as resume_file:
                 resume_upload = _request(
                     client,
@@ -134,7 +150,11 @@ def seed(api_base_url: str, output: Path) -> dict:
         ).json()
         job_profile_id = int(job_profile["profile_id"])
 
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    # Match the application path: psycopg converts aware UTC datetimes into the
+    # database session timezone before storing timestamp-without-time-zone
+    # columns. Stripping tzinfo here made fresh fixtures appear 5.5 hours old on
+    # Asia/Kolkata hosts, so the stale-session cleaner expired them immediately.
+    now = datetime.now(timezone.utc)
     interview_id = str(uuid.uuid4())
     technical_id = str(uuid.uuid4())
     report_id = str(uuid.uuid4())
@@ -380,7 +400,6 @@ def seed(api_base_url: str, output: Path) -> dict:
         "job_profile_id": job_profile_id,
         "api_base_url": api_base_url,
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(fixture, indent=2) + "\n", encoding="utf-8")
     return fixture
 
@@ -403,6 +422,7 @@ def cleanup(api_base_url: str, fixture_path: Path) -> None:
             json={"password": fixture["password"]},
         )
     fixture_path.unlink(missing_ok=True)
+    fixture_path.with_name("visual-system-resume.docx").unlink(missing_ok=True)
 
 
 def main() -> int:

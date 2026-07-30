@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 BLUEPRINT_SCHEMA_VERSION = "interview_blueprint_v1"
-BLUEPRINT_COMPILER_VERSION = "deterministic-blueprint-compiler-v3"
+BLUEPRINT_COMPILER_VERSION = "deterministic-blueprint-compiler-v5"
 
 _STOP_WORDS = {
     "and", "the", "with", "for", "from", "that", "this", "your", "you",
@@ -256,7 +256,7 @@ def compile_interview_blueprint(
                 label=f"{name} project depth",
                 kind="project",
                 anchor=name,
-                question=f"Walk me through what you personally built in {name}?",
+                question=f"What did you personally build in {name}?",
                 importance="critical" if index == 1 else "high",
                 difficulty="matched",
                 selection_reason="Resume project claim requires evidence and ownership",
@@ -273,9 +273,9 @@ def compile_interview_blueprint(
             project = projects[0] if projects else None
             project_name = _text(project.get("name"), 100) if project else ""
             question = (
-                f"In {project_name}, which {skill} design decision most affected reliability, latency, or accuracy, and what trade-off did you accept?"
+                f"What was the toughest {skill} trade-off you made in {project_name}?"
                 if project_name else
-                f"Which {skill} design decision did you personally make for this role, and what trade-off did you accept?"
+                f"What was the toughest {skill} trade-off you had to make?"
             )
             add(_section(
                 section_id=f"critical-skill-{index}",
@@ -303,9 +303,9 @@ def compile_interview_blueprint(
                 kind="technical",
                 anchor=skill,
                 question=(
-                    f"In {project_name}, why did you choose {skill}, what alternative did you reject, and how did you validate the choice?"
+                    f"Why did you choose {skill} for {project_name}?"
                     if project_name else
-                    f"Why would you choose {skill} for this role, what alternative would you reject, and how would you validate the choice?"
+                    f"When would you choose {skill} over another option?"
                 ),
                 importance="high" if index <= 2 else "medium",
                 difficulty="stretch" if profile_type == "top_tier" and index <= 2 else "matched",
@@ -320,7 +320,7 @@ def compile_interview_blueprint(
             label="Ownership under constraints",
             kind="behavioral",
             anchor=job_title,
-            question=f"Tell me about a difficult decision you personally owned in your {job_title} work?",
+            question=f"What was the toughest decision you owned as a {job_title}?",
             importance="high",
             difficulty="matched",
             selection_reason="Behavioral evidence and STAR structure coverage",
@@ -341,8 +341,8 @@ def compile_interview_blueprint(
         "Learning from failure",
     ]
     fallback_questions = {
-        "Problem solving": f"How would you break down an ambiguous problem for a {job_title} system?",
-        "System design": f"What would you clarify first when designing a {job_title} system?",
+        "Problem solving": "You get a vague requirement. What do you clarify first?",
+        "System design": "What would you clarify before designing the system?",
         "Testing and reliability": "What failure would you test first before shipping?",
         "Communication": "How do you explain a difficult technical trade-off to a teammate?",
         "Data modelling": "What access pattern would drive your data model first?",
@@ -475,9 +475,21 @@ def validate_blueprint(blueprint: Dict[str, Any]) -> Dict[str, Any]:
         seen_questions.add(normalized_question)
         if any(token in question.lower() for token in ("[placeholder]", "[relevant", "todo", "lorem ipsum")):
             raise ValueError(f"Blueprint section {section_id} contains a placeholder question")
-        if question.count("?") != 1 or not question.endswith("?") or len(question.split()) > 45:
+        if question.count("?") != 1 or not question.endswith("?") or len(question.split()) > 28:
             raise ValueError(f"Blueprint section {section_id} must contain one concise question")
-        if any(phrase in normalized_question for phrase in ("please explain", "discuss in detail", "write an essay")):
+        if question.count(",") > 1 or ";" in question:
+            raise ValueError(f"Blueprint section {section_id} contains a checklist instead of one question")
+        if any(
+            phrase in normalized_question
+            for phrase in (
+                "please explain",
+                "discuss in detail",
+                "write an essay",
+                "walk through requirements",
+                "go one level deeper",
+                "provide a comprehensive",
+            )
+        ):
             raise ValueError(f"Blueprint section {section_id} is not naturally phrased")
         if not section.get("taxonomy_keys") or not section.get("expected_points") or not section.get("rubric"):
             raise ValueError(f"Blueprint section {section_id} is missing evidence contracts")

@@ -1,6 +1,7 @@
 "use client"
-import { useState } from "react"
-import { Check, X } from "lucide-react"
+
+import { useState, type PointerEvent } from "react"
+import { ArrowRight, Check } from "lucide-react"
 import { useScrollReveal } from "@/hooks/use-scroll-reveal"
 
 interface PricingSectionProps {
@@ -9,300 +10,108 @@ interface PricingSectionProps {
 
 type BillingCycle = "monthly" | "annual"
 
-const seriousPricing = { monthly: 999, annual: 799, annualBilled: 9588 }
-const fullPrepPricing = { monthly: 1499, annual: 1199, annualBilled: 14388 }
-
-function formatPrice(n: number) {
-  return `₹${n.toLocaleString("en-IN")}`
+const prices = {
+  pro: { monthly: 999, annual: 799, annualBilled: 9588 },
+  premium: { monthly: 1499, annual: 1199, annualBilled: 14388 },
 }
 
-const weeklyFeatures = [
-  { text: "1 AI Mock Interview per week", included: true },
-  { text: "Technical Assessments", included: false },
-  { text: "Personalised Performance Report", included: true },
-  { text: "JD-Based Behavioral Rounds", included: false },
-  { text: "Full Loop Simulation", included: false },
+const plans = [
+  {
+    name: "Free",
+    description: "For a consistent interview practice habit.",
+    price: "₹0",
+    features: ["1 Interview Round per week", "Evidence-based feedback report", "Focused Drills from your feedback"],
+    action: "Create account",
+  },
+  {
+    name: "Pro",
+    description: "For steady Interview and Technical Round preparation.",
+    features: ["3 Interview Rounds per week", "1 Technical Round per week", "Job-description-based Interview Rounds", "Evidence-based feedback and Focused Drills"],
+    action: "Choose Pro",
+    highlighted: true,
+  },
+  {
+    name: "Premium",
+    description: "For higher-volume, role-specific preparation.",
+    features: ["5 Interview Rounds per week", "3 Technical Rounds per week", "Job-description-based Interview and Technical Rounds", "Code review, feedback, and Focused Drills"],
+    action: "Choose Premium",
+  },
 ]
 
-const seriousFeatures = [
-  { text: "3 AI Mock Interviews per week", included: true },
-  { text: "1 Technical Assessment per week", included: true },
-  { text: "JD-Based Behavioral Rounds", included: true },
-  { text: "Personalised Performance Reports", included: true },
-]
-
-const fullPrepFeatures = [
-  { text: "5 AI Mock Interviews per week", included: true },
-  { text: "3 Technical Assessments per week", included: true },
-  { text: "JD-Based Interview and Technical Rounds", included: true },
-  { text: "Personalised Performance Reports", included: true },
-]
+function formatPrice(value: number) {
+  return `₹${value.toLocaleString("en-IN")}`
+}
 
 export function PricingSection({ onGetStarted }: PricingSectionProps) {
   const [billing, setBilling] = useState<BillingCycle>("monthly")
-  const [hoveredCard, setHoveredCard] = useState<number | null>(null)
-  const { ref: sectionRef, isVisible } = useScrollReveal({ threshold: 0.1 })
-  const isAnnual = billing === "annual"
+  const { ref, isVisible } = useScrollReveal({ threshold: 0.1 })
+  const annual = billing === "annual"
+
+  const updateSpotlight = (event: PointerEvent<HTMLElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect()
+    event.currentTarget.style.setProperty("--pricing-pointer-x", `${event.clientX - bounds.left}px`)
+    event.currentTarget.style.setProperty("--pricing-pointer-y", `${event.clientY - bounds.top}px`)
+  }
 
   return (
-    <section id="pricing" className="relative px-6 pt-14 pb-24 md:pt-16 md:pb-28 border-t border-border/40">
-      <div ref={sectionRef} className="mx-auto max-w-6xl">
-
-        {/* Section Header */}
-        <div className="mx-auto mb-10 max-w-2xl text-center">
-          <span className={`mb-4 inline-block text-xs font-semibold uppercase tracking-[0.25em] text-primary ${isVisible ? "animate-fade-in-up" : "opacity-0"}`}>
-            Pricing
-          </span>
-          <h2 className={`text-balance text-3xl sm:text-4xl md:text-5xl font-semibold tracking-[-0.03em] leading-[1.1] text-foreground transition-all duration-700 ${isVisible ? "animate-blur-in delay-100" : "opacity-0"}`}>
-            Pick your prep intensity.
-          </h2>
-          <p className={`mt-5 text-sm sm:text-base text-muted-foreground leading-[1.65] ${isVisible ? "animate-fade-in-up delay-300" : "opacity-0"}`}>
-            Start free. Scale up when you have a real interview on the calendar.
-          </p>
+    <section id="pricing" className="landing-chapter-gap landing-screen-section relative border-b border-border/40 px-6 py-12 md:py-14">
+      <div ref={ref} className="mx-auto max-w-7xl">
+        <div className="mx-auto max-w-3xl text-center">
+          <h2 className={`text-balance text-3xl font-semibold tracking-[-0.035em] text-foreground sm:text-4xl ${isVisible ? "animate-fade-in-up" : "opacity-0"}`}>Choose the practice time you need.</h2>
+          <p className={`mt-3 text-base leading-7 text-muted-foreground ${isVisible ? "animate-fade-in-up delay-100" : "opacity-0"}`}>More weekly rounds and Technical Round access when you need it.</p>
         </div>
 
-        {/* Toggle Billing Cycles */}
-        <div className="mx-auto mb-10 flex items-center justify-center gap-4">
-          <span className={`text-sm font-medium transition-colors duration-200 ${!isAnnual ? "text-foreground" : "text-muted-foreground"}`}>
-            Monthly
-          </span>
-          <button
-            onClick={() => setBilling(isAnnual ? "monthly" : "annual")}
-            className="relative h-7 w-[52px] cursor-pointer rounded-full border border-foreground/15 bg-secondary shadow-[inset_0_0_0_1px_rgba(255,255,255,0.22)] transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 dark:border-white/15 dark:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]"
-            aria-label="Toggle billing cycle"
-          >
-            <span
-              className={`absolute top-0.5 left-0.5 h-5.5 w-5.5 rounded-full bg-primary shadow-sm transition-transform duration-300 ${
-                isAnnual ? "translate-x-[24px]" : "translate-x-0"
-              }`}
-            />
-          </button>
-          <span className={`text-sm font-medium transition-colors duration-200 ${isAnnual ? "text-foreground" : "text-muted-foreground"}`}>
-            Annual
-          </span>
-          <span
-            className={`inline-flex items-center rounded-[4px] bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary transition-all duration-300 ${
-              isAnnual ? "scale-100 opacity-100" : "scale-90 opacity-0 pointer-events-none"
-            }`}
-          >
-            Save 20%
-          </span>
+        <div className="mx-auto mt-7 flex min-h-16 flex-col items-center">
+          <div className="billing-switch relative grid w-[220px] grid-cols-2 rounded-xl border border-border bg-card p-1 text-sm shadow-sm">
+            <span className={`billing-switch-thumb absolute bottom-1 top-1 left-1 w-[calc(50%-0.25rem)] rounded-lg bg-secondary shadow-sm ${annual ? "translate-x-full" : "translate-x-0"}`} aria-hidden="true" />
+            <button type="button" aria-pressed={!annual} onClick={() => setBilling("monthly")} className={`relative z-10 rounded-lg px-4 py-2 font-medium transition-colors duration-300 ${!annual ? "text-foreground" : "text-muted-foreground"}`}>Monthly</button>
+            <button type="button" aria-pressed={annual} onClick={() => setBilling("annual")} className={`relative z-10 rounded-lg px-4 py-2 font-medium transition-colors duration-300 ${annual ? "text-foreground" : "text-muted-foreground"}`}>Annual</button>
+          </div>
+          <div className="h-7 overflow-hidden" aria-live="polite">
+            <span className={`mt-2 inline-flex rounded-full bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary transition-all duration-500 ${annual ? "translate-y-0 opacity-100" : "-translate-y-2 opacity-0"}`}>Save 20% with annual billing</span>
+          </div>
         </div>
 
-        {/* Pricing Cards Grid */}
-        <div className={`grid grid-cols-1 gap-8 items-stretch lg:grid-cols-3 spatial-stage overflow-visible pt-2 pb-4 ${isVisible ? "animate-fade-in-up delay-300" : "opacity-0"}`}>
-
-          {/* Card 1: Weekly (Free) */}
-          <div
-            onMouseEnter={() => setHoveredCard(0)}
-            onMouseLeave={() => setHoveredCard(null)}
-            className={`landing-solid-card flex flex-col justify-between rounded-xl border border-border bg-white p-8 transition-all duration-500 ease-out select-none ${
-              hoveredCard === 0
-                ? "shadow-xl shadow-primary/5"
-                : hoveredCard !== null
-                  ? "scale-[0.99]"
-                  : ""
-            }`}
-            style={{
-              transform: hoveredCard === 0
-                ? "rotateX(0deg) rotateY(0deg) translateZ(12px) scale(1.012)"
-                : hoveredCard !== null
-                  ? "rotateX(10deg) rotateY(8deg) translateZ(-4px)"
-                  : "rotateX(8deg) rotateY(6deg) translateZ(0px)",
-              transformStyle: "preserve-3d",
-            }}
-          >
-            <div>
-              <div className="mb-6">
-                <h3 className="text-lg font-semibold text-foreground">Weekly</h3>
-                <p className="mt-1 text-xs text-muted-foreground leading-relaxed">Build the habit. One real interview every week, free forever.</p>
-              </div>
-
-              <div className="flex items-baseline gap-1 my-6" style={{ transform: "translateZ(5px)" }}>
-                <span className="text-4xl font-bold tracking-tight text-foreground">₹0</span>
-              </div>
-
-              <div className="space-y-3.5 border-t border-border/40 pt-6">
-                {weeklyFeatures.map((f) => (
-                  <div key={f.text} className="flex items-start gap-2.5">
-                    {f.included ? (
-                      <Check className="h-4 w-4 shrink-0 text-primary mt-0.5" />
-                    ) : (
-                      <X className="h-4 w-4 shrink-0 text-foreground/20 mt-0.5" />
-                    )}
-                    <span className={`text-sm leading-relaxed ${f.included ? "text-foreground/70" : "text-foreground/25 line-through"}`}>
-                      {f.text}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="mt-8 pt-4" style={{ transform: "translateZ(10px)" }}>
-              <button
-                onClick={onGetStarted}
-                className="h-11 w-full rounded-lg border border-border/60 bg-transparent text-sm font-medium text-foreground/70 transition-all duration-200 hover:bg-secondary/50 hover:text-foreground cursor-pointer"
+        <div className={`pricing-window-set mt-7 grid gap-3 lg:grid-cols-3 ${isVisible ? "animate-fade-in-up delay-200" : "opacity-0"}`}>
+          {plans.map((plan, planIndex) => {
+            const price = plan.name === "Pro" ? prices.pro : plan.name === "Premium" ? prices.premium : null
+            const displayedPrice = price ? formatPrice(price[annual ? "annual" : "monthly"]) : plan.price
+            const windowShape = planIndex === 0
+              ? "lg:[border-radius:1.75rem_1.15rem_1.35rem_2rem] lg:[transform:rotateY(3.5deg)_translateX(5px)] lg:[transform-origin:right_center]"
+              : planIndex === 1
+                ? "lg:z-[2] lg:-translate-y-[7px] lg:[border-radius:1.45rem]"
+                : "lg:[border-radius:1.15rem_1.75rem_2rem_1.35rem] lg:[transform:rotateY(-3.5deg)_translateX(-5px)] lg:[transform-origin:left_center]"
+            return (
+              <article
+                key={plan.name}
+                data-featured={plan.highlighted ? "true" : "false"}
+                data-position={planIndex === 0 ? "left" : planIndex === 1 ? "center" : "right"}
+                onPointerMove={updateSpotlight}
+                onPointerLeave={(event) => {
+                  event.currentTarget.style.setProperty("--pricing-pointer-x", "50%")
+                  event.currentTarget.style.setProperty("--pricing-pointer-y", "35%")
+                }}
+                className={`pricing-plan-card landing-solid-card group relative flex min-h-[410px] flex-col overflow-hidden rounded-3xl border p-6 ${windowShape}`}
               >
-                Create Account
-              </button>
-            </div>
-          </div>
-
-          {/* Card 2: Serious (Most Popular) */}
-          <div
-            onMouseEnter={() => setHoveredCard(1)}
-            onMouseLeave={() => setHoveredCard(null)}
-            className={`landing-solid-card relative flex flex-col justify-between rounded-xl border border-primary/30 bg-white p-8 shadow-lg shadow-primary/8 transition-all duration-500 ease-out select-none ${
-              hoveredCard === 1
-                ? ""
-                : hoveredCard !== null
-                  ? "scale-[0.99]"
-                  : ""
-            }`}
-            style={{
-              transform: hoveredCard === 1
-                ? "rotateX(0deg) rotateY(0deg) translateZ(24px) scale(1.012)"
-                : hoveredCard !== null
-                  ? "rotateX(10deg) rotateY(4deg) translateZ(-3px)"
-                  : "rotateX(8deg) rotateY(2deg) translateZ(12px)",
-              transformStyle: "preserve-3d",
-            }}
-          >
-            {/* Badge */}
-            <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-primary text-primary-foreground text-[11px] font-semibold tracking-wide whitespace-nowrap">
-              MOST POPULAR
-            </div>
-
-            <div>
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold text-foreground">Serious</h3>
-                <p className="mt-1 text-xs text-muted-foreground leading-relaxed">For when you have an interview coming up and can&apos;t afford to guess.</p>
-              </div>
-
-              <div className="flex items-baseline gap-2 my-6" style={{ transform: "translateZ(10px)" }}>
-                <span className={`font-bold tracking-tight transition-all duration-500 ease-out ${
-                  isAnnual
-                    ? "text-xl text-muted-foreground line-through opacity-60"
-                    : "text-4xl text-foreground"
-                }`}>
-                  {formatPrice(seriousPricing.monthly)}
-                </span>
-                <span className={`font-bold tracking-tight transition-all duration-500 ease-out origin-left ${
-                  isAnnual
-                    ? "text-4xl text-foreground opacity-100 translate-x-0 max-w-[150px] scale-100"
-                    : "text-xl text-transparent opacity-0 -translate-x-2 max-w-0 scale-75 pointer-events-none"
-                } overflow-hidden whitespace-nowrap`}>
-                  {formatPrice(seriousPricing.annual)}
-                </span>
-                <span className="text-xs text-muted-foreground">/ month</span>
-              </div>
-
-              {isAnnual && (
-                <p className="text-[11px] text-muted-foreground mb-4">
-                  billed {formatPrice(seriousPricing.annualBilled)} / year
-                </p>
-              )}
-
-              <div className="space-y-3.5 border-t border-border/40 pt-6">
-                {seriousFeatures.map((f) => (
-                  <div key={f.text} className="flex items-start gap-2.5">
-                    <Check className="h-4 w-4 shrink-0 text-primary mt-0.5" />
-                    <span className="text-sm text-foreground/70 leading-relaxed">{f.text}</span>
+                <div className="relative z-10 flex h-full flex-col">
+                  <div className="flex items-start justify-between gap-3">
+                    <h3 className="text-xl font-semibold text-foreground">{plan.name}</h3>
+                    {plan.highlighted && <span className="rounded-full bg-primary px-2.5 py-1 text-[10px] font-semibold text-primary-foreground">Recommended</span>}
                   </div>
-                ))}
-              </div>
-            </div>
+                  <p className="mt-3 min-h-10 text-sm leading-5 text-muted-foreground">{plan.description}</p>
+                  <div className="mt-4 flex items-baseline gap-2" aria-live="polite"><span key={`${plan.name}-${billing}`} className="animate-blur-in text-4xl font-semibold tracking-tight text-foreground">{displayedPrice}</span>{price && <span className="text-sm text-muted-foreground">/ month</span>}</div>
+                  <p className="mt-1 min-h-4 text-xs text-muted-foreground">{annual && price ? `Billed ${formatPrice(price.annualBilled)} yearly` : price ? "Billed monthly" : "No payment required"}</p>
 
-            <div className="mt-8 pt-4" style={{ transform: "translateZ(15px)" }}>
-              <button
-                onClick={onGetStarted}
-                className="h-11 w-full rounded-lg bg-primary text-sm font-semibold text-primary-foreground shadow-lg shadow-primary/20 hover:shadow-primary/30 hover:brightness-110 transition-all duration-200 cursor-pointer"
-              >
-                Upgrade to Serious
-              </button>
-            </div>
-          </div>
-
-          {/* Card 3: Full Prep */}
-          <div
-            onMouseEnter={() => setHoveredCard(2)}
-            onMouseLeave={() => setHoveredCard(null)}
-            className={`landing-solid-card flex flex-col justify-between rounded-xl border border-border bg-white p-8 transition-all duration-500 ease-out select-none ${
-              hoveredCard === 2
-                ? "shadow-xl shadow-primary/5"
-                : hoveredCard !== null
-                  ? "scale-[0.99]"
-                  : ""
-            }`}
-            style={{
-              transform: hoveredCard === 2
-                ? "rotateX(0deg) rotateY(0deg) translateZ(12px) scale(1.012)"
-                : hoveredCard !== null
-                  ? "rotateX(10deg) rotateY(-8deg) translateZ(-4px)"
-                  : "rotateX(8deg) rotateY(-5deg) translateZ(0px)",
-              transformStyle: "preserve-3d",
-            }}
-          >
-            <div>
-              <div className="mb-4">
-                <h3 className="text-lg font-semibold text-foreground">Full Prep</h3>
-                <p className="mt-1 text-xs text-muted-foreground leading-relaxed">Unlimited prep, fully calibrated to every role you apply for.</p>
-              </div>
-
-              <div className="mb-4 px-3 py-1.5 rounded-lg bg-primary/8 border border-primary/15 text-[11px] text-primary font-medium text-center">
-                Early Bird: Register by 30 July 2026 to get Premium free for 1 month
-              </div>
-
-              <div className="flex items-baseline gap-2 my-6" style={{ transform: "translateZ(5px)" }}>
-                <span className={`font-bold tracking-tight transition-all duration-500 ease-out ${
-                  isAnnual
-                    ? "text-xl text-muted-foreground line-through opacity-60"
-                    : "text-4xl text-foreground"
-                }`}>
-                  {formatPrice(fullPrepPricing.monthly)}
-                </span>
-                <span className={`font-bold tracking-tight transition-all duration-500 ease-out origin-left ${
-                  isAnnual
-                    ? "text-4xl text-foreground opacity-100 translate-x-0 max-w-[150px] scale-100"
-                    : "text-xl text-transparent opacity-0 -translate-x-2 max-w-0 scale-75 pointer-events-none"
-                } overflow-hidden whitespace-nowrap`}>
-                  {formatPrice(fullPrepPricing.annual)}
-                </span>
-                <span className="text-xs text-muted-foreground">/ month</span>
-              </div>
-
-              {isAnnual && (
-                <p className="text-[11px] text-muted-foreground mb-4">
-                  billed {formatPrice(fullPrepPricing.annualBilled)} / year
-                </p>
-              )}
-
-              <div className="space-y-3.5 border-t border-border/40 pt-6">
-                {fullPrepFeatures.map((f) => (
-                  <div key={f.text} className="flex items-start gap-2.5">
-                    <Check className="h-4 w-4 shrink-0 text-primary mt-0.5" />
-                    <span className="text-sm text-foreground/70 leading-relaxed">{f.text}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="mt-8 pt-4" style={{ transform: "translateZ(10px)" }}>
-              <button
-                onClick={onGetStarted}
-                className="h-11 w-full rounded-lg bg-secondary text-sm font-semibold text-foreground/70 hover:bg-secondary/80 hover:text-foreground transition-all duration-200 cursor-pointer"
-              >
-                Get Full Prep
-              </button>
-            </div>
-          </div>
-
+                  <ul className="mt-6 space-y-2">
+                    {plan.features.map((feature) => <li key={feature} className="pricing-feature flex gap-2.5 text-sm leading-5 text-foreground/80"><span className="pricing-feature-check mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-primary/20 bg-primary/10 text-primary"><Check className="h-2.5 w-2.5" /></span>{feature}</li>)}
+                  </ul>
+                  <button onClick={onGetStarted} className={`pricing-card-action mt-auto flex h-11 w-full items-center justify-center gap-2 rounded-xl text-sm font-semibold transition-colors duration-300 ${plan.highlighted ? "bg-primary text-primary-foreground" : "border border-border bg-card/80 text-foreground hover:bg-secondary"}`}>{plan.action}<ArrowRight className="h-4 w-4" /></button>
+                </div>
+              </article>
+            )
+          })}
         </div>
-
-        {/* Trust signal */}
-        <p className="text-center mt-10 text-sm text-foreground/35 max-w-md mx-auto">
-          Cancel anytime. No commitment. Built for the exact interview you&apos;re facing.
-        </p>
+        <p className="mx-auto mt-7 max-w-2xl text-center text-xs leading-5 text-muted-foreground">Early Bird: new registrations before 30 July 2026 receive Premium free for 30 days. Cancel any time.</p>
       </div>
     </section>
   )

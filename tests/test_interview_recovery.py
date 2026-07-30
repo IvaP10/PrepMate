@@ -13,6 +13,13 @@ def test_interview_round_rejects_text_input_but_technical_remains_typed():
     technical = interview.StartInterviewRequest(interview_type="technical", input_mode="text")
     assert technical.input_mode == "text"
 
+    technical_blueprint = interview.StartInterviewRequest(
+        blueprint_id="technical-blueprint-1",
+        input_mode="text",
+    )
+    assert technical_blueprint.blueprint_id == "technical-blueprint-1"
+    assert technical_blueprint.input_mode == "text"
+
 
 def test_disconnect_enters_durable_recovery_with_deadline():
     async def run():
@@ -46,3 +53,5 @@ def test_expired_recovery_is_incomplete_not_scored():
     assert "status = 'cancelled'" in query
     assert "overall_score = NULL" in query
     assert "status = 'recovering'" in query
+    assert "UPDATE TechnicalInterviewRounds round" in query
+    assert "round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')" in query

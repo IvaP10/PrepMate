@@ -23,7 +23,7 @@ from config import settings
 logger = logging.getLogger("database")
 
 _connection_pool = None
-ALEMBIC_HEAD_REVISION = "015_improve_graph_invariants"
+ALEMBIC_HEAD_REVISION = "020_resume_version_detach"
 REQUIRED_SCHEMA_TABLES = (
     "ResumeVersions",
     "InterviewBlueprints",
@@ -33,6 +33,7 @@ REQUIRED_SCHEMA_TABLES = (
     "TechnicalProblemBank",
     "TechnicalExecutionJobs",
     "AnalysisJobs",
+    "EvidenceManifests",
     "AIUsageReservations",
     "AttemptContextSnapshots",
     "AttemptPreflightChecks",
@@ -46,11 +47,20 @@ REQUIRED_SCHEMA_COLUMNS = {
     },
     "ResumeVersions": {"parent_resume_id", "superseded_at", "immutable_at"},
     "InterviewResponses": {"idempotency_key", "evidence_hash", "answer_text_encrypted"},
-    "AnalysisJobs": {"lease_owner", "lease_expires_at", "heartbeat_at", "next_attempt_at"},
+    "AnalysisJobs": {
+        "lease_owner", "lease_expires_at", "heartbeat_at", "next_attempt_at",
+        "producer_version",
+    },
     "AnalysisStageOutputs": {"stage_version", "evidence_hash", "output_encrypted"},
     "SessionPerformanceAnalyses": {
         "evaluator_version", "taxonomy_version", "rubric_version",
         "analysis_json_encrypted", "evidence_index_encrypted",
+        "revision_no", "is_current", "supersedes_analysis_id",
+        "producer_version",
+    },
+    "EvidenceManifests": {
+        "revision_no", "is_current", "supersedes_manifest_id",
+        "producer_version",
     },
     "TechnicalExecutionJobs": {"lease_owner", "lease_expires_at", "heartbeat_at", "next_attempt_at"},
     "ImprovementAttemptSessions": {"deadline_at", "remaining_seconds", "expires_at"},

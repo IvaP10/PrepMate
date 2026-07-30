@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -10,12 +11,26 @@ import sys
 import time
 
 from openai import OpenAI
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import settings
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        help="Optional dotenv file to load before validating application settings.",
+    )
+    args = parser.parse_args()
+    if args.env_file:
+        if not args.env_file.is_file():
+            raise SystemExit(f"Environment file does not exist: {args.env_file}")
+        load_dotenv(args.env_file, override=False)
+
+    from config import settings
+
     if not settings.OPENAI_API_KEY:
         raise SystemExit("OPENAI_API_KEY is required for the live canary")
     model = os.getenv("OPENAI_CANARY_MODEL", settings.OPENAI_EVALUATION_MODEL)
@@ -30,9 +45,20 @@ def main() -> int:
     }
     if model.startswith("gpt-5"):
         request["reasoning"] = {"effort": "minimal"}
-    response = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20, max_retries=0).responses.create(
-        **request,
-    )
+    try:
+        response = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20, max_retries=0).responses.create(
+            **request,
+        )
+    except Exception as exc:
+        print(json.dumps({
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "model": model,
+            "store": False,
+            "maximum_cost_usd": maximum_cost,
+            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        }, sort_keys=True))
+        return 1
     usage = response.usage
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)

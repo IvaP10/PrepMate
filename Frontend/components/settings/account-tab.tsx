@@ -93,10 +93,7 @@ export function AccountTab({
       
       {!isGoogle && (
         <div className="dashboard-card">
-          <div className="mb-1 flex items-center gap-2">
-            <Lock className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold text-foreground">Change Password</h3>
-          </div>
+          <h3 className="mb-1 text-sm font-semibold text-foreground">Change Password</h3>
           <p className="mb-4 text-xs text-muted-foreground">Must be at least 8 characters with uppercase, lowercase, digit, and special character.</p>
           <div className="space-y-3 max-w-md">
             <div className="flex flex-col gap-1.5">

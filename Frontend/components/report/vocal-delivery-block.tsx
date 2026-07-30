@@ -1,7 +1,7 @@
 "use client"
 
 import React from "react"
-import { Mic, MessageSquareQuote, AlertTriangle, Zap } from "lucide-react"
+import { AlertTriangle, Zap } from "lucide-react"
 import type { AnalysisSection, VocalDeliverySection, Severity } from "@/types/premium-report"
 
 interface VocalDeliveryBlockProps {
@@ -44,10 +44,7 @@ export function VocalDeliveryBlock({
         {contentAccuracy && (
           <div className="space-y-4">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h3 className="text-base font-semibold text-foreground flex items-center gap-2">
-                <MessageSquareQuote className="h-4 w-4 text-muted-foreground" />
-                {contentAccuracy.title}
-              </h3>
+              <h3 className="text-base font-semibold text-foreground">{contentAccuracy.title}</h3>
               <SeverityStrip severity={contentAccuracy.severity} />
             </div>
 
@@ -90,10 +87,7 @@ export function VocalDeliveryBlock({
         {vocalDelivery && (
           <div className="space-y-4">
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h3 className="text-base font-semibold text-foreground flex items-center gap-2">
-                <Mic className="h-4 w-4 text-muted-foreground" />
-                {vocalDelivery.title}
-              </h3>
+              <h3 className="text-base font-semibold text-foreground">{vocalDelivery.title}</h3>
               <SeverityStrip severity={vocalDelivery.severity} />
             </div>
 

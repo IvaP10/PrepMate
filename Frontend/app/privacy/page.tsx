@@ -1,4 +1,5 @@
 import { LegalPageShell, type LegalSection } from "@/components/legal-page-shell"
+import { PublicContactDetails } from "@/components/public-contact-details"
 
 const sections: LegalSection[] = [
   { id: "overview", title: "Overview" },
@@ -275,10 +276,7 @@ export default function PrivacyPage() {
 
       <section id="contact">
         <h2>12. Contact</h2>
-        <p>
-          For privacy questions or requests, contact [privacy email]. For support, contact [support
-          email]. For legal notices, contact [legal notices email].
-        </p>
+        <p><PublicContactDetails /></p>
       </section>
     </LegalPageShell>
   )

@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState } from "react"
-import { Code2, CheckCircle2, XCircle, AlertCircle, ChevronDown, ChevronUp, Cpu, Flame } from "lucide-react"
+import { Code2, CheckCircle2, XCircle, AlertCircle, ChevronDown, ChevronUp } from "lucide-react"
 
 interface Annotation {
   line?: number
@@ -109,10 +109,7 @@ export function ProblemDeepDive({
         <div className="grid gap-6 md:grid-cols-2">
           {/* Test Case Breakdown */}
           <div className="space-y-3 rounded-lg border border-border/50 bg-secondary/15 p-4">
-            <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
-              <CheckCircle2 className="h-4 w-4 text-muted-foreground" />
-              Test Results
-            </h4>
+            <h4 className="text-sm font-semibold text-foreground">Test Results</h4>
             <div className="grid grid-cols-2 gap-4 text-sm mt-2">
               <div className="bg-card/40 border border-border/40 p-2.5 rounded">
                 <span className="text-xs text-muted-foreground block">Visible Tests</span>
@@ -130,8 +127,7 @@ export function ProblemDeepDive({
               )}
             </div>
             {!passedAll && !evidenceUnknown && (
-              <p className="text-xs text-rose-500 mt-2 italic flex items-center gap-1">
-                <Flame className="h-3 w-3 shrink-0" />
+              <p className="text-xs text-rose-500 mt-2 italic">
                 {failedVisibleRun
                   ? "Latest run failed visible tests; no final submit was recorded."
                   : isEvidenceOnly
@@ -143,10 +139,7 @@ export function ProblemDeepDive({
 
           {/* Approach summary */}
           <div className="space-y-3 rounded-lg border border-border/50 bg-secondary/15 p-4">
-            <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
-              <Cpu className="h-4 w-4 text-muted-foreground" />
-              Complexity & Approach
-            </h4>
+            <h4 className="text-sm font-semibold text-foreground">Complexity & Approach</h4>
             <div className="text-sm text-muted-foreground leading-relaxed">
               {approach ? (
                 <p className="line-clamp-3 hover:line-clamp-none transition-all">{approach}</p>
@@ -171,10 +164,7 @@ export function ProblemDeepDive({
         {/* Mistakes & Fixes / Code Annotations */}
         {annotations.length > 0 && (
           <div className="space-y-3">
-            <h4 className="text-sm font-semibold text-foreground flex items-center gap-1.5">
-              <AlertCircle className="h-4 w-4 text-amber-500" />
-              Line-Level Feedback
-            </h4>
+            <h4 className="text-sm font-semibold text-foreground">Line-Level Feedback</h4>
             <div className="space-y-3">
               {annotations.map((note, noteIdx) => {
                 const lineNum = note.line ?? note.start_line

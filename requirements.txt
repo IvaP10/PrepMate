@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn[standard]
 python-dotenv
@@ -13,9 +15,9 @@ razorpay
 redis
 openai
 pymupdf
-paddlepaddle; python_version < "3.14"
-paddleocr>=3.0.0
-spacy
+paddlepaddle==3.2.2; python_version < "3.14"
+paddleocr>=3.0.0,<4
+spacy>=3.8,<4
 python-docx
 numpy
 cryptography
@@ -23,7 +25,9 @@ websockets
 aiohttp>=3.13.4
 requests>=2.33.0
 Pygments>=2.20.0
-kokoro
+torch==2.13.0+cpu; sys_platform == "linux"
+torch==2.13.0; sys_platform != "linux"
+kokoro==0.9.4
 soundfile
 sentry-sdk[fastapi]
 httpx>=0.28.1

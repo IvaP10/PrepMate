@@ -19,15 +19,18 @@ cd Frontend && npm ci && cd ..
 python3 -m alembic upgrade head
 ```
 
-Run three processes in separate terminals:
+In development, the API starts the durable analysis and technical worker
+process by default, so run two processes in separate terminals:
 
 ```bash
 uvicorn app:app --reload --host 0.0.0.0 --port 8000
-python3 worker.py
 cd Frontend && npm run dev
 ```
 
-The API commits analysis and code-execution jobs; only `worker.py` claims them. Production code never runs untrusted submissions on the API host.
+Set `DEVELOPMENT_AUTO_WORKER=false` when you want to run `python3 worker.py`
+as a separate local process. Production always uses the separate worker service.
+The API commits analysis and code-execution jobs; durable workers claim them.
+Production code never runs untrusted submissions on the API host.
 
 ## Option A Docker deployment
 
@@ -71,13 +74,21 @@ Raw audio/video retention defaults to disabled (`RAW_VIDEO_RETENTION_HOURS=0`, `
 ## Validation
 
 ```bash
+git fetch --prune
+python3 scripts/release_source_guard.py
 python3 -m pytest -q
 python3 -m alembic upgrade head
 python3 -m compileall -q .
 cd Frontend && npm run lint -- --incremental false && npm run build
 ```
 
-For a release, also prove an empty-database migration and an existing-database upgrade, worker lease/restart recovery, duplicate answer/finalization behavior, sandbox hidden-test secrecy and adversarial resource-limit probes, export/delete coverage, authenticated browser flows across all four areas, and the latency gates in the implementation plan.
+The source guard intentionally fails when deployment files are untracked, the
+worktree is dirty, or the local commit is not the pushed upstream commit. For a
+release, also pass `scripts/openai_canary.py`, prove an empty-database migration
+and an existing-database upgrade, worker lease/restart recovery, duplicate
+answer/finalization behavior, sandbox hidden-test secrecy and adversarial
+resource-limit probes, export/delete coverage, authenticated browser flows
+across all four areas, and the latency gates in the implementation plan.
 
 ## Operational notes
 

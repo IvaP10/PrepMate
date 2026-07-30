@@ -13,7 +13,7 @@ async function captureReleaseVisual(page: Page, name: string) {
 test.describe("authenticated production lifecycle", () => {
   test.skip(process.env.E2E_REQUIRE_AUTH !== "true", "Requires a seeded disposable release account")
 
-  test("dashboard and Improve expose one current action while future nodes stay locked", async ({ page }) => {
+  test("Improve exposes one current action while future nodes stay locked", async ({ page }) => {
     const params = new URLSearchParams({
       tab: "improve",
       mission_id: process.env.E2E_MISSION_ID!,
@@ -21,12 +21,11 @@ test.describe("authenticated production lifecycle", () => {
       exercise_id: process.env.E2E_EXERCISE_ID!,
     })
     await page.goto(`/?${params}`)
-    await expect(page.getByText("Next best action")).toBeVisible()
-    await expect(page.getByRole("button", { name: /Continue/ }).first()).toBeVisible()
+    await expect(page.getByText("Interview learning path", { exact: true })).toBeVisible()
+    await expect(page.getByText("Path progress", { exact: true })).toBeVisible()
     await expect(page.locator("ol button:enabled")).toHaveCount(1)
-    await expect(page.getByText("Predicted", { exact: true })).toBeVisible()
-    await expect(page.getByText(/Prediction confidence:/)).toBeVisible()
-    await expect(page.getByText("Project ownership", { exact: true }).first()).toBeVisible()
+    await expect(page.getByRole("dialog")).toBeVisible()
+    await expect(page.getByRole("button", { name: "Start", exact: true })).toBeVisible()
     await captureReleaseVisual(page, "authenticated-improve")
   })
 
@@ -40,10 +39,9 @@ test.describe("authenticated production lifecycle", () => {
     })
     await page.goto(`/?${params}`)
     await page.getByRole("button", { name: "Start", exact: true }).click()
-    await expect(page.getByText("Attempt in progress")).toBeVisible()
-    await page.getByRole("button", { name: /Answer B/ }).click()
-    await page.getByLabel("Why is this stronger?").fill(
-      "It starts with the direct answer, explains how the decision works, adds a concrete example, and closes with the measurable result.",
+    await expect(page.getByText("Attempt in progress")).toHaveCount(0)
+    await page.getByLabel("Rewrite with exact ownership").fill(
+      "I owned the idempotent job redesign, chose a database-backed lease after rejecting an in-memory lock, and reduced duplicate processing to zero while cutting p95 latency by 38 percent.",
     )
     await expect(page.getByRole("button", { name: "Submit attempt" })).toBeEnabled()
     await page.getByRole("button", { name: "Submit attempt" }).click()
@@ -54,7 +52,8 @@ test.describe("authenticated production lifecycle", () => {
 
   test("interview reconnect surface never exposes coaching or scores", async ({ page }) => {
     await page.goto(`/interview/${process.env.E2E_INTERVIEW_ID}`)
-    await expect(page.getByText(/interview/i).first()).toBeVisible()
+    await expect(page.getByRole("heading", { name: "Share your screen" })).toBeVisible()
+    await expect(page.getByRole("button", { name: "Share screen" })).toBeVisible()
     await expect(page.getByText(/your score|coaching feedback/i)).toHaveCount(0)
     await captureReleaseVisual(page, "interview-preflight")
     await page.reload()
@@ -91,10 +90,13 @@ test.describe("authenticated production lifecycle", () => {
 
   test("controlled camera, microphone, and screen media enter the live interview workspace", async ({ page }) => {
     test.skip(process.env.E2E_MUTATE_FIXTURES !== "true", "Requires a disposable mutation fixture")
-    await page.goto(`/interview/${process.env.E2E_INTERVIEW_ID}`)
-    await page.getByRole("button", { name: "Share screen" }).click()
+    test.setTimeout(90_000)
+    await page.goto("/?tab=interview")
+    await expect(page.getByRole("radiogroup", { name: "Interview profile" })).toBeVisible()
+    await page.getByRole("button", { name: "Start Interview Round", exact: true }).click()
+    await expect(page).toHaveURL(/\/interview\/[a-f0-9-]+(?:\?.*)?$/, { timeout: 30_000 })
     await expect(page.getByRole("button", { name: /End Interview|Leave interview/ })).toBeVisible({ timeout: 20_000 })
-    await expect(page.getByRole("heading", { name: /Hi Release, I am Ava/i })).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByRole("heading", { name: /Hi .* I am /i })).toBeVisible({ timeout: 30_000 })
     await expect(page.getByText("Warm-up", { exact: true })).toBeVisible()
     await expect(page.getByText(/Starting interview/i)).toBeHidden({ timeout: 20_000 })
     await expect(page.getByText(/Camera/).first()).toBeVisible()

@@ -33,15 +33,26 @@ def init_redis_client():
 
     _last_init_attempt = monotonic()
     try:
-        _redis_pool = redis.ConnectionPool(
-            host=settings.REDIS_HOST,
-            port=settings.REDIS_PORT,
-            db=settings.REDIS_DB,
-            max_connections=settings.REDIS_MAX_CONNECTIONS,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-        )
+        connection_options = {
+            "max_connections": settings.REDIS_MAX_CONNECTIONS,
+            "decode_responses": True,
+            "socket_connect_timeout": 5,
+            "socket_timeout": 5,
+        }
+        if settings.REDIS_URL:
+            # Managed Redis services (including Railway) encode authentication,
+            # TLS, host, port, and database selection in one private URL.
+            _redis_pool = redis.ConnectionPool.from_url(
+                settings.REDIS_URL,
+                **connection_options,
+            )
+        else:
+            _redis_pool = redis.ConnectionPool(
+                host=settings.REDIS_HOST,
+                port=settings.REDIS_PORT,
+                db=settings.REDIS_DB,
+                **connection_options,
+            )
         _redis_client = redis.Redis(connection_pool=_redis_pool)
         _redis_client.ping()
         logger.info(

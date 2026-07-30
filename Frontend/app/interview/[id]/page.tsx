@@ -19,7 +19,7 @@ import { useAudioEnvironment } from "@/hooks/use-audio-environment"
 import { useSessionControlLock } from "@/hooks/use-session-control-lock"
 import { getAuthHeaders } from "@/lib/auth"
 import { API_CONFIG } from "@/lib/config"
-import { cancelInterviewSession, endInterviewSession } from "@/lib/api"
+import { abandonInterviewSession, cancelInterviewSession, endInterviewSession } from "@/lib/api"
 import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
 import {
   getTechnicalPermissionState,
@@ -1076,14 +1076,20 @@ export default function InterviewRoom() {
       event.preventDefault()
       event.returnValue = ""
     }
-    const onPageHide = () => cleanupInterviewEnvironment()
+    const onPageHide = () => {
+      if (!interviewEndSentRef.current) {
+        interviewEndSentRef.current = true
+        void abandonInterviewSession(sessionId, { keepalive: true }).catch(() => undefined)
+      }
+      cleanupInterviewEnvironment()
+    }
     window.addEventListener("beforeunload", onBeforeUnload)
     window.addEventListener("pagehide", onPageHide)
     return () => {
       window.removeEventListener("beforeunload", onBeforeUnload)
       window.removeEventListener("pagehide", onPageHide)
     }
-  }, [cleanupInterviewEnvironment, interviewState, showAnalyzing])
+  }, [cleanupInterviewEnvironment, interviewState, sessionId, showAnalyzing])
 
   useEffect(() => {
     if (showAnalyzing || interviewState === "complete") return
@@ -1370,10 +1376,7 @@ function MeetSidePanel({
   return (
     <aside className="w-80 border-l border-border flex flex-col bg-background shrink-0 animate-in slide-in-from-right duration-200">
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <div className="flex items-center gap-2">
-          <Brain className="w-4 h-4 text-primary" />
-          <h3 className="text-sm font-medium text-foreground">AI Assistant</h3>
-        </div>
+        <h3 className="text-sm font-medium text-foreground">AI Assistant</h3>
         <button onClick={onClose} className="w-8 h-8 rounded-full hover:bg-border flex items-center justify-center text-muted-foreground transition-colors">
           <X className="w-4 h-4" />
         </button>

@@ -106,6 +106,89 @@ def _materialize_resume(payload: Dict[str, Any], facts_payload: Dict[str, Any]) 
     return result
 
 
+def _resume_skill_labels(value: Any) -> list[str]:
+    raw = value.split(",") if isinstance(value, str) else value if isinstance(value, list) else []
+    labels: list[str] = []
+    for item in raw:
+        label = (
+            item.get("name") or item.get("skill")
+            if isinstance(item, dict)
+            else item
+        )
+        cleaned = re.sub(r"\s+", " ", str(label or "")).strip()
+        if cleaned and cleaned.lower() not in {existing.lower() for existing in labels}:
+            labels.append(cleaned[:80])
+    return labels[:16]
+
+
+def _resolve_blueprint_job_target(
+    *,
+    job_row: Any,
+    resume_payload: Dict[str, Any],
+    profile_type: str,
+    requested_job_profile_id: Optional[int],
+) -> Dict[str, Any]:
+    if job_row:
+        encrypted_jd = job_row[3]
+        if isinstance(encrypted_jd, memoryview):
+            encrypted_jd = encrypted_jd.tobytes()
+        if isinstance(encrypted_jd, bytes):
+            encrypted_jd = encrypted_jd.decode("utf-8")
+        job_description = decrypt_data(encrypted_jd) if isinstance(encrypted_jd, str) else ""
+        requirements = _json_value(job_row[4], {})
+        has_full_job_description = bool(str(job_description or "").strip())
+        if not job_description and isinstance(requirements, dict):
+            job_description = "\n".join(str(item) for item in requirements.get("requirements") or [])
+        role = str(job_row[1] or "").strip()
+        company = str(job_row[2] or "").strip()
+        if profile_type == "custom" and not (role and has_full_job_description):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "Custom requires the role and full job description",
+            )
+        return {
+            "job_profile_id": job_row[0],
+            "role": role or "General Interview",
+            "company": company,
+            "job_description": job_description,
+            "experience_level": job_row[5],
+            "source": "saved_profile",
+        }
+
+    if requested_job_profile_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Job target not found")
+    if profile_type == "custom":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Add or select a saved profile with a full job description before starting a Custom round",
+        )
+
+    role = str(
+        resume_payload.get("target_role")
+        or resume_payload.get("targetRole")
+        or resume_payload.get("current_role")
+        or "General Interview"
+    ).strip()
+    summary = str(
+        resume_payload.get("summary")
+        or resume_payload.get("professionalSummary")
+        or resume_payload.get("profile_summary")
+        or ""
+    ).strip()
+    skills = _resume_skill_labels(resume_payload.get("skills"))
+    context_parts = [summary] if summary else []
+    if skills:
+        context_parts.append("Relevant skills: " + ", ".join(skills))
+    return {
+        "job_profile_id": None,
+        "role": role or "General Interview",
+        "company": "",
+        "job_description": "\n".join(context_parts),
+        "experience_level": resume_payload.get("experience_level"),
+        "source": "resume",
+    }
+
+
 def _preview_response(
     *,
     blueprint_id: str,
@@ -114,7 +197,7 @@ def _preview_response(
     created_at: Any,
     blueprint: Dict[str, Any],
     resume_id: str,
-    job_profile_id: int,
+    job_profile_id: Optional[int],
 ) -> Dict[str, Any]:
     return {
         "blueprint_id": blueprint_id,
@@ -198,28 +281,18 @@ async def create_interview_blueprint(
                 (current_user["user_id"],),
             )
         job_row = cursor.fetchone()
-        if not job_row:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Job target not found")
-        encrypted_jd = job_row[3]
-        if isinstance(encrypted_jd, memoryview):
-            encrypted_jd = encrypted_jd.tobytes()
-        if isinstance(encrypted_jd, bytes):
-            encrypted_jd = encrypted_jd.decode("utf-8")
-        job_description = decrypt_data(encrypted_jd) if isinstance(encrypted_jd, str) else ""
-        has_full_job_description = bool(str(job_description or "").strip())
-        requirements = _json_value(job_row[4], {})
-        if not job_description and isinstance(requirements, dict):
-            job_description = "\n".join(str(item) for item in requirements.get("requirements") or [])
-        role = str(job_row[1] or "").strip()
-        company = str(job_row[2] or "").strip()
-        if request.profile_type == "custom" and not (role and has_full_job_description):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "Custom requires the role and full job description",
-            )
-        role = role or "General Interview"
+        target = _resolve_blueprint_job_target(
+            job_row=job_row,
+            resume_payload=resume_payload,
+            profile_type=request.profile_type,
+            requested_job_profile_id=request.job_profile_id,
+        )
+        job_profile_id = target["job_profile_id"]
+        role = target["role"]
+        company = target["company"]
+        job_description = target["job_description"]
         job_title = f"{role} at {company}" if company else role
-        experience_level = job_row[5]
+        experience_level = target["experience_level"]
         policy = server_owned_interview_policy(request.profile_type)
 
         if request.request_idempotency_key:
@@ -283,9 +356,10 @@ async def create_interview_blueprint(
         ))
         settings_json = {
             "resume_id": resume_row[0],
-            "job_profile_id": job_row[0],
+            "job_profile_id": job_profile_id,
             "role": role,
             "company": company or None,
+            "job_context_source": target["source"],
             "profile_type": request.profile_type,
             "focus": policy["focus"],
             "difficulty_level": policy["difficulty_level"],
@@ -298,13 +372,14 @@ async def create_interview_blueprint(
             SELECT blueprint_id, status, expires_at, created_at, blueprint_json,
                    blueprint_json_encrypted
             FROM InterviewBlueprints
-            WHERE user_id = %s AND resume_id = %s AND job_profile_id = %s
+            WHERE user_id = %s AND resume_id = %s
+              AND job_profile_id IS NOT DISTINCT FROM %s
               AND blueprint_hash = %s AND status = 'ready'
               AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY created_at DESC
             LIMIT 1
             """,
-            (current_user["user_id"], resume_row[0], job_row[0], blueprint["blueprint_hash"]),
+            (current_user["user_id"], resume_row[0], job_profile_id, blueprint["blueprint_hash"]),
         )
         existing = cursor.fetchone()
         if existing:
@@ -317,7 +392,7 @@ async def create_interview_blueprint(
                 created_at=existing[3],
                 blueprint=persisted,
                 resume_id=resume_row[0],
-                job_profile_id=job_row[0],
+                job_profile_id=job_profile_id,
             )
 
         blueprint_id = str(uuid.uuid4())
@@ -341,7 +416,7 @@ async def create_interview_blueprint(
                 blueprint_id,
                 current_user["user_id"],
                 resume_row[0],
-                job_row[0],
+                job_profile_id,
                 request.interview_mode,
                 request.interview_type,
                 experience_level,
@@ -366,7 +441,7 @@ async def create_interview_blueprint(
             created_at=persisted_row[1],
             blueprint=blueprint,
             resume_id=resume_row[0],
-            job_profile_id=job_row[0],
+            job_profile_id=job_profile_id,
         )
     except HTTPException:
         connection.rollback()
@@ -393,7 +468,8 @@ async def get_interview_blueprint(
         cursor.execute(
             """
             SELECT blueprint_id, resume_id, job_profile_id, status,
-                   expires_at, created_at, blueprint_json, blueprint_json_encrypted
+                   expires_at, created_at, blueprint_json, blueprint_json_encrypted,
+                   (expires_at IS NULL OR expires_at > NOW()) AS is_unexpired
             FROM InterviewBlueprints
             WHERE blueprint_id = %s AND user_id = %s
             """,
@@ -404,10 +480,7 @@ async def get_interview_blueprint(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Interview blueprint not found")
         blueprint = _blueprint_payload(row[6], row[7], {})
         effective_status = str(row[3] or "")
-        expiry = row[4]
-        if expiry and getattr(expiry, "tzinfo", None) is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-        if effective_status == "ready" and expiry and expiry <= datetime.now(timezone.utc):
+        if effective_status == "ready" and not bool(row[8]):
             effective_status = "expired"
         return _preview_response(
             blueprint_id=row[0],

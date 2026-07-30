@@ -16,6 +16,14 @@ def test_question_validator_rejects_combined_or_formal_prompts():
         "Please explain your project architecture in detail?",
         fallback=fallback,
     ) == fallback
+    assert validate_presented_question(
+        "Go one level deeper on reliability and provide a comprehensive answer?",
+        fallback=fallback,
+    ) == fallback
+    assert validate_presented_question(
+        "How would you design it, scale it, monitor it, and recover it?",
+        fallback=fallback,
+    ) == fallback
 
 
 def test_question_validator_rejects_duplicate_conversation_question():

@@ -598,9 +598,17 @@ def build_async_technical_report(
         )
     correctness = technical_output.get("correctness_score") if submission_count else None
     code_quality = technical_output.get("code_quality_score") if submission_count else None
-    communication = nlp_output.get("communication_score")
+    communication = (
+        technical_output.get("reasoning_communication_score")
+        if technical_output.get("reasoning_communication_score") is not None
+        else nlp_output.get("communication_score")
+    )
     typed_score = technical_output.get("typed_response_score") if typed_assessed_count else None
-    tradeoff_reasoning = _dimension_average(nlp_output.get("turns") or [], "tradeoffs")
+    tradeoff_reasoning = (
+        technical_output.get("reasoning_tradeoff_score")
+        if technical_output.get("reasoning_tradeoff_score") is not None
+        else _dimension_average(nlp_output.get("turns") or [], "tradeoffs")
+    )
     overall = _weighted_available([
         (correctness, 0.50),
         (typed_score, 0.30),
@@ -642,6 +650,8 @@ def build_async_technical_report(
             "typed_assessed_count": typed_assessed_count,
             "run_event_count": run_event_count,
             "draft_count": draft_count,
+            "reasoning_evidence_count": int(technical_output.get("reasoning_evidence_count") or 0),
+            "reasoning_round_count": int(technical_output.get("reasoning_round_count") or 0),
             "technical_evidence": technical_output.get("evidence", {}),
             "source_counts": _source_counts(nlp_output.get("turns") or [], technical_output),
         },
@@ -663,6 +673,7 @@ def build_async_technical_report(
             "submission_count": technical_output.get("submission_count", 0),
             "typed_response_count": typed_response_count,
             "run_event_count": technical_output.get("run_event_count", 0),
+            "reasoning_evidence_count": int(technical_output.get("reasoning_evidence_count") or 0),
             "latest_exit_code": technical_output.get("latest_exit_code"),
             "code_origin_verdict": "Integrity flags present" if cheating_output.get("risk_score") else "Not assessed",
         },

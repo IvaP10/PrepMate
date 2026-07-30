@@ -25,7 +25,7 @@ import {
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { getAuthHeaders } from "@/lib/auth"
-import { cancelInterviewSession, endInterviewSession } from "@/lib/api"
+import { abandonInterviewSession, cancelInterviewSession, endInterviewSession } from "@/lib/api"
 import { API_CONFIG } from "@/lib/config"
 import { cn } from "@/lib/utils"
 import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
@@ -204,11 +204,12 @@ const finalizedInterviewStatuses = new Set([
   "partial",
   "partial_report",
   "failed",
-  "cancelled",
   "ended",
   "report_ready",
   "analyzed",
 ])
+
+const nonReportableInterviewStatuses = new Set(["cancelled"])
 
 function visibleTests(round?: Round): TestCase[] {
   const tests = round?.metadata?.visible_tests
@@ -749,6 +750,10 @@ export default function TechnicalInterviewPage() {
         if (statusResp.ok) {
           const statusData = await statusResp.json()
           const interviewStatus = statusData?.status || statusData?.interview_status || ""
+          if (nonReportableInterviewStatuses.has(interviewStatus.toLowerCase())) {
+            router.replace("/?tab=technical")
+            return
+          }
           if (finalizedInterviewStatuses.has(interviewStatus.toLowerCase())) {
             setReviewMode(true)
             setStatusChecked(true)
@@ -769,6 +774,10 @@ export default function TechnicalInterviewPage() {
       if (!response.ok) throw new Error(data.detail || data.message || "Failed to load technical rounds")
       if (data.job_context && typeof data.job_context === "object") setJobContext(data.job_context as JobContext)
       const parentStatus = String(data.interview_status || "").toLowerCase()
+      if (nonReportableInterviewStatuses.has(parentStatus)) {
+        router.replace("/?tab=technical")
+        return
+      }
       if (data.read_only || finalizedInterviewStatuses.has(parentStatus)) {
         setReviewMode(true)
         router.replace(`/interview/${interviewId}/report`)
@@ -1253,7 +1262,7 @@ export default function TechnicalInterviewPage() {
           stopTechnicalMic()
           void releaseTechnicalPermissions()
           toast.error("The restoration window expired. This attempt was marked incomplete.")
-          router.replace("/?tab=coding")
+          router.replace("/?tab=technical")
         })
       })
     }, recoveryGraceSeconds * 1000)
@@ -1375,7 +1384,7 @@ export default function TechnicalInterviewPage() {
       stopObjCheck()
       stopTechnicalMic()
       await releaseTechnicalPermissions()
-      router.replace("/?tab=coding")
+      router.replace("/?tab=technical")
     } catch (error) {
       endSentRef.current = false
       toast.error(error instanceof Error ? error.message : "Could not end this attempt. Check your connection and try again.")
@@ -1386,6 +1395,10 @@ export default function TechnicalInterviewPage() {
     if (!rounds.length || reviewMode) return
     const preserveOnLeave = () => {
       void saveCurrentDrafts({ keepalive: true })
+      if (!endSentRef.current) {
+        endSentRef.current = true
+        void abandonInterviewSession(interviewId, { keepalive: true }).catch(() => undefined)
+      }
       stopFaceCheck()
       stopObjCheck()
       stopTechnicalMic()
@@ -1402,7 +1415,7 @@ export default function TechnicalInterviewPage() {
       window.removeEventListener("beforeunload", onBeforeUnload)
       window.removeEventListener("pagehide", onPageHide)
     }
-  }, [reviewMode, rounds.length, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [interviewId, reviewMode, rounds.length, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
 
   useEffect(() => {
     if (reviewMode) return
@@ -1421,13 +1434,13 @@ export default function TechnicalInterviewPage() {
         phase="This attempt is already active in another tab."
         error="Close the other tab before taking control of this continuous attempt."
         onRetry={() => window.location.reload()}
-        onBack={() => router.replace("/?tab=coding")}
+        onBack={() => router.replace("/?tab=technical")}
       />
     )
   }
 
   if (sessionControlLock !== "owned") {
-    return <TechnicalLoadingScreen phase="Securing this attempt…" error="" onRetry={() => window.location.reload()} onBack={() => router.replace("/?tab=coding")} />
+    return <TechnicalLoadingScreen phase="Securing this attempt…" error="" onRetry={() => window.location.reload()} onBack={() => router.replace("/?tab=technical")} />
   }
 
   if (!statusChecked && !preflightDone && !endSentRef.current) {
@@ -1943,12 +1956,12 @@ function TypedTechnicalResponsePanel({
             </span>
           </div>
           <div>
-            <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground"><HelpCircle className="h-4 w-4 text-primary" /> Prompt</h2>
+            <h2 className="text-sm font-semibold text-foreground">Prompt</h2>
             <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-foreground">{responsePrompt}</p>
             {needsFollowup && <p className="mt-2 text-xs font-semibold uppercase tracking-wide text-primary">Targeted follow-up · one final response</p>}
           </div>
           <div>
-            <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground"><LayoutPanelLeft className="h-4 w-4 text-primary" /> Response structure</h2>
+            <h2 className="text-sm font-semibold text-foreground">Response structure</h2>
             <ol className="mt-3 space-y-2">
               {guidance.map((item, index) => <li key={item} className="flex gap-2 text-sm leading-6 text-muted-foreground"><span className="font-mono text-primary">{index + 1}.</span>{item}</li>)}
             </ol>
@@ -1973,7 +1986,7 @@ function TypedTechnicalResponsePanel({
 
         <section className="flex min-h-[560px] flex-col overflow-hidden rounded-lg border border-border bg-card">
           <div className="flex items-center justify-between border-b border-border bg-secondary px-4 py-3">
-            <div className="flex items-center gap-2 text-sm font-semibold text-foreground"><FileText className="h-4 w-4 text-primary" /> Written response</div>
+            <div className="text-sm font-semibold text-foreground">Written response</div>
             <span className="text-xs text-muted-foreground">{wordCount} words · saved in this tab</span>
           </div>
           <textarea

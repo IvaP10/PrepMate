@@ -39,7 +39,12 @@ from database import get_db
 from config import settings as app_settings
 from pricing import PRICING
 from security_utils import redact_text, stable_hash
-from entitlements import membership_plans, public_plans
+from entitlements import (
+    get_active_subscription_plan_type,
+    membership_plans,
+    normalize_plan_type,
+    public_plans,
+)
 
 router = APIRouter(tags=["Payment"])
 logger = logging.getLogger("ai_interviewer.payment")
@@ -51,6 +56,28 @@ if app_settings.RAZORPAY_KEY_ID and app_settings.RAZORPAY_KEY_SECRET:
 RAZORPAY_WEBHOOK_SECRET = app_settings.RAZORPAY_WEBHOOK_SECRET
 
 MEMBERSHIP_PLANS = membership_plans()
+PLAN_RANK = {"starter": 0, "pro": 1, "premium": 2}
+
+
+def _plan_family(plan_type: Optional[str]) -> str:
+    normalized = normalize_plan_type(plan_type)
+    if normalized.startswith("premium"):
+        return "premium"
+    if normalized.startswith("pro"):
+        return "pro"
+    return "starter"
+
+
+def _purchase_state(plan_type: str, current_plan_type: str) -> str:
+    requested = normalize_plan_type(plan_type)
+    current = normalize_plan_type(current_plan_type)
+    requested_family = _plan_family(requested)
+    current_family = _plan_family(current)
+    if requested == current:
+        return "current"
+    if requested_family == current_family:
+        return "unavailable"
+    return "upgrade" if PLAN_RANK[requested_family] > PLAN_RANK[current_family] else "unavailable"
 
 
 def _razorpay_missing_config():
@@ -108,6 +135,8 @@ class SubscriptionResponse(BaseModel):
     auto_renew: bool
     interviews_remaining: Optional[int]
     is_unlimited: bool
+    is_signup_promo: bool = False
+    days_remaining: Optional[int] = None
 
 
 def _apply_completed_transaction(cursor, user_id: str, credits_to_grant: Optional[int], subscription_id: Optional[str]) -> str:
@@ -175,10 +204,27 @@ async def get_pricing(
 
 @router.get("/plans")
 async def get_payment_plans(current_user: Dict = Depends(get_current_user)):
+    with get_db() as connection:
+        cursor = connection.cursor()
+        try:
+            current_plan_type = get_active_subscription_plan_type(
+                cursor,
+                current_user["user_id"],
+            ) or "starter"
+        finally:
+            cursor.close()
+    plans = [
+        {
+            **plan,
+            "purchase_state": _purchase_state(plan["plan_type"], current_plan_type),
+        }
+        for plan in public_plans()
+    ]
     return {
-        "plans": public_plans(),
+        "plans": plans,
         "provider": "razorpay",
         "checkout_ready": _razorpay_checkout_ready(),
+        "current_plan_type": current_plan_type,
     }
 
 @router.post("/create-subscription", response_model=PaymentResponse)
@@ -207,6 +253,22 @@ async def create_subscription(
             detail="Provider must be 'razorpay'"
         )
     _require_razorpay_checkout_ready()
+
+    if membership_plan:
+        with get_db() as entitlement_connection:
+            entitlement_cursor = entitlement_connection.cursor()
+            try:
+                current_plan_type = get_active_subscription_plan_type(
+                    entitlement_cursor,
+                    current_user["user_id"],
+                ) or "starter"
+            finally:
+                entitlement_cursor.close()
+        if _purchase_state(request.plan_type, current_plan_type) != "upgrade":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="plan_change_not_allowed: This plan is current or lower than your active plan. Choose an upgrade or wait until the current term ends.",
+            )
 
     if is_credit_purchase:
         pricing = PRICING.calculate_total(request.sessions, request.provider)
@@ -494,7 +556,18 @@ async def get_subscription(current_user: Dict = Depends(get_current_user)):
                 """
                 SELECT s.subscription_id, s.plan_type, s.status,
                        s.start_date, s.end_date, s.auto_renew,
-                       s.is_unlimited, u.interviews_remaining
+                       s.is_unlimited, u.interviews_remaining,
+                       NOT EXISTS (
+                           SELECT 1 FROM Transactions txn
+                           WHERE txn.subscription_id = s.subscription_id
+                             AND txn.status = 'completed'
+                       ) AS has_no_completed_payment,
+                       GREATEST(
+                           0,
+                           CEIL(EXTRACT(EPOCH FROM (
+                               s.end_date - NOW()::timestamp
+                           )) / 86400)
+                       )::integer AS days_remaining
                 FROM Subscriptions s
                 JOIN UserInfo u ON s.user_id = u.user_id
                 WHERE s.user_id = %s
@@ -512,6 +585,11 @@ async def get_subscription(current_user: Dict = Depends(get_current_user)):
                     detail="No subscription found"
                 )
 
+            is_signup_promo = bool(
+                row[8]
+                and str(row[1] or "").startswith("premium")
+                and not row[5]
+            )
             return SubscriptionResponse(**{
                 "subscription_id": row[0],
                 "plan_type": row[1],
@@ -520,7 +598,9 @@ async def get_subscription(current_user: Dict = Depends(get_current_user)):
                 "end_date": row[4],
                 "auto_renew": row[5],
                 "is_unlimited": row[6] or False,
-                "interviews_remaining": row[7] if not row[6] else None
+                "interviews_remaining": row[7] if not row[6] else None,
+                "is_signup_promo": is_signup_promo,
+                "days_remaining": row[9],
             })
 
         finally:

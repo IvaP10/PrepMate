@@ -87,7 +87,7 @@ from ws_contract import (
 
 router = APIRouter(tags=["Interview"])
 logger = logging.getLogger("ai_interviewer.interview")
-REPORT_READY_STATUSES = {"completed", "partial", "failed"}
+REPORT_READY_STATUSES = {"completed", "report_ready", "partial", "failed"}
 ANALYSIS_ACTIVE_STATUSES = {"analysis_pending", "analysis_running"}
 LIVE_INTERVIEW_STATUSES = {"in_progress", "uploading", "recovering"}
 FINALIZED_INTERVIEW_STATUSES = REPORT_READY_STATUSES | ANALYSIS_ACTIVE_STATUSES | {"cancelled"}
@@ -209,21 +209,34 @@ async def _abandon_interview_after_recovery(interview_id: str, user_id: str) -> 
         await asyncio.sleep(settings.SESSION_RECOVERY_GRACE_SECONDS)
         expired = await async_execute(
             """
-            UPDATE Interviews
-            SET status = 'cancelled', completed_at = COALESCE(completed_at, NOW()),
-                attempt_status = 'incomplete', analysis_status = 'not_requested',
-                completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
-                lifecycle_revision = lifecycle_revision + 1,
-                overall_score = NULL,
-                duration_seconds = CASE
-                    WHEN started_at IS NULL THEN duration_seconds
-                    ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
-                END,
-                feedback_summary = 'Attempt incomplete because connection recovery expired.',
-                settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
-                    || jsonb_build_object('abandonment_reason', 'recovery_timeout')
-            WHERE interview_id = %s AND user_id = %s AND status = 'recovering'
-            RETURNING interview_id
+            WITH expired_interview AS (
+                UPDATE Interviews
+                SET status = 'cancelled', completed_at = COALESCE(completed_at, NOW()),
+                    attempt_status = 'incomplete', analysis_status = 'not_requested',
+                    completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
+                    lifecycle_revision = lifecycle_revision + 1,
+                    overall_score = NULL,
+                    duration_seconds = CASE
+                        WHEN started_at IS NULL THEN duration_seconds
+                        ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
+                    END,
+                    feedback_summary = 'Attempt incomplete because connection recovery expired.',
+                    settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
+                        || jsonb_build_object('abandonment_reason', 'recovery_timeout')
+                WHERE interview_id = %s AND user_id = %s AND status = 'recovering'
+                RETURNING interview_id, user_id, completed_at
+            ),
+            closed_rounds AS (
+                UPDATE TechnicalInterviewRounds round
+                SET status = 'cancelled',
+                    completed_at = COALESCE(round.completed_at, expired.completed_at, NOW())
+                FROM expired_interview expired
+                WHERE round.interview_id = expired.interview_id
+                  AND round.user_id = expired.user_id
+                  AND round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
+                RETURNING round.round_id
+            )
+            SELECT interview_id FROM expired_interview
             """,
             (interview_id, user_id),
             fetchone=True,
@@ -385,6 +398,11 @@ class StartInterviewRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_voice_for_interview_round(self):
+        # A ready server-owned blueprint supplies the authoritative interview
+        # type inside start_interview(). Do not reject a typed Technical Round
+        # before that frozen type has been loaded.
+        if self.blueprint_id:
+            return self
         if not is_technical_interview_type(self.interview_type) and self.input_mode != "voice":
             raise ValueError("The Interview Round requires voice input")
         return self
@@ -707,6 +725,7 @@ async def _finalize_interview_for_analysis(
             current_status = str(row[0] or "").lower()
             report_payload = _decrypt_json_blob(row[4], None) or _json_load(row[1], None)
             report_ready = current_status in REPORT_READY_STATUSES and isinstance(report_payload, dict)
+            technical_interview = is_technical_interview_type(str(row[5] or ""))
             if current_status == "cancelled":
                 conn.commit()
                 return {
@@ -729,7 +748,7 @@ async def _finalize_interview_for_analysis(
                     "queue_analysis": False,
                 }
 
-            if is_technical_interview_type(str(row[5] or "")):
+            if technical_interview:
                 cursor.execute(
                     """
                     SELECT COUNT(*)
@@ -816,6 +835,30 @@ async def _finalize_interview_for_analysis(
                 )
                 updated = cursor.fetchone()
                 if updated:
+                    if technical_interview:
+                        cursor.execute(
+                            """
+                            UPDATE TechnicalInterviewRounds round
+                            SET status = CASE
+                                    WHEN interview.completion_kind = 'deadline' THEN 'expired'
+                                    ELSE 'completed'
+                                END,
+                                completed_at = COALESCE(
+                                    round.completed_at,
+                                    interview.completed_at,
+                                    NOW()
+                                )
+                            FROM Interviews interview
+                            WHERE round.interview_id = interview.interview_id
+                              AND round.user_id = interview.user_id
+                              AND interview.interview_id = %s
+                              AND interview.user_id = %s
+                              AND round.status NOT IN (
+                                  'submitted', 'completed', 'expired', 'cancelled'
+                              )
+                            """,
+                            (interview_id, user_id),
+                        )
                     conn.commit()
                     return {
                         "found": True,
@@ -848,7 +891,25 @@ async def _finalize_interview_for_analysis(
     if outcome.get("cancelled") or outcome.get("report_ready"):
         return outcome
 
-    job_id = await enqueue_analysis(interview_id, user_id, reason)
+    try:
+        job_id = await enqueue_analysis(interview_id, user_id, reason)
+    except Exception:
+        logger.exception(
+            "Could not queue analysis after finalizing interview %s",
+            stable_hash(interview_id, "interview"),
+        )
+        await async_execute(
+            """
+            UPDATE Interviews
+            SET analysis_status = 'failed',
+                feedback_summary = 'Interview complete, but analysis could not be queued. It will be retried automatically.'
+            WHERE interview_id = %s AND user_id = %s
+              AND attempt_status = 'completed'
+            """,
+            (interview_id, user_id),
+        )
+        outcome["analysis_queue_failed"] = True
+        return outcome
     if job_id:
         await async_execute(
             """
@@ -861,6 +922,18 @@ async def _finalize_interview_for_analysis(
             (job_id, interview_id, user_id),
         )
         outcome["analysis_job_id"] = job_id
+    else:
+        await async_execute(
+            """
+            UPDATE Interviews
+            SET analysis_status = 'failed',
+                feedback_summary = 'Interview complete, but analysis could not be queued. It will be retried automatically.'
+            WHERE interview_id = %s AND user_id = %s
+              AND attempt_status = 'completed'
+            """,
+            (interview_id, user_id),
+        )
+        outcome["analysis_queue_failed"] = True
     return outcome
 
 
@@ -1522,13 +1595,13 @@ def _commit_live_assessment(
 
 def _followup_template(action: str, topic: str) -> str:
     templates = {
-        "clarify": "Could you answer that directly first, then give one concrete supporting detail?",
-        "verify_contradiction": "I heard a possible contradiction. Which claim is accurate, and what evidence supports it?",
-        "simplify_prerequisite": f"Let us step back to the prerequisite: what is the core idea behind {topic}, and why is it needed?",
-        "probe_evidence": "What did you personally do, and what concrete result or evidence proves the impact?",
-        "challenge_tradeoff": "What alternative did you consider, and what limitation or trade-off shaped your choice?",
+        "clarify": "What is the short answer, with one concrete example?",
+        "verify_contradiction": "Those two points conflict. Which one is true?",
+        "simplify_prerequisite": f"Let us step back. What is the core idea behind {topic}?",
+        "probe_evidence": "What did you personally do?",
+        "challenge_tradeoff": "What trade-off mattered most in that decision?",
     }
-    return templates.get(action, "Could you add one concrete example that supports your answer?")
+    return templates.get(action, "What is one concrete example?")
 
 @router.post("/ws-ticket")
 async def create_ws_ticket(current_user: Dict = Depends(get_current_user)):
@@ -1595,7 +1668,8 @@ async def start_interview(
                 SELECT blueprint_id, interview_mode, interview_type, resume_id,
                        job_profile_id, blueprint_json, settings_json, status,
                        expires_at, consumed_by_interview_id, round_config,
-                       blueprint_json_encrypted
+                       blueprint_json_encrypted,
+                       (expires_at IS NULL OR expires_at > NOW()) AS is_unexpired
                 FROM InterviewBlueprints
                 WHERE blueprint_id = %s AND user_id = %s
                 FOR UPDATE
@@ -1629,7 +1703,7 @@ async def start_interview(
                     )
             if blueprint_status != "ready":
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interview blueprint is not ready")
-            if blueprint_row[8] and _coerce_blueprint_datetime(blueprint_row[8]) <= datetime.now(timezone.utc):
+            if not bool(blueprint_row[12]):
                 cursor.execute(
                     "UPDATE InterviewBlueprints SET status = 'expired' WHERE blueprint_id = %s AND status = 'ready'",
                     (request.blueprint_id,),
@@ -1694,6 +1768,11 @@ async def start_interview(
         external_profile_signals = _json_load(row[6], {})
         plan_type = get_active_subscription_plan_type(cursor, current_user["user_id"]) or "starter"
         is_technical_mode = is_technical_interview_type(request.interview_type)
+        if not is_technical_mode and request.input_mode != "voice":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="The Interview Round requires voice input",
+            )
         profile_type = normalize_profile_type(request.profile_type or row[8])
         if is_technical_mode:
             profile_type = normalize_technical_profile(profile_type)
@@ -1717,7 +1796,8 @@ async def start_interview(
                 """
                 SELECT flow, camera_ready, microphone_ready, microphone_level_detected,
                        screen_share_ready, network_ready, backend_ready, openai_ready,
-                       sandbox_ready, worker_ready, expires_at, consumed_at
+                       sandbox_ready, worker_ready, expires_at, consumed_at,
+                       (expires_at > NOW()) AS is_unexpired
                 FROM AttemptPreflightChecks
                 WHERE preflight_id = %s AND user_id = %s AND blueprint_id = %s
                 FOR UPDATE
@@ -1727,13 +1807,12 @@ async def start_interview(
             preflight = cursor.fetchone()
             if not preflight:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preflight check not found")
-            expires_at = _coerce_blueprint_datetime(preflight[10])
             required_ready = all(bool(value) for value in preflight[1:8]) and bool(preflight[9])
             if expected_flow == "technical":
                 required_ready = required_ready and bool(preflight[8])
             if str(preflight[0]) != expected_flow or preflight[11] is not None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight does not match this attempt or was already consumed")
-            if expires_at <= datetime.now(timezone.utc):
+            if not bool(preflight[12]):
                 raise HTTPException(status_code=status.HTTP_410_GONE, detail="Preflight expired. Run the environment check again")
             if not required_ready:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight requirements are not ready")
@@ -4108,14 +4187,14 @@ async def get_analysis_status(
                 UPDATE Interviews
                 SET analysis_job_id = %s,
                     status = CASE
-                        WHEN status IN ('completed', 'partial', 'failed')
+                        WHEN status IN ('completed', 'report_ready', 'partial', 'failed')
                              AND report_json IS NULL AND report_json_encrypted IS NULL
                         THEN 'analysis_pending'
                         ELSE status
                     END
                 WHERE interview_id = %s
                   AND user_id = %s
-                  AND status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
+                  AND status IN ('analysis_pending', 'analysis_running', 'completed', 'report_ready', 'partial', 'failed')
                 """,
                 (job_id, interview_id, current_user["user_id"]),
             )
@@ -4160,6 +4239,7 @@ async def get_analysis_status(
         "report_state": report_state,
         "analysis_status": row[12],
         "attempt_status": row[14],
+        "processing_sla_minutes": 15,
         "retry_in_progress": report_state == "retrying",
         "retryable": job_status == "failed" and manual_retry_count < 3,
         "job": {
@@ -4252,6 +4332,108 @@ async def get_interview_status(
         cursor.close()
         return_db_connection(connection)
 
+def _report_job_target(
+    cursor: Any,
+    *,
+    interview_id: str,
+    user_id: str,
+    job_profile_id: Optional[int],
+    settings_value: Any,
+) -> Optional[Dict[str, Any]]:
+    """Load the immutable role/JD used by a report and its reusable-save state."""
+    cursor.execute(
+        """
+        SELECT job_context_encrypted
+        FROM AttemptContextSnapshots
+        WHERE interview_id = %s AND user_id = %s
+        LIMIT 1
+        """,
+        (interview_id, user_id),
+    )
+    snapshot_row = cursor.fetchone()
+    snapshot = _decrypt_json_blob(snapshot_row[0], {}) if snapshot_row else {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    settings_payload = _json_load(settings_value, {})
+    if not isinstance(settings_payload, dict):
+        settings_payload = {}
+    compact_context = settings_payload.get("job_context")
+    if not isinstance(compact_context, dict):
+        compact_context = {}
+
+    profile_row = None
+    if job_profile_id:
+        cursor.execute(
+            """
+            SELECT role, company, job_description_encrypted, job_description_hash
+            FROM JobProfiles
+            WHERE profile_id = %s AND user_id = %s
+            """,
+            (job_profile_id, user_id),
+        )
+        profile_row = cursor.fetchone()
+
+    role = str(
+        snapshot.get("role")
+        or compact_context.get("role")
+        or (profile_row[0] if profile_row else "")
+        or settings_payload.get("job_title")
+        or ""
+    ).strip()
+    company = str(
+        snapshot.get("company")
+        or compact_context.get("company")
+        or (profile_row[1] if profile_row else "")
+        or ""
+    ).strip()
+    job_description = str(snapshot.get("job_description") or "").strip()
+    if not job_description:
+        encrypted_description = settings_payload.get("job_description_encrypted")
+        if encrypted_description:
+            job_description = str(decrypt_data(str(encrypted_description)) or "").strip()
+    if not job_description and profile_row:
+        job_description = str(_decrypt_job_description_value(profile_row[2]) or "").strip()
+    if not role:
+        return None
+
+    description_hash = (
+        hashlib.sha256(job_description.encode("utf-8")).hexdigest()
+        if job_description
+        else (profile_row[3] if profile_row else None)
+    )
+    cursor.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM JobProfiles reusable_profile
+            WHERE reusable_profile.user_id = %s
+              AND LOWER(BTRIM(reusable_profile.role)) = LOWER(BTRIM(%s))
+              AND LOWER(BTRIM(COALESCE(reusable_profile.company, ''))) = LOWER(BTRIM(%s))
+              AND reusable_profile.job_description_hash IS NOT DISTINCT FROM %s
+        )
+        """,
+        (user_id, role, company, description_hash),
+    )
+    saved_row = cursor.fetchone()
+    return {
+        "role": role,
+        "company": company or None,
+        "job_description": job_description,
+        "saved_for_reuse": bool(saved_row and saved_row[0]),
+    }
+
+
+def _decrypt_job_description_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8", errors="strict")
+    return decrypt_data(str(value)) if value else ""
+
+
 @router.get("/report/{interview_id}")
 async def get_interview_report(
     interview_id: str,
@@ -4264,8 +4446,8 @@ async def get_interview_report(
         cursor.execute(
             """
             SELECT interview_mode, interview_type, job_title, strictness_level,
-                   overall_score, feedback_summary, report_json, created_at, completed_at
-                   , status, report_json_encrypted, analysis_status
+                   overall_score, feedback_summary, report_json, created_at, completed_at,
+                   status, report_json_encrypted, analysis_status, job_profile_id, settings
             FROM Interviews
             WHERE interview_id = %s AND user_id = %s
             """,
@@ -4345,6 +4527,14 @@ async def get_interview_report(
                 )
             analysis_pending = True
 
+        job_target = _report_job_target(
+            cursor,
+            interview_id=interview_id,
+            user_id=current_user["user_id"],
+            job_profile_id=row[12],
+            settings_value=row[13],
+        )
+
         return {
             "interview_id": interview_id,
             "mode": row[0],
@@ -4359,6 +4549,7 @@ async def get_interview_report(
             "status": "analysis_pending" if analysis_pending and row[9] in {"completed", "partial", "uploading"} else row[9],
             "analysis_pending": analysis_pending,
             "analysis_job_id": analysis_job_id,
+            "job_target": job_target,
             "detailed_responses": detailed_responses
         }
 
@@ -4366,6 +4557,7 @@ async def get_interview_report(
         cursor.close()
         return_db_connection(connection)
 
+@router.post("/{interview_id}/abandon")
 @router.delete("/cancel/{interview_id}")
 async def cancel_interview(
     interview_id: str,
@@ -4407,6 +4599,17 @@ async def cancel_interview(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Interview not found or already completed"
             )
+        cursor.execute(
+            """
+            UPDATE TechnicalInterviewRounds
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, NOW())
+            WHERE interview_id = %s
+              AND user_id = %s
+              AND status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
+            """,
+            (interview_id, current_user["user_id"]),
+        )
         connection.commit()
         _cancel_interview_recovery(interview_id)
         await _record_server_integrity_event(

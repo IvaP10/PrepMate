@@ -1,7 +1,7 @@
 "use client"
 import { useState } from "react"
 import Link from "next/link"
-import { Download, Shield, Loader2, ExternalLink } from "lucide-react"
+import { Download, Loader2, ExternalLink } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 import { exportUserData } from "@/lib/api"
@@ -22,10 +22,7 @@ export function PrivacyTab() {
     <div className="space-y-6">
 
       <div className="dashboard-card ring-1 ring-primary/15">
-        <div className="mb-3 flex items-center gap-2">
-          <ExternalLink className="h-4 w-4 text-primary" />
-          <h3 className="text-sm font-semibold text-foreground">External AI & Third-Party Processing</h3>
-        </div>
+        <h3 className="mb-3 text-sm font-semibold text-foreground">External AI & Third-Party Processing</h3>
         <div className="space-y-3 text-sm leading-6 text-muted-foreground">
           <p>
             InterAI sends certain data to external providers to run core features, including OpenAI,
@@ -57,10 +54,7 @@ export function PrivacyTab() {
       </div>
 
       <div className="dashboard-card">
-        <div className="mb-3 flex items-center gap-2">
-          <Shield className="h-4 w-4 text-primary" />
-          <h3 className="text-sm font-semibold text-foreground">What We Store</h3>
-        </div>
+        <h3 className="mb-3 text-sm font-semibold text-foreground">What We Store</h3>
         <p className="text-sm leading-6 text-muted-foreground">
           InterAI stores your resume data, interview transcripts, scores, and coaching feedback to
           personalize practice and generate performance insights. Your account data is encrypted at

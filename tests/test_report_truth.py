@@ -1,4 +1,13 @@
+from analysis_pipeline import _is_report_ready_status
+from interview import _interview_report_ready
 from report_generator import build_async_behavioral_report, build_async_technical_report
+
+
+def test_report_ready_lifecycle_status_accepts_a_persisted_report():
+    report = {"overall_score": 78}
+
+    assert _interview_report_ready("report_ready", report) is True
+    assert _is_report_ready_status("report_ready", report) is True
 
 
 def test_behavioral_report_without_candidate_evidence_is_explicitly_unscored():

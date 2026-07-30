@@ -265,6 +265,7 @@ async def cleanup_stale_interviews():
     # Run once immediately on start
     try:
         await _expire_stale_interviews()
+        await _recover_orphaned_analysis_attempts()
     except Exception as e:
         logger.error("Error in initial stale interview cleanup run: %s", str(e))
 
@@ -272,12 +273,101 @@ async def cleanup_stale_interviews():
         try:
             await asyncio.sleep(60)  # check every minute
             await _expire_stale_interviews()
+            await _recover_orphaned_analysis_attempts()
         except asyncio.CancelledError:
             logger.info("Stale interview cleaner task cancelled")
             break
         except Exception as e:
             logger.error("Error in stale interview cleaner background task: %s", str(e))
             await asyncio.sleep(60)
+
+
+async def _recover_orphaned_analysis_attempts() -> None:
+    """Repair completed attempts that finalized but failed before job creation."""
+    from analysis_pipeline import (
+        ANALYSIS_STAGE_VERSION,
+        SESSION_PERFORMANCE_VERSION,
+        enqueue_analysis_result,
+    )
+    from database import async_execute
+
+    rows = await async_execute(
+        """
+        SELECT i.interview_id, i.user_id
+        FROM Interviews i
+        WHERE i.attempt_status = 'completed'
+          AND i.status IN (
+              'analysis_pending', 'analysis_running',
+              'completed', 'partial', 'failed'
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM SessionPerformanceAnalyses analysis
+              WHERE analysis.interview_id = i.interview_id
+                AND analysis.user_id = i.user_id
+                AND analysis.schema_version = %s
+                AND analysis.is_current = TRUE
+                AND analysis.status = 'ready'
+                AND analysis.analysis_json_encrypted IS NOT NULL
+                AND analysis.evidence_index_encrypted IS NOT NULL
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM AnalysisJobs job
+              WHERE job.interview_id = i.interview_id
+                AND job.user_id = i.user_id
+                AND job.producer_version = %s
+          )
+        ORDER BY COALESCE(i.completed_at, i.created_at)
+        LIMIT 20
+        """,
+        (SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION),
+        fetchall=True,
+    )
+    for interview_id, user_id in rows or []:
+        try:
+            result = await enqueue_analysis_result(
+                str(interview_id),
+                str(user_id),
+                "orphaned_analysis_recovery",
+                force_canonical_rebuild=True,
+            )
+            state_name = str(result.get("state") or "rejected")
+            job_id = result.get("job_id")
+            await async_execute(
+                """
+                UPDATE Interviews
+                SET analysis_job_id = COALESCE(%s, analysis_job_id),
+                    analysis_status = CASE
+                        WHEN %s IN ('queued', 'already_running') THEN 'queued'
+                        WHEN %s IN ('ready', 'report_ready') THEN 'completed'
+                        ELSE 'failed'
+                    END,
+                    feedback_summary = CASE
+                        WHEN %s IN ('queued', 'already_running')
+                        THEN 'Interview complete. Async analysis is queued.'
+                        WHEN %s IN ('ready', 'report_ready')
+                        THEN feedback_summary
+                        ELSE 'Interview complete, but analysis needs attention.'
+                    END
+                WHERE interview_id = %s AND user_id = %s
+                  AND attempt_status = 'completed'
+                """,
+                (
+                    job_id,
+                    state_name,
+                    state_name,
+                    state_name,
+                    state_name,
+                    interview_id,
+                    user_id,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Could not recover orphaned analysis attempt %s",
+                interview_id,
+            )
 
 
 async def _expire_stale_interviews():
@@ -287,23 +377,42 @@ async def _expire_stale_interviews():
         try:
             cursor.execute(
                 """
-                UPDATE Interviews
-                SET status = 'cancelled', completed_at = COALESCE(completed_at, NOW()),
-                    attempt_status = 'incomplete', analysis_status = 'not_requested',
-                    completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
-                    lifecycle_revision = lifecycle_revision + 1,
-                    overall_score = NULL,
-                    duration_seconds = CASE
-                        WHEN started_at IS NULL THEN duration_seconds
-                        ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
-                    END,
-                    feedback_summary = 'Attempt incomplete because connection recovery expired.',
-                    settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
-                        || jsonb_build_object('abandonment_reason', 'recovery_timeout')
-                WHERE status = 'recovering'
-                  AND settings ? 'recovery_deadline'
-                  AND (settings->>'recovery_deadline')::timestamptz <= NOW()
-                RETURNING interview_id, user_id
+                WITH expired_interviews AS (
+                    UPDATE Interviews
+                    SET status = 'cancelled', completed_at = COALESCE(completed_at, NOW()),
+                        attempt_status = 'incomplete', analysis_status = 'not_requested',
+                        completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
+                        lifecycle_revision = lifecycle_revision + 1,
+                        overall_score = NULL,
+                        duration_seconds = CASE
+                            WHEN started_at IS NULL THEN duration_seconds
+                            ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
+                        END,
+                        feedback_summary = 'Attempt incomplete because connection recovery expired.',
+                        settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
+                            || jsonb_build_object('abandonment_reason', 'recovery_timeout')
+                    WHERE status = 'recovering'
+                      AND settings ? 'recovery_deadline'
+                      AND (settings->>'recovery_deadline')::timestamptz <= NOW()
+                    RETURNING interview_id, user_id, completed_at
+                ),
+                closed_rounds AS (
+                    UPDATE TechnicalInterviewRounds round
+                    SET status = 'cancelled',
+                        completed_at = COALESCE(
+                            round.completed_at,
+                            expired.completed_at,
+                            NOW()
+                        )
+                    FROM expired_interviews expired
+                    WHERE round.interview_id = expired.interview_id
+                      AND round.user_id = expired.user_id
+                      AND round.status NOT IN (
+                          'submitted', 'completed', 'expired', 'cancelled'
+                      )
+                    RETURNING round.round_id
+                )
+                SELECT interview_id, user_id FROM expired_interviews
                 """
             )
             expired_recoveries = cursor.fetchall()
@@ -315,7 +424,14 @@ async def _expire_stale_interviews():
                 """
                 SELECT interview_id, user_id
                 FROM Interviews
-                WHERE status = 'in_progress' AND created_at < NOW() - INTERVAL '60 minutes'
+                WHERE status = 'in_progress'
+                  AND (
+                      deadline_at <= NOW()
+                      OR (
+                          deadline_at IS NULL
+                          AND COALESCE(started_at, created_at) < NOW() - INTERVAL '60 minutes'
+                      )
+                  )
                 """
             )
             return expired_recoveries, cursor.fetchall()
@@ -340,19 +456,55 @@ async def _expire_stale_interviews():
 
     for interview_id, user_id in stale_interviews:
         try:
+            finalized = await async_execute(
+                """
+                WITH finalized_interview AS (
+                    UPDATE Interviews
+                    SET status = 'analysis_pending',
+                        attempt_status = 'completed', analysis_status = 'queued',
+                        completion_kind = 'deadline', lifecycle_revision = lifecycle_revision + 1,
+                        completed_at = NOW(),
+                        feedback_summary = 'Interview complete. Auto-finalized due to 60-minute limit.'
+                    WHERE interview_id = %s AND status = 'in_progress'
+                    RETURNING interview_id, user_id, completed_at
+                ),
+                closed_rounds AS (
+                    UPDATE TechnicalInterviewRounds round
+                    SET status = 'expired',
+                        completed_at = COALESCE(
+                            round.completed_at,
+                            finalized.completed_at,
+                            NOW()
+                        )
+                    FROM finalized_interview finalized
+                    WHERE round.interview_id = finalized.interview_id
+                      AND round.user_id = finalized.user_id
+                      AND round.status NOT IN (
+                          'submitted', 'completed', 'expired', 'cancelled'
+                      )
+                    RETURNING round.round_id
+                )
+                SELECT interview_id FROM finalized_interview
+                """,
+                (interview_id,),
+                fetchone=True,
+            )
+            if not finalized:
+                continue
             job_id = await enqueue_analysis(interview_id, user_id, "auto_expire_60m")
             await async_execute(
                 """
                 UPDATE Interviews
-                SET status = 'analysis_pending',
-                    attempt_status = 'completed', analysis_status = 'queued',
-                    completion_kind = 'deadline', lifecycle_revision = lifecycle_revision + 1,
-                    analysis_job_id = %s,
-                    completed_at = NOW(),
-                    feedback_summary = 'Interview complete. Auto-finalized due to 60-minute limit.'
-                WHERE interview_id = %s
+                SET analysis_job_id = %s,
+                    analysis_status = CASE WHEN %s IS NULL THEN 'failed' ELSE 'queued' END,
+                    feedback_summary = CASE
+                        WHEN %s IS NULL
+                        THEN 'Interview complete, but analysis could not be queued.'
+                        ELSE feedback_summary
+                    END
+                WHERE interview_id = %s AND attempt_status = 'completed'
                 """,
-                (job_id, interview_id),
+                (job_id, job_id, job_id, interview_id),
             )
             logger.info("Auto-finalized stale interview %s due to 60m limit", interview_id)
         except Exception as e:

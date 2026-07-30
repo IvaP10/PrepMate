@@ -78,7 +78,12 @@ RESUME_VERSION_SELECT = """
     SELECT resume_id, version_number, resume_payload_encrypted, facts_encrypted,
            derived_taxonomy, is_active, confirmation_status, content_hash,
            parser_version, source_filename, created_at, updated_at, resume_json,
-           parent_resume_id, superseded_at, immutable_at
+           parent_resume_id, superseded_at, immutable_at,
+           immutable_at IS NOT NULL
+               OR EXISTS (SELECT 1 FROM Interviews interview WHERE interview.resume_id = ResumeVersions.resume_id)
+               OR EXISTS (SELECT 1 FROM InterviewBlueprints blueprint WHERE blueprint.resume_id = ResumeVersions.resume_id)
+               OR EXISTS (SELECT 1 FROM AttemptContextSnapshots snapshot WHERE snapshot.resume_id = ResumeVersions.resume_id)
+               AS referenced
     FROM ResumeVersions
 """
 
@@ -264,7 +269,7 @@ def _resume_version_payload(row: Any) -> dict[str, Any]:
         "parent_resume_id": row[13] if len(row) > 13 else None,
         "superseded_at": row[14].isoformat() if len(row) > 14 and row[14] else None,
         "immutable": bool(row[15]) if len(row) > 15 else False,
-        "referenced": bool(row[15]) if len(row) > 15 else False,
+        "referenced": bool(row[16]) if len(row) > 16 else bool(row[15]) if len(row) > 15 else False,
     }
 
 
@@ -277,7 +282,8 @@ def _load_resume_version(cursor: Any, user_id: str, resume_id: str) -> Optional[
     return _resume_version_payload(row) if row else None
 
 _enrichment_tasks = set()
-RESUME_UPLOAD_AI_TIMEOUT_SECONDS = 120.0
+RESUME_UPLOAD_AI_TIMEOUT_SECONDS = 20.0
+RESUME_PARSE_TIMEOUT_SECONDS = 15.0
 
 async def _run_profile_enrichment(user_id: str, profile: dict[str, Any]) -> None:
     try:
@@ -1113,9 +1119,11 @@ async def extract_with_ai_upload(resume_text: str) -> dict[str, Any]:
 
 @router.post("/upload-resume")
 async def upload_resume(
+    request: Request,
     file: UploadFile = File(...),
     current_user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any] | None:
+    request_id = str(getattr(request.state, "request_id", "") or "unknown")
     if not file.filename:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Resume file is required")
 
@@ -1143,13 +1151,25 @@ async def upload_resume(
         loop = asyncio.get_running_loop()
         started = time.perf_counter()
         try:
-            parsed_resume = await loop.run_in_executor(
-                None,
-                lambda: parse_resume_structured(temp_path, fast=False),
+            logger.info("resume_upload_stage request_id=%s stage=parse_started", request_id)
+            parsed_resume = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: parse_resume_structured(temp_path, fast=False),
+                ),
+                timeout=RESUME_PARSE_TIMEOUT_SECONDS,
             )
             resume_text = parsed_resume.get("text", "")
+            logger.info(
+                "resume_upload_stage request_id=%s stage=parse_completed latency_ms=%s",
+                request_id,
+                round((time.perf_counter() - started) * 1000, 2),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("resume_upload_stage request_id=%s stage=parse_timeout", request_id)
+            raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, "Resume parsing timed out. Try a text-based PDF or DOCX.")
         except Exception:
-            logger.error("Resume parsing failed")
+            logger.exception("resume_upload_stage request_id=%s stage=parse_failed", request_id)
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to read resume. Ensure it's a valid PDF or DOCX.")
 
         if not resume_text or len(resume_text.strip()) < 40:
@@ -1168,13 +1188,16 @@ async def upload_resume(
         fallback_json = extract_resume_with_rules(resume_text, contact, social, parsed_resume)
         resume_json = fallback_json
         try:
+            logger.info("resume_upload_stage request_id=%s stage=ai_enrichment_started", request_id)
             ai_json = await extract_with_ai_upload(redacted_text)
             resume_json = _merge_resume_profiles(ai_json, fallback_json)
+            logger.info("resume_upload_stage request_id=%s stage=ai_enrichment_completed", request_id)
         except asyncio.TimeoutError:
-            logger.warning("OpenAI resume extraction timed out; using rule-based extraction")
+            logger.warning("resume_upload_stage request_id=%s stage=ai_timeout fallback=rules", request_id)
         except Exception as exc:
             logger.warning(
-                "OpenAI resume extraction failed (%s); using rule-based extraction",
+                "resume_upload_stage request_id=%s stage=ai_failed error=%s fallback=rules",
+                request_id,
                 type(exc).__name__,
             )
 
@@ -1328,6 +1351,11 @@ async def upload_resume(
 
         if profile_completed:
             schedule_profile_enrichment(current_user["user_id"], active_profile)
+        logger.info(
+            "resume_upload_stage request_id=%s stage=stored total_latency_ms=%s",
+            request_id,
+            round((time.perf_counter() - started) * 1000, 2),
+        )
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.info("Resume upload processed in %sms (parser=%s)", elapsed_ms, parsed_resume.get("parser"))
@@ -1367,6 +1395,36 @@ async def list_resume_versions(
             resumes = [_resume_version_payload(row) for row in cur.fetchall()]
             active = next((item["resume_id"] for item in resumes if item["is_active"]), None)
             return {"resumes": resumes, "active_resume_id": active}
+        finally:
+            cur.close()
+
+
+@router.delete("/resumes/{resume_id}")
+async def delete_resume_version(
+    resume_id: str,
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    with get_db() as conn:
+        cur = conn.cursor()
+        try:
+            with transaction(conn):
+                cur.execute(
+                    """
+                    SELECT version.resume_id
+                    FROM ResumeVersions version
+                    WHERE version.user_id = %s AND version.resume_id = %s
+                    FOR UPDATE
+                    """,
+                    (current_user["user_id"], resume_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume version not found")
+                cur.execute(
+                    "DELETE FROM ResumeVersions WHERE user_id = %s AND resume_id = %s",
+                    (current_user["user_id"], resume_id),
+                )
+            return {"success": True, "message": "Resume version deleted"}
         finally:
             cur.close()
 

@@ -3,7 +3,7 @@ const DEFAULT_API_BASE_URL = process.env.NODE_ENV === 'production' ? '/api' : 'h
 export const API_CONFIG = {
   BASE_URL: process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL,
   TIMEOUT: 30000,
-  RETRY_ATTEMPTS: 3,
+  RETRY_ATTEMPTS: 1,
 } as const
 
 /** Resume upload only — must match backend RESUME_MAX_FILE_SIZE_MB (default 4). */

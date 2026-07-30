@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useState } from "react"
-import { MessageSquare, ThumbsUp, HelpCircle, ChevronDown, ChevronUp, Star } from "lucide-react"
+import { ChevronDown, ChevronUp } from "lucide-react"
 
 interface QuestionDeepDiveProps {
   index: number
@@ -84,8 +84,8 @@ export function QuestionDeepDive({
         {/* Score Ring / Badge */}
         <div className="flex items-center gap-3 shrink-0">
           <div className={`flex flex-col items-center justify-center border rounded-lg p-2.5 min-w-[70px] ${getScoreColor(score)}`}>
-            <span className="text-xl font-bold font-mono leading-none">{score === null ? "Unknown" : `${Math.round(score)}%`}</span>
-            <span className="text-[10px] text-muted-foreground uppercase font-semibold mt-1">{score === null ? "Insufficient evidence" : "Score"}</span>
+            <span className="text-xl font-bold font-mono leading-none">{Math.round(score ?? 0)}%</span>
+            <span className="text-[10px] text-muted-foreground uppercase font-semibold mt-1">Score</span>
           </div>
           {sessionAverageScore !== undefined && sessionAverageScore !== null && (
             <div className="text-[11px] text-muted-foreground flex flex-col">
@@ -98,10 +98,7 @@ export function QuestionDeepDive({
 
       {/* Response Box */}
       <div className="bg-secondary/10 border border-border/50 rounded-lg p-4 space-y-2">
-        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
-          <MessageSquare className="h-3.5 w-3.5" />
-          Your Response
-        </h4>
+        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Your Response</h4>
         <div className="text-sm leading-relaxed text-foreground/80 whitespace-pre-wrap">
           {displayedResponse || <span className="italic">No response captured.</span>}
         </div>
@@ -127,10 +124,7 @@ export function QuestionDeepDive({
       <div className="grid gap-5 md:grid-cols-2">
         {/* Good parts */}
         <div className="space-y-2 border border-emerald-500/20 bg-emerald-500/5 p-4 rounded-lg">
-          <h4 className="text-xs font-semibold text-emerald-500 uppercase tracking-wider flex items-center gap-1.5">
-            <ThumbsUp className="h-3.5 w-3.5" />
-            Captured strength
-          </h4>
+          <h4 className="text-xs font-semibold text-emerald-500 uppercase tracking-wider">Captured strength</h4>
           <p className="text-sm leading-relaxed text-muted-foreground">
             {workedText}
           </p>
@@ -138,10 +132,7 @@ export function QuestionDeepDive({
 
         {/* Needs improvement */}
         <div className="space-y-2 border border-border/60 bg-card p-4 rounded-lg">
-          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
-            <HelpCircle className="h-3.5 w-3.5" />
-            Your mistake
-          </h4>
+          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Your mistake</h4>
           <p className="text-sm leading-relaxed text-muted-foreground">
             {mistake?.diagnosis || feedback || coachingHint || "No suggestions recorded."}
           </p>
@@ -166,10 +157,7 @@ export function QuestionDeepDive({
       {/* Stronger Answer Rewrite (Rewritten Answer Block) */}
       {(improvedAnswer || strongerAnswerOutline) && (
         <div className="report-rewrite-block p-4 space-y-2">
-          <h4 className="text-xs font-semibold text-primary uppercase tracking-wider flex items-center gap-1.5">
-            <Star className="h-3.5 w-3.5 text-primary" />
-            Your Answer, Rewritten
-          </h4>
+          <h4 className="text-xs font-semibold text-primary uppercase tracking-wider">Your Answer, Rewritten</h4>
           <p className="text-sm leading-relaxed text-foreground/80 whitespace-pre-wrap">
             {improvedAnswer || strongerAnswerOutline}
           </p>

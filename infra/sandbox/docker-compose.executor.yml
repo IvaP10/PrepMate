@@ -20,7 +20,7 @@ services:
       SANDBOX_OCI_RUNTIME: runsc
       SANDBOX_TIMEOUT_MS: "2000"
       SANDBOX_ABSOLUTE_TIMEOUT_MS: "10000"
-      SANDBOX_MAX_CONCURRENT_EXECUTIONS: "4"
+      SANDBOX_MAX_CONCURRENT_EXECUTIONS: "1"
       SANDBOX_QUEUE_WAIT_SECONDS: "1.0"
       SANDBOX_MEMORY_LIMIT_BYTES: "268435456"
       SANDBOX_PROCESS_LIMIT: "32"
@@ -38,7 +38,7 @@ services:
       - /tmp:rw,nosuid,nodev,noexec,size=32m
     security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8080/health',headers={'Authorization':'Bearer '+os.environ['SANDBOX_API_TOKEN']}); urllib.request.urlopen(r,timeout=3)"]
+      test: ["CMD", "python", "-c", "import os,urllib.request; token=os.getenv('SANDBOX_API_TOKEN') or os.getenv('INTERNAL_SERVICE_TOKEN') or os.getenv('JWT_SECRET',''); r=urllib.request.Request('http://127.0.0.1:8080/health',headers={'Authorization':'Bearer '+token}); urllib.request.urlopen(r,timeout=3)"]
       interval: 5s
       timeout: 4s
       retries: 30

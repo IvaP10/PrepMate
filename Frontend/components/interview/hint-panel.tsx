@@ -1,6 +1,6 @@
 "use client"
 import { useState, useEffect } from "react"
-import { Lightbulb, ChevronDown, ChevronUp, Sparkles } from "lucide-react"
+import { ChevronDown, ChevronUp } from "lucide-react"
 interface HintPanelProps {
   hints: string[]
   isVisible?: boolean
@@ -28,9 +28,6 @@ export function HintPanel({ hints, isVisible = true }: HintPanelProps) {
         className="w-full flex items-center justify-between px-4 py-3 hover:bg-secondary transition-colors"
       >
         <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded-lg bg-secondary flex items-center justify-center">
-            <Sparkles className="w-3.5 h-3.5 text-primary" />
-          </div>
           <h3 className="text-sm font-semibold text-foreground">Suggestions</h3>
           {displayedHints.length > 0 && (
             <span className="px-1.5 py-0.5 rounded-full bg-primary/10 text-primary text-xs font-semibold">
@@ -49,10 +46,9 @@ export function HintPanel({ hints, isVisible = true }: HintPanelProps) {
           {displayedHints.map((hint, i) => (
             <div
               key={i}
-              className="flex items-start gap-2 p-2.5 rounded-lg bg-secondary border border-border animate-in fade-in slide-in-from-bottom-1 duration-300"
+              className="p-2.5 rounded-lg bg-secondary border border-border animate-in fade-in slide-in-from-bottom-1 duration-300"
               style={{ animationDelay: `${i * 100}ms` }}
             >
-              <Lightbulb className="w-3.5 h-3.5 text-primary mt-0.5 shrink-0" />
               <p className="text-xs text-muted-foreground leading-relaxed">{hint}</p>
             </div>
           ))}

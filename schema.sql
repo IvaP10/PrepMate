@@ -121,22 +121,26 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_interviews_resume_version') THEN
         ALTER TABLE Interviews
             ADD CONSTRAINT fk_interviews_resume_version
-            FOREIGN KEY (resume_id) REFERENCES ResumeVersions(resume_id) ON DELETE RESTRICT;
+            FOREIGN KEY (resume_id) REFERENCES ResumeVersions(resume_id) ON DELETE SET NULL;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_interviews_job_profile') THEN
         ALTER TABLE Interviews
             ADD CONSTRAINT fk_interviews_job_profile
-            FOREIGN KEY (job_profile_id) REFERENCES JobProfiles(profile_id) ON DELETE RESTRICT;
+            FOREIGN KEY (job_profile_id) REFERENCES JobProfiles(profile_id) ON DELETE SET NULL;
     END IF;
 END $$;
 
 CREATE OR REPLACE FUNCTION enforce_interview_context_immutability()
 RETURNS TRIGGER AS $$
 BEGIN
-    IF OLD.resume_id IS NOT NULL AND NEW.resume_id IS DISTINCT FROM OLD.resume_id THEN
+    IF OLD.resume_id IS NOT NULL
+       AND NEW.resume_id IS NOT NULL
+       AND NEW.resume_id IS DISTINCT FROM OLD.resume_id THEN
         RAISE EXCEPTION 'interview resume_id is immutable once assigned';
     END IF;
-    IF OLD.job_profile_id IS NOT NULL AND NEW.job_profile_id IS DISTINCT FROM OLD.job_profile_id THEN
+    IF OLD.job_profile_id IS NOT NULL
+       AND NEW.job_profile_id IS NOT NULL
+       AND NEW.job_profile_id IS DISTINCT FROM OLD.job_profile_id THEN
         RAISE EXCEPTION 'interview job_profile_id is immutable once assigned';
     END IF;
     RETURN NEW;
@@ -393,12 +397,19 @@ CREATE TABLE IF NOT EXISTS SessionPerformanceAnalyses (
     rubric_version      VARCHAR(40) NOT NULL DEFAULT 'rubric-v1',
     duration_seconds    INTEGER,
     evidence_status     VARCHAR(30) NOT NULL DEFAULT 'sufficient',
+    revision_no         INTEGER NOT NULL DEFAULT 1,
+    is_current          BOOLEAN NOT NULL DEFAULT TRUE,
+    supersedes_analysis_id VARCHAR(64) REFERENCES SessionPerformanceAnalyses(analysis_id) ON DELETE SET NULL,
+    producer_version    VARCHAR(80) NOT NULL DEFAULT 'evidence-v4',
     created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMP NOT NULL DEFAULT NOW(),
-    UNIQUE(interview_id, mode, schema_version)
+    updated_at          TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_perf_user_mode ON SessionPerformanceAnalyses (user_id, mode, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_performance_current
+    ON SessionPerformanceAnalyses (interview_id, mode, schema_version) WHERE is_current;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_performance_revision
+    ON SessionPerformanceAnalyses (interview_id, mode, schema_version, revision_no);
 
 CREATE TABLE IF NOT EXISTS ImprovementMissions (
     mission_id         VARCHAR(64) PRIMARY KEY,
@@ -695,20 +706,28 @@ CREATE INDEX IF NOT EXISTS idx_report_artifacts_interview ON ReportArtifacts (in
 
 CREATE TABLE IF NOT EXISTS EvidenceManifests (
     manifest_id VARCHAR(64) PRIMARY KEY,
-    interview_id VARCHAR(64) NOT NULL UNIQUE REFERENCES Interviews(interview_id) ON DELETE CASCADE,
+    interview_id VARCHAR(64) NOT NULL REFERENCES Interviews(interview_id) ON DELETE CASCADE,
     user_id VARCHAR(64) NOT NULL REFERENCES UserInfo(user_id) ON DELETE CASCADE,
     schema_version VARCHAR(40) NOT NULL,
     evidence_hash VARCHAR(128) NOT NULL,
     item_count INTEGER NOT NULL DEFAULT 0,
     manifest_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     manifest_encrypted BYTEA NOT NULL,
+    revision_no INTEGER NOT NULL DEFAULT 1,
+    is_current BOOLEAN NOT NULL DEFAULT TRUE,
+    supersedes_manifest_id VARCHAR(64) REFERENCES EvidenceManifests(manifest_id) ON DELETE SET NULL,
+    producer_version VARCHAR(80) NOT NULL DEFAULT 'evidence-v4',
     sealed_at TIMESTAMP NOT NULL DEFAULT NOW(),
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_manifest_hash ON EvidenceManifests (interview_id, evidence_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_manifest_hash_producer
+    ON EvidenceManifests (interview_id, evidence_hash, producer_version);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_manifest_current ON EvidenceManifests (interview_id) WHERE is_current;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_manifest_revision ON EvidenceManifests (interview_id, revision_no);
 
 ALTER TABLE AnalysisJobs ADD COLUMN IF NOT EXISTS manifest_id VARCHAR(64) REFERENCES EvidenceManifests(manifest_id) ON DELETE RESTRICT;
+ALTER TABLE AnalysisJobs ADD COLUMN IF NOT EXISTS producer_version VARCHAR(80) NOT NULL DEFAULT 'evidence-v4';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_analysis_job_idempotency ON AnalysisJobs (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS EvidenceCorrections (

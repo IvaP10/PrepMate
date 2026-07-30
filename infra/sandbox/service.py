@@ -12,6 +12,7 @@ import asyncio
 import io
 import os
 import secrets
+import socket
 import tarfile
 import time
 import uuid
@@ -26,6 +27,7 @@ from pydantic import BaseModel, Field, field_validator
 
 RUNTIME_IMAGE = os.getenv("SANDBOX_RUNTIME_IMAGE", "interai-sandbox-runtime:2026-07-v1")
 OCI_RUNTIME = os.getenv("SANDBOX_OCI_RUNTIME", "runsc")
+STAGING_MARKER = "/workspace/.interai-ready"
 # Keep the executor and application on the same internal credential when a
 # deployment uses the documented JWT-secret fallback. `or` is deliberate:
 # Compose may pass an empty SANDBOX_API_TOKEN after host-side interpolation.
@@ -41,9 +43,13 @@ MAX_MEMORY_BYTES = int(os.getenv("SANDBOX_MEMORY_LIMIT_BYTES", str(256 * 1024 * 
 MAX_PIDS = int(os.getenv("SANDBOX_PROCESS_LIMIT", "32"))
 MAX_TIMEOUT_MS = int(os.getenv("SANDBOX_TIMEOUT_MS", "2000"))
 MAX_ABSOLUTE_TIMEOUT_MS = int(os.getenv("SANDBOX_ABSOLUTE_TIMEOUT_MS", "10000"))
-MAX_CONCURRENT_EXECUTIONS = int(os.getenv("SANDBOX_MAX_CONCURRENT_EXECUTIONS", "4"))
+# A controller serializes Docker lifecycle operations. Capacity is increased by
+# running more controllers, not by racing create/start/remove calls through one
+# daemon connection.
+MAX_CONCURRENT_EXECUTIONS = int(os.getenv("SANDBOX_MAX_CONCURRENT_EXECUTIONS", "1"))
 MAX_QUEUE_WAIT_SECONDS = float(os.getenv("SANDBOX_QUEUE_WAIT_SECONDS", "1.0"))
 EXECUTION_SLOTS = asyncio.Semaphore(max(1, MAX_CONCURRENT_EXECUTIONS))
+OUTPUT_TRUNCATION_MARKER = "\n[output truncated at 64 KB]"
 
 RUNTIMES = [
     {"language": "python", "version": "3.12", "aliases": ["py", "python3"]},
@@ -144,13 +150,21 @@ def command_for_language(language: str) -> list[str]:
         "java": "javac /workspace/Main.java && java -cp /workspace Main < /workspace/stdin.txt",
         "c++": "g++ -std=c++17 -O2 -pipe /workspace/main.cpp -o /workspace/main && /workspace/main < /workspace/stdin.txt",
     }
-    return ["/bin/sh", "-c", commands[language]]
+    return [
+        "/bin/sh",
+        "-c",
+        f"until [ -f {STAGING_MARKER} ]; do sleep 0.01; done; {commands[language]}",
+    ]
 
 
 def source_archive(language: str, source: str, stdin: str) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as archive:
-        for name, payload in ((FILE_NAMES[language], source), ("stdin.txt", stdin)):
+        for name, payload in (
+            (FILE_NAMES[language], source),
+            ("stdin.txt", stdin),
+            (STAGING_MARKER.rsplit("/", 1)[-1], "ready"),
+        ):
             raw = payload.encode("utf-8")
             info = tarfile.TarInfo(name=name)
             info.size = len(raw)
@@ -159,6 +173,68 @@ def source_archive(language: str, source: str, stdin: str) -> bytes:
             info.gid = 65532
             archive.addfile(info, io.BytesIO(raw))
     return buffer.getvalue()
+
+
+def stage_source_archive(client: Any, container: Any, archive: bytes) -> None:
+    """Stream trusted fixed-name source data into the writable workspace tmpfs."""
+    execution = client.api.exec_create(
+        container.id,
+        ["/bin/tar", "-x", "-C", "/workspace", "--no-same-owner"],
+        user="65532:65532",
+        stdin=True,
+        stdout=True,
+        stderr=True,
+    )
+    stream = client.api.exec_start(execution["Id"], socket=True)
+    raw_socket = getattr(stream, "_sock", stream)
+    try:
+        raw_socket.sendall(archive)
+        raw_socket.shutdown(socket.SHUT_WR)
+        while raw_socket.recv(64 * 1024):
+            pass
+    finally:
+        stream.close()
+    result = client.api.exec_inspect(execution["Id"])
+    if result.get("Running") or int(result.get("ExitCode") or 0) != 0:
+        raise RuntimeError("Could not stage submission files")
+
+
+def kill_timed_out_container(container: Any) -> bool:
+    """Kill a live timeout without turning an exit-at-deadline race into 502."""
+    try:
+        container.kill()
+        return True
+    except APIError as exc:
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if status_code != 409:
+            raise
+        container.reload()
+        if container.status not in {"exited", "dead"}:
+            raise
+    return False
+
+
+def bound_execution_output(stdout: str, stderr: str) -> tuple[str, str, bool]:
+    """Return UTF-8-safe output that includes its truncation marker in the cap."""
+    stdout_bytes = stdout.encode("utf-8", errors="replace")
+    stderr_bytes = stderr.encode("utf-8", errors="replace")
+    if len(stdout_bytes) + len(stderr_bytes) <= MAX_OUTPUT_BYTES:
+        return stdout, stderr, False
+
+    marker_bytes = OUTPUT_TRUNCATION_MARKER.encode("utf-8")
+    if MAX_OUTPUT_BYTES <= len(marker_bytes):
+        marker = marker_bytes[:MAX_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+        return "", marker, True
+
+    content_budget = MAX_OUTPUT_BYTES - len(marker_bytes)
+    bounded_stdout_bytes = stdout_bytes[:content_budget]
+    remaining = content_budget - len(bounded_stdout_bytes)
+    bounded_stderr_bytes = stderr_bytes[:remaining]
+    bounded_stdout = bounded_stdout_bytes.decode("utf-8", errors="ignore")
+    bounded_stderr = bounded_stderr_bytes.decode("utf-8", errors="ignore") + OUTPUT_TRUNCATION_MARKER
+    return bounded_stdout, bounded_stderr, True
 
 
 def execute_isolated(request: ExecuteRequest) -> dict[str, Any]:
@@ -198,12 +274,21 @@ def execute_isolated(request: ExecuteRequest) -> dict[str, Any]:
                 "/workspace": "rw,exec,nosuid,nodev,size=32m,uid=65532,gid=65532,mode=0700",
                 "/tmp": "rw,noexec,nosuid,nodev,size=8m,uid=65532,gid=65532,mode=0700",
             },
-            log_config=docker.types.LogConfig(type="local", config={"max-size": "64k", "max-file": "1"}),
+            log_config=docker.types.LogConfig(
+                type="json-file",
+                # Keep the driver cap above the API cap so the controller can
+                # detect oversized output and append an explicit truncation
+                # marker instead of silently inheriting a rotated log.
+                config={"max-size": "128k", "max-file": "1"},
+            ),
             labels={"interai.component": "candidate-sandbox", "interai.ephemeral": "true"},
         )
-        if not container.put_archive("/workspace", source_archive(request.language, request.files[0].content, request.stdin)):
-            raise RuntimeError("Could not stage submission files")
         container.start()
+        stage_source_archive(
+            client,
+            container,
+            source_archive(request.language, request.files[0].content, request.stdin),
+        )
         deadline = time.monotonic() + timeout_ms / 1000
         while time.monotonic() < deadline:
             container.reload()
@@ -211,19 +296,12 @@ def execute_isolated(request: ExecuteRequest) -> dict[str, Any]:
                 break
             time.sleep(0.025)
         else:
-            timed_out = True
-            container.kill()
+            timed_out = kill_timed_out_container(container)
         result = container.wait(timeout=2)
         exit_code = 124 if timed_out else int(result.get("StatusCode") or 0)
         stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
         stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
-        combined = (stdout + stderr).encode("utf-8", errors="replace")
-        if len(combined) > MAX_OUTPUT_BYTES:
-            stdout_raw = stdout.encode("utf-8", errors="replace")[:MAX_OUTPUT_BYTES]
-            stdout = stdout_raw.decode("utf-8", errors="ignore")
-            remaining = max(0, MAX_OUTPUT_BYTES - len(stdout.encode("utf-8")))
-            stderr = stderr.encode("utf-8", errors="replace")[:remaining].decode("utf-8", errors="ignore")
-            stderr = (stderr + "\n[output truncated at 64 KB]").strip()
+        stdout, stderr, truncated = bound_execution_output(stdout, stderr)
         wall_time = int((time.monotonic() - started) * 1000)
         return {
             "language": request.language,
@@ -236,6 +314,8 @@ def execute_isolated(request: ExecuteRequest) -> dict[str, Any]:
                 "status": "TO" if timed_out else "",
                 "wall_time": wall_time,
                 "memory": 0,
+                "truncated": truncated,
+                "output_limit_bytes": MAX_OUTPUT_BYTES,
             },
         }
     except HTTPException:

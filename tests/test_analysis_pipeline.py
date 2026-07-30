@@ -10,6 +10,19 @@ from analysis_pipeline import aggregate_cheating_risk, _valid_candidate_report
 
 
 class AnalysisPipelinePureTests(unittest.TestCase):
+    def test_analysis_job_identity_is_scoped_to_the_interview(self):
+        first = analysis_pipeline._analysis_job_idempotency_key(
+            "interview-1",
+            "same-evidence",
+        )
+        second = analysis_pipeline._analysis_job_idempotency_key(
+            "interview-2",
+            "same-evidence",
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertIn("interview-1", first)
+
     def test_report_pipeline_uses_explicit_production_stages(self):
         self.assertEqual(analysis_pipeline.ANALYSIS_STAGES, (
             "evidence_load",
@@ -79,6 +92,42 @@ class AnalysisPipelinePureTests(unittest.TestCase):
         self.assertFalse(_valid_candidate_report({"error": "stage_failed"}, "interview-1"))
         self.assertFalse(_valid_candidate_report({**valid, "interview_id": "interview-2"}, "interview-1"))
         self.assertFalse(_valid_candidate_report({**valid, "evidence_status": None}, "interview-1"))
+
+    def test_openai_report_fallback_is_published_as_partial(self):
+        report = {
+            "overall_score": 78,
+            "ai_enhanced": False,
+            "ai_fallback_reason": "report_generation_llm_failed",
+        }
+
+        self.assertTrue(
+            analysis_pipeline._report_has_noncritical_degradation(
+                report,
+                {"semantic_enhancement": report},
+            )
+        )
+
+    def test_no_candidate_evidence_is_ungradable_not_partial(self):
+        report = {
+            "overall_score": None,
+            "ai_enhanced": False,
+            "ai_fallback_reason": "no_candidate_evidence",
+        }
+
+        self.assertFalse(
+            analysis_pipeline._report_has_noncritical_degradation(
+                report,
+                {"semantic_enhancement": report},
+            )
+        )
+
+    def test_failed_noncritical_stage_marks_report_partial(self):
+        self.assertTrue(
+            analysis_pipeline._report_has_noncritical_degradation(
+                {"overall_score": 72},
+                {"audio_features": {"error": "stage_failed"}},
+            )
+        )
 
     def test_cheating_risk_escalates_large_paste_and_focus_events(self):
         result = aggregate_cheating_risk(

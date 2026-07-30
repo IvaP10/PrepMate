@@ -75,6 +75,12 @@ class _Connection:
     def cursor(self):
         return self._cursor
 
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
 
 class _DatabaseContext:
     def __init__(self, connection):
@@ -121,3 +127,53 @@ def test_list_resume_versions_uses_owned_rows_and_returns_active_id():
     assert result["active_resume_id"] == "resume-1"
     assert result["resumes"][0]["resume_payload"]["name"] == "Ada Lovelace"
     assert cursor.queries[0][1] == ("user-1",)
+
+
+class _DeleteCursor:
+    def __init__(self, row):
+        self.row = row
+        self.queries = []
+
+    def execute(self, query, params=None):
+        self.queries.append((" ".join(query.split()), params))
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        return None
+
+
+def _delete_context(row):
+    cursor = _DeleteCursor(row)
+    return cursor, _DatabaseContext(_Connection(cursor))
+
+
+def test_delete_resume_version_removes_owned_version():
+    cursor, context = _delete_context(("resume-2",))
+
+    with patch.object(pre_interview, "get_db", return_value=context):
+        result = asyncio.run(pre_interview.delete_resume_version(
+            "resume-2",
+            current_user={"user_id": "user-1"},
+        ))
+
+    assert result == {"success": True, "message": "Resume version deleted"}
+    assert cursor.queries[0][1] == ("user-1", "resume-2")
+    assert cursor.queries[1][0].startswith("DELETE FROM ResumeVersions")
+    assert cursor.queries[1][1] == ("user-1", "resume-2")
+
+
+@pytest.mark.parametrize("row", [(True, False), (False, True), (True, True)])
+def test_delete_resume_version_does_not_block_active_or_referenced_versions(row):
+    cursor, context = _delete_context(row)
+
+    with patch.object(pre_interview, "get_db", return_value=context):
+        result = asyncio.run(pre_interview.delete_resume_version(
+            "resume-locked",
+            current_user={"user_id": "user-1"},
+        ))
+
+    assert result == {"success": True, "message": "Resume version deleted"}
+    assert len(cursor.queries) == 2
+    assert cursor.queries[1][0].startswith("DELETE FROM ResumeVersions")

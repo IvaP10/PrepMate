@@ -316,27 +316,7 @@ async def delete_resume(
 
     try:
         cursor.execute(
-            """
-            UPDATE ResumeVersions
-            SET is_active = FALSE,
-                updated_at = NOW()
-            WHERE user_id = %s
-            """,
-            (current_user["user_id"],),
-        )
-        cursor.execute(
-            """
-            DELETE FROM ResumeVersions version
-            WHERE version.user_id = %s
-              AND NOT EXISTS (
-                  SELECT 1 FROM Interviews interview
-                  WHERE interview.resume_id = version.resume_id
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM InterviewBlueprints blueprint
-                  WHERE blueprint.resume_id = version.resume_id
-              )
-            """,
+            "DELETE FROM ResumeVersions WHERE user_id = %s",
             (current_user["user_id"],),
         )
         cursor.execute(
@@ -356,8 +336,8 @@ async def delete_resume(
         logger.info("Resume deleted for %s", stable_hash(current_user["user_id"], "user"))
 
         return {
-            "message": "Active resume removed successfully",
-            "retained_history": "Resume versions tied to historical interviews remain inactive so their evidence stays auditable.",
+            "message": "Resume versions removed successfully",
+            "retained_history": "Past interview evidence remains available after the resume references are detached.",
         }
 
     except Exception:

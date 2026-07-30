@@ -1,0 +1,15 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile.api"
+watchPatterns = [
+  "/**/*.py",
+  "/requirements.lock.txt",
+  "/Dockerfile.api",
+  "/alembic.ini",
+  "/migrations/**",
+]
+
+[deploy]
+startCommand = "python worker.py"
+restartPolicyType = "ALWAYS"
+drainingSeconds = 30

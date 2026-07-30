@@ -467,7 +467,7 @@ def _candidate_report_cta(
             "nav": "report",
             "entity_id": interview_id,
         }
-    if has_candidate_evidence and normalized_status in {"completed", "partial", "failed"}:
+    if has_candidate_evidence and normalized_status in {"completed", "report_ready", "partial", "failed"}:
         return {
             "label": "Open report",
             "nav": "report",
@@ -728,7 +728,7 @@ def _non_technical_interview_where(alias: str = "i") -> str:
 
 def _gradable_interview_where(alias: str = "i") -> str:
     return f"""
-      AND {alias}.status IN ('completed', 'partial')
+      AND {alias}.status IN ('completed', 'report_ready', 'partial')
       AND {alias}.overall_score IS NOT NULL
       AND {alias}.report_json IS NOT NULL
       AND COALESCE({alias}.report_json->>'readiness_label', '') <> 'Not gradable'
@@ -744,7 +744,8 @@ def _recent_interviews(cursor, user_id: str, limit: int = 20) -> List[Dict[str, 
                i.status, i.attempt_status
         FROM Interviews i
         WHERE i.user_id = %s
-          AND i.status IN ('completed', 'partial', 'failed', 'cancelled', 'in_progress')
+          AND i.status IN ('completed', 'report_ready', 'partial', 'failed')
+          AND i.attempt_status = 'completed'
           AND EXISTS (
               SELECT 1 FROM InterviewResponses response
               WHERE response.interview_id = i.interview_id
@@ -812,10 +813,11 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
         assessment_score = row[20]
         if assessment_score is None:
             assessment_score = assessment.get("overall_score")
-        if assessment_score is None:
-            # This is a coaching-only answer score. The session readiness score
-            # remains null until the evidence contract is sufficient.
-            assessment_score = assessment.get("provisional_score")
+        insufficient = bool(
+            assessment.get("insufficient_evidence")
+            or assessment.get("evidence_status") == "insufficient_evidence"
+        )
+        authoritative = bool(assessment_score is not None and not insufficient)
 
         encrypted_answer = row[16]
         if isinstance(encrypted_answer, memoryview):
@@ -853,13 +855,13 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
             "question_type": row[2] or "main",
             "is_followup": bool(row[3]),
             "topic": row[4] or "General",
-            "score": numeric(row[5], assessment_score),
+            "score": numeric(assessment_score) if authoritative else None,
             "response_time": float(row[6]) if row[6] is not None else None,
-            "technical_accuracy": numeric(row[7], dimensions.get("correctness"), scores.get("technical_accuracy")),
-            "communication": numeric(row[8], dimensions.get("communication"), scores.get("directness")),
-            "problem_solving": numeric(row[9], dimensions.get("star_structure"), dimensions.get("depth"), scores.get("structure")),
-            "confidence": numeric(row[10], assessment.get("confidence")),
-            "relevance": numeric(row[11], dimensions.get("relevance"), scores.get("relevance")),
+            "technical_accuracy": numeric(dimensions.get("correctness"), scores.get("technical_accuracy")) if authoritative else None,
+            "communication": numeric(dimensions.get("communication"), scores.get("directness")) if authoritative else None,
+            "problem_solving": numeric(dimensions.get("star_structure"), dimensions.get("depth"), scores.get("structure")) if authoritative else None,
+            "confidence": numeric(assessment.get("confidence")) if authoritative else None,
+            "relevance": numeric(dimensions.get("relevance"), scores.get("relevance")) if authoritative else None,
             "answer_quality_flags": list(dict.fromkeys([*legacy_flags, *assessment_flags])),
             "evidence_quotes": row[13] or assessment_quotes,
             "feedback": feedback,
@@ -867,7 +869,7 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
             "interview_id": row[17],
             "created_at": row[18],
             "evidence_status": assessment.get("evidence_status"),
-            "authoritative": bool(assessment.get("authoritative")),
+            "authoritative": authoritative,
         })
     return items
 
@@ -1026,21 +1028,463 @@ def _dynamic_payload(mode: str, has_data: bool, overview: List[Dict[str, Any]], 
     return payload
 
 
+PERFORMANCE_DIMENSION_LABELS = {
+    "communication_clarity": "Communication clarity",
+    "communication": "Communication clarity",
+    "answer_structure_star": "Answer structure",
+    "star_structure": "Answer structure",
+    "relevance": "Answer relevance",
+    "evidence_confidence": "Evidence confidence",
+    "technical_competency": "Technical competency",
+    "technical_accuracy": "Technical accuracy",
+    "correctness": "Technical correctness",
+    "problem_solving": "Problem solving",
+    "depth": "Technical depth",
+    "ownership": "Ownership",
+    "specificity_evidence": "Specificity and evidence",
+    "tradeoffs": "Trade-off reasoning",
+    "overall_interview_performance": "Overall interview performance",
+    "code_quality": "Code quality",
+}
+
+
+def _performance_raw_number(*values: Any) -> Optional[float]:
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip().rstrip("%"))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _performance_number(*values: Any) -> Optional[float]:
+    value = _performance_raw_number(*values)
+    return _clip(value) if value is not None else None
+
+
+def _analysis_dimensions(analysis: Dict[str, Any]) -> Dict[str, float]:
+    raw = analysis.get("dimension_scores") or analysis.get("dimensions") or {}
+    if not isinstance(raw, dict):
+        return {}
+    dimensions: Dict[str, float] = {}
+    for key, value in raw.items():
+        score = _performance_number(value)
+        if score is not None:
+            dimensions[str(key)] = score
+    return dimensions
+
+
+def _analysis_report(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    report = analysis.get("report")
+    return report if isinstance(report, dict) else {}
+
+
+def _question_score(item: Dict[str, Any]) -> Optional[float]:
+    return _performance_number(item.get("overall_score"), item.get("provisional_score"))
+
+
+def _is_project_question(item: Dict[str, Any]) -> bool:
+    text = " ".join(str(item.get(key) or "") for key in ("question", "skill", "project_facet")).lower()
+    taxonomy = item.get("taxonomy_keys") or []
+    if isinstance(taxonomy, list):
+        text += " " + " ".join(str(value).lower() for value in taxonomy)
+    return any(token in text for token in ("project", "portfolio"))
+
+
+def _canonical_project_explanation(comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
+    project_scores: List[float] = []
+    sessions: set[str] = set()
+    breakdown_values: Dict[str, List[float]] = defaultdict(list)
+    breakdown_keys = {
+        "clarity": ("communication", "directness", "relevance"),
+        "technical_depth": ("correctness", "depth", "technical_accuracy"),
+        "architecture": ("tradeoffs", "structure"),
+        "impact": ("specificity_evidence", "ownership"),
+    }
+    for session in comparable:
+        analysis = session.get("analysis") or {}
+        for question in analysis.get("question_analyses") or analysis.get("questions") or []:
+            if not isinstance(question, dict) or not _is_project_question(question):
+                continue
+            score = _question_score(question)
+            if score is not None:
+                project_scores.append(score)
+                sessions.add(str(session.get("interview_id") or ""))
+            dimensions = question.get("dimension_scores") or {}
+            if not isinstance(dimensions, dict):
+                continue
+            for label, keys in breakdown_keys.items():
+                values = [
+                    _performance_number(dimensions.get(key))
+                    for key in keys
+                ]
+                available = [value for value in values if value is not None]
+                if available:
+                    breakdown_values[label].append(sum(available) / len(available))
+
+    breakdown = [
+        {
+            "label": _human_label(label),
+            "score": round(sum(values) / len(values), 1),
+        }
+        for label, values in breakdown_values.items()
+        if values
+    ]
+    return {
+        "score": round(sum(project_scores) / len(project_scores), 1) if project_scores else None,
+        "answer_count": len(project_scores),
+        "session_count": len({value for value in sessions if value}),
+        "breakdown": breakdown,
+        "detail": (
+            f"Based on {len(project_scores)} project answer{'s' if len(project_scores) != 1 else ''} "
+            f"across {len(sessions)} comparable interview{'s' if len(sessions) != 1 else ''}."
+            if project_scores else "No project explanation has enough scored evidence yet."
+        ),
+    }
+
+
+def _canonical_communication_summary(comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not comparable:
+        return {"fluency_clarity": None, "confidence": None, "patterns": []}
+    latest_analysis = comparable[-1].get("analysis") or {}
+    dimensions = _analysis_dimensions(latest_analysis)
+    report = _analysis_report(latest_analysis)
+    behavioral = report.get("behavioral_metrics") if isinstance(report.get("behavioral_metrics"), dict) else {}
+    measured = latest_analysis.get("measured_communication") or {}
+    audio = measured.get("audio") if isinstance(measured, dict) else {}
+    audio = audio if isinstance(audio, dict) else {}
+
+    fluency = _performance_number(
+        dimensions.get("communication_clarity"),
+        dimensions.get("communication"),
+    )
+    words_per_minute = _performance_raw_number(
+        behavioral.get("words_per_minute"),
+        audio.get("words_per_minute"),
+    )
+    filler_count = _performance_raw_number(
+        behavioral.get("filler_count"),
+        audio.get("filler_count"),
+    )
+    voiced_seconds = _performance_raw_number(
+        behavioral.get("voiced_duration_seconds"),
+        audio.get("voiced_duration_seconds"),
+    )
+    response_latency = _performance_raw_number(
+        behavioral.get("response_latency_seconds_avg"),
+        audio.get("response_latency_seconds_avg"),
+    )
+    filler_rate = (
+        round(float(filler_count) / (float(voiced_seconds) / 60.0), 1)
+        if filler_count is not None and voiced_seconds and voiced_seconds > 0 else None
+    )
+
+    delivery_confidence: Optional[float] = None
+    if filler_rate is not None or words_per_minute is not None or response_latency is not None:
+        delivery_confidence = 88.0
+        if filler_rate is not None:
+            delivery_confidence -= max(0.0, filler_rate - 1.0) * 8.0
+        if words_per_minute is not None:
+            if words_per_minute < 105:
+                delivery_confidence -= min(18.0, (105 - words_per_minute) * 0.35)
+            elif words_per_minute > 185:
+                delivery_confidence -= min(18.0, (words_per_minute - 185) * 0.3)
+        if response_latency is not None and response_latency > 4:
+            delivery_confidence -= min(12.0, (response_latency - 4) * 2.0)
+        delivery_confidence = _clip(delivery_confidence)
+
+    pattern_sessions: Dict[str, set[str]] = defaultdict(set)
+    pattern_counts: Counter[str] = Counter()
+    pattern_details = {
+        "Weak self-introduction": "The opening answer needs a clearer role, proof point, and target-role bridge.",
+        "Unclear project explanations": "Project answers need clearer ownership, architecture, trade-offs, and impact.",
+        "Excessive filler words": "Measured filler density is interrupting otherwise useful answers.",
+        "Rambling or indirect answers": "The direct answer is arriving too late or drifting away from the question.",
+        "Incomplete answers": "Answers stop before showing reasoning, evidence, or a result.",
+        "Vague explanations": "Claims need exact decisions, constraints, and measurable outcomes.",
+        "Missing evidence": "Claims are not consistently backed by a project, example, or metric.",
+    }
+    flag_labels = {
+        "too_short": "Incomplete answers",
+        "no_response": "Incomplete answers",
+        "vague": "Vague explanations",
+        "off_topic": "Rambling or indirect answers",
+        "low_lexical_relevance": "Rambling or indirect answers",
+        "no_evidence": "Missing evidence",
+        "insufficient_evidence": "Missing evidence",
+    }
+    for session in comparable[-5:]:
+        session_id = str(session.get("interview_id") or "unknown")
+        analysis = session.get("analysis") or {}
+        for question in analysis.get("question_analyses") or analysis.get("questions") or []:
+            if not isinstance(question, dict):
+                continue
+            score = _question_score(question)
+            question_text = str(question.get("question") or "").lower()
+            if score is not None and score < 70:
+                if "tell me about yourself" in question_text or "introduce" in question_text:
+                    pattern_sessions["Weak self-introduction"].add(session_id)
+                    pattern_counts.update(["Weak self-introduction"])
+                if _is_project_question(question):
+                    pattern_sessions["Unclear project explanations"].add(session_id)
+                    pattern_counts.update(["Unclear project explanations"])
+            for flag in question.get("answer_quality_flags") or []:
+                label = flag_labels.get(str(flag).strip().lower())
+                if label:
+                    pattern_sessions[label].add(session_id)
+                    pattern_counts.update([label])
+        session_measured = analysis.get("measured_communication") or {}
+        session_audio = session_measured.get("audio") if isinstance(session_measured, dict) else {}
+        session_audio = session_audio if isinstance(session_audio, dict) else {}
+        session_fillers = _performance_raw_number(session_audio.get("filler_count"))
+        session_voiced = _performance_raw_number(session_audio.get("voiced_duration_seconds"))
+        if session_fillers is not None and session_voiced and session_voiced > 0:
+            session_rate = session_fillers / (session_voiced / 60.0)
+            if session_rate > 2:
+                pattern_sessions["Excessive filler words"].add(session_id)
+                pattern_counts.update(["Excessive filler words"])
+
+    patterns = [
+        {
+            "label": label,
+            "detail": pattern_details[label],
+            "count": int(pattern_counts[label]),
+            "session_count": len(sessions),
+            "recurring": len(sessions) >= 2,
+        }
+        for label, sessions in sorted(
+            pattern_sessions.items(),
+            key=lambda item: (-len(item[1]), -pattern_counts[item[0]], item[0]),
+        )
+    ][:5]
+    fluency_detail_parts = []
+    if words_per_minute is not None:
+        fluency_detail_parts.append(f"{round(words_per_minute):g} words/min")
+    if filler_rate is not None:
+        fluency_detail_parts.append(f"{filler_rate:g} fillers/min")
+    return {
+        "fluency_clarity": {
+            "score": fluency,
+            "detail": ", ".join(fluency_detail_parts) or "Based on transcript clarity and answer structure.",
+        },
+        "confidence": {
+            "score": delivery_confidence,
+            "detail": (
+                "Estimated from measured pacing, hesitation, and filler use."
+                if delivery_confidence is not None
+                else "Voice delivery evidence was not measurable in the latest interview."
+            ),
+        },
+        "patterns": patterns,
+    }
+
+
+def _canonical_dimension_directions(comparable: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    series: Dict[str, List[float]] = defaultdict(list)
+    for session in comparable[-5:]:
+        for key, score in _analysis_dimensions(session.get("analysis") or {}).items():
+            series[key].append(score)
+    changes = []
+    for key, values in series.items():
+        if len(values) < 2:
+            continue
+        delta = round(values[-1] - values[0], 1)
+        if abs(delta) < 4:
+            continue
+        changes.append({
+            "label": PERFORMANCE_DIMENSION_LABELS.get(key, _human_label(key)),
+            "delta": delta,
+            "latest_score": round(values[-1], 1),
+            "session_count": len(values),
+        })
+    return {
+        "improving": sorted((item for item in changes if item["delta"] > 0), key=lambda item: -item["delta"])[:4],
+        "declining": sorted((item for item in changes if item["delta"] < 0), key=lambda item: item["delta"])[:4],
+    }
+
+
+def _canonical_technical_summary(comparable: List[Dict[str, Any]], trend: List[Dict[str, Any]]) -> Dict[str, Any]:
+    gap_sessions: Dict[str, set[str]] = defaultdict(set)
+    gap_scores: Dict[str, List[float]] = defaultdict(list)
+    for session in comparable[-5:]:
+        session_id = str(session.get("interview_id") or "unknown")
+        analysis = session.get("analysis") or {}
+        technical = analysis.get("technical") if isinstance(analysis.get("technical"), dict) else {}
+        for gap in technical.get("weak_topics") or []:
+            if not isinstance(gap, dict):
+                continue
+            label = _human_label(gap.get("topic") or gap.get("skill") or gap.get("label"))
+            if not label:
+                continue
+            gap_sessions[label].add(session_id)
+            score = _performance_number(gap.get("score"), gap.get("average_score"))
+            if score is not None:
+                gap_scores[label].append(score)
+        for question in analysis.get("question_analyses") or []:
+            if not isinstance(question, dict):
+                continue
+            score = _question_score(question)
+            if score is None or score >= 65:
+                continue
+            taxonomy = question.get("taxonomy_keys") or []
+            labels = taxonomy if isinstance(taxonomy, list) and taxonomy else [question.get("skill")]
+            for raw_label in labels[:2]:
+                label = _human_label(raw_label)
+                if label and label not in {"General", "Technical"}:
+                    gap_sessions[label].add(session_id)
+                    gap_scores[label].append(score)
+    knowledge_gaps = [
+        {
+            "label": label,
+            "session_count": len(sessions),
+            "score": round(sum(gap_scores[label]) / len(gap_scores[label]), 1) if gap_scores[label] else None,
+        }
+        for label, sessions in sorted(
+            gap_sessions.items(),
+            key=lambda item: (-len(item[1]), item[0]),
+        )
+        if len(sessions) >= 2
+    ][:6]
+    return {
+        "trend": trend[-5:],
+        "knowledge_gaps": knowledge_gaps,
+        "latest_score": next((item.get("score") for item in reversed(trend) if item.get("score") is not None), None),
+    }
+
+
+def _canonical_ai_insights(
+    comparable: List[Dict[str, Any]],
+    trend: List[Dict[str, Any]],
+    communication: Dict[str, Any],
+    directions: Dict[str, List[Dict[str, Any]]],
+) -> List[str]:
+    if not comparable:
+        return []
+    report = _analysis_report(comparable[-1].get("analysis") or {})
+    student_summary = report.get("student_summary") if isinstance(report.get("student_summary"), dict) else {}
+    candidates = [
+        report.get("summary"),
+        student_summary.get("blocker"),
+        student_summary.get("next_step"),
+        student_summary.get("interviewer_signal"),
+    ]
+    scored_trend = [item for item in trend[-5:] if item.get("score") is not None]
+    if len(scored_trend) >= 2:
+        delta = round(float(scored_trend[-1]["score"]) - float(scored_trend[0]["score"]), 1)
+        direction = "improved" if delta > 0 else "declined" if delta < 0 else "held steady"
+        candidates.append(f"Comparable interview performance has {direction} by {abs(delta):g} points across the visible history.")
+    recurring = [item for item in communication.get("patterns") or [] if item.get("recurring")]
+    if recurring:
+        candidates.append(f"{recurring[0]['label']} is the most persistent communication pattern across recent interviews.")
+    if directions.get("improving"):
+        candidates.append(f"{directions['improving'][0]['label']} is the clearest improving area.")
+    if directions.get("declining"):
+        candidates.append(f"{directions['declining'][0]['label']} needs attention after declining across comparable interviews.")
+
+    insights: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        text = _short_text(candidate, 180)
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        insights.append(text)
+        if len(insights) == 5:
+            break
+    return insights
+
+
+def _canonical_strengths(comparable: List[Dict[str, Any]]) -> List[str]:
+    if not comparable:
+        return []
+    latest_report = _analysis_report(comparable[-1].get("analysis") or {})
+    strengths = [
+        _short_text(item, 150)
+        for item in latest_report.get("strengths") or []
+        if str(item or "").strip()
+    ]
+    series: Dict[str, List[float]] = defaultdict(list)
+    for session in comparable[-5:]:
+        for key, score in _analysis_dimensions(session.get("analysis") or {}).items():
+            series[key].append(score)
+    stable = sorted(
+        (
+            (key, values)
+            for key, values in series.items()
+            if len(values) >= 2 and sum(values) / len(values) >= 75
+        ),
+        key=lambda item: -(sum(item[1]) / len(item[1])),
+    )
+    for key, values in stable:
+        strengths.append(
+            f"{PERFORMANCE_DIMENSION_LABELS.get(key, _human_label(key))} has remained strong across {len(values)} comparable interviews."
+        )
+    unique: List[str] = []
+    seen: set[str] = set()
+    for strength in strengths:
+        key = strength.lower()
+        if not strength or key in seen:
+            continue
+        seen.add(key)
+        unique.append(strength)
+        if len(unique) == 5:
+            break
+    return unique
+
+
+def _canonical_performance_cohort(
+    rows: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """Separate latest-attempt state from the latest official scoring cohort."""
+    latest_attempt = rows[0]
+    score_anchor = next(
+        (
+            item
+            for item in rows
+            if item.get("evidence_status") == "sufficient"
+            and item.get("overall_score") is not None
+        ),
+        latest_attempt,
+    )
+    comparable = [
+        item for item in rows
+        if item.get("taxonomy_version") == score_anchor.get("taxonomy_version")
+        and item.get("rubric_version") == score_anchor.get("rubric_version")
+        and item.get("evaluator_version") == score_anchor.get("evaluator_version")
+        and item.get("profile_family") == score_anchor.get("profile_family")
+        and item.get("evidence_status") == score_anchor.get("evidence_status")
+    ]
+    return latest_attempt, score_anchor, comparable
+
+
 def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100) -> Dict[str, Optional[Dict[str, Any]]]:
     cursor.execute(
         """
-        SELECT analysis_id, interview_id, mode, schema_version, evidence_hash,
-               status, analysis_json, evidence_index_json,
-               analysis_json_encrypted, evidence_index_encrypted, overall_score,
-               evaluator_version, taxonomy_version, rubric_version,
-               duration_seconds, evidence_status, created_at
-        FROM SessionPerformanceAnalyses
-        WHERE user_id = %s
-          AND status = 'ready'
-          AND schema_version = 'session-performance-v3'
-          AND analysis_json_encrypted IS NOT NULL
-          AND evidence_index_encrypted IS NOT NULL
-        ORDER BY created_at DESC
+        SELECT analysis.analysis_id, analysis.interview_id, analysis.mode,
+               analysis.schema_version, analysis.evidence_hash,
+               analysis.status, analysis.analysis_json, analysis.evidence_index_json,
+               analysis.analysis_json_encrypted, analysis.evidence_index_encrypted,
+               analysis.overall_score, analysis.evaluator_version,
+               analysis.taxonomy_version, analysis.rubric_version,
+               analysis.duration_seconds, analysis.evidence_status,
+               COALESCE(interview.completed_at, interview.created_at) AS session_at,
+               analysis.created_at AS analyzed_at
+        FROM SessionPerformanceAnalyses analysis
+        JOIN Interviews interview
+          ON interview.interview_id = analysis.interview_id
+         AND interview.user_id = analysis.user_id
+        WHERE analysis.user_id = %s
+          AND analysis.status = 'ready'
+          AND analysis.schema_version = 'session-performance-v4'
+          AND analysis.is_current = TRUE
+          AND analysis.analysis_json_encrypted IS NOT NULL
+          AND analysis.evidence_index_encrypted IS NOT NULL
+        ORDER BY COALESCE(interview.completed_at, interview.created_at) DESC,
+                 analysis.created_at DESC
         LIMIT %s
         """,
         (user_id, min(max(int(limit or 100), 1), 200)),
@@ -1074,6 +1518,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             "duration_seconds": int(row[12 + offset]) if row[12 + offset] is not None else None,
             "evidence_status": row[13 + offset],
             "created_at": row[14 + offset],
+            "analyzed_at": row[15 + offset] if len(row) > 15 + offset else row[14 + offset],
             "profile_family": (
                 analysis.get("profile_type")
                 or ((analysis.get("report") or {}).get("profile_type") if isinstance(analysis.get("report"), dict) else None)
@@ -1085,15 +1530,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
     for mode, rows in grouped.items():
         if not rows:
             continue
-        latest = rows[0]
-        comparable = [
-            item for item in rows
-            if item["taxonomy_version"] == latest["taxonomy_version"]
-            and item["rubric_version"] == latest["rubric_version"]
-            and item["evaluator_version"] == latest["evaluator_version"]
-            and item["profile_family"] == latest["profile_family"]
-            and item["evidence_status"] == latest["evidence_status"]
-        ]
+        latest_attempt, latest, comparable = _canonical_performance_cohort(rows)
 
         def evidence_ids_for(item: Dict[str, Any]) -> List[str]:
             index = item.get("evidence_index") or {}
@@ -1110,16 +1547,36 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             ]
             round_ids.extend(str(value) for value in index.get("submission_ids", []) if value)
             round_ids.extend(str(value) for value in index.get("round_ids", []) if value)
+            round_ids.extend(
+                str(entry.get("run_id"))
+                for entry in index.get("technical_runs", [])
+                if isinstance(entry, dict) and entry.get("run_id")
+            )
+            round_ids.extend(
+                str(entry.get("snapshot_id"))
+                for entry in index.get("technical_drafts", [])
+                if isinstance(entry, dict) and entry.get("snapshot_id")
+            )
+            round_ids.extend(str(value) for value in index.get("run_ids", []) if value)
+            round_ids.extend(str(value) for value in index.get("snapshot_ids", []) if value)
             return list(dict.fromkeys([*response_ids, *round_ids]))
 
         def report_anchor_for(item: Dict[str, Any]) -> Optional[str]:
             index = item.get("evidence_index") or {}
             if mode == "technical":
-                return next((
-                    str(entry.get("round_id"))
-                    for entry in index.get("technical_rounds", [])
-                    if isinstance(entry, dict) and entry.get("round_id")
-                ), None)
+                return next(
+                    (
+                        str(entry.get("round_id"))
+                        for key in (
+                            "technical_rounds",
+                            "technical_runs",
+                            "technical_drafts",
+                        )
+                        for entry in index.get(key, [])
+                        if isinstance(entry, dict) and entry.get("round_id")
+                    ),
+                    None,
+                )
             ids = evidence_ids_for(item)
             return ids[0] if ids else None
 
@@ -1139,36 +1596,60 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             for item in comparable
         ]
         overview: List[Dict[str, Any]] = []
-        if latest["overall_score"] is not None and latest["evidence_status"] == "sufficient":
+        has_official_score = (
+            latest["overall_score"] is not None
+            and latest["evidence_status"] == "sufficient"
+        )
+        latest_has_official_score = (
+            latest_attempt["overall_score"] is not None
+            and latest_attempt["evidence_status"] == "sufficient"
+        )
+        if has_official_score:
             overview.append({
-                "label": "Overall score",
+                "label": (
+                    "Previous official score"
+                    if latest_attempt["analysis_id"] != latest["analysis_id"]
+                    else "Overall score"
+                ),
                 "value": _format_percent_value(latest["overall_score"]),
                 "raw_value": latest["overall_score"],
             })
         overview.append({
             "label": "Evidence status",
-            "value": _human_label(latest["evidence_status"] or "unknown"),
+            "value": _human_label(latest_attempt["evidence_status"] or "unknown"),
         })
-        if latest["duration_seconds"] is not None:
+        if latest_attempt["duration_seconds"] is not None:
             overview.append({
                 "label": "Session duration",
-                "value": _format_number_value(round(latest["duration_seconds"] / 60, 1), " min"),
-                "raw_value": latest["duration_seconds"],
+                "value": _format_number_value(round(latest_attempt["duration_seconds"] / 60, 1), " min"),
+                "raw_value": latest_attempt["duration_seconds"],
             })
 
         analysis = latest["analysis"]
+        latest_attempt_analysis = latest_attempt["analysis"]
         latest_evidence_ids = evidence_ids_for(latest)
         latest_round_id = next(
             (
                 str(entry.get("round_id"))
-                for entry in (latest.get("evidence_index") or {}).get("technical_rounds", [])
+                for key in (
+                    "technical_rounds",
+                    "technical_runs",
+                    "technical_drafts",
+                )
+                for entry in (latest.get("evidence_index") or {}).get(key, [])
                 if isinstance(entry, dict) and entry.get("round_id")
             ),
             None,
         )
         sections: List[Dict[str, Any]] = []
-        if len(trend) >= 2:
-            sections.append({"id": "score_trend", "title": "Comparable score trend", "kind": "trend", "trend": trend})
+        scored_trend = [item for item in trend if item.get("score") is not None][-5:]
+        if scored_trend:
+            sections.append({
+                "id": "score_trend",
+                "title": "Comparable score trend",
+                "kind": "trend",
+                "trend": scored_trend,
+            })
         dimensions = analysis.get("dimensions") or analysis.get("dimension_scores") or {}
         if isinstance(dimensions, dict) and latest["evidence_status"] == "sufficient":
             rows_payload = [
@@ -1323,7 +1804,13 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                     ],
                     "rows": problem_rows,
                 })
-        next_focus = analysis.get("next_focus") if isinstance(analysis.get("next_focus"), dict) else None
+        next_focus = (
+            latest_attempt_analysis.get("next_focus")
+            if isinstance(latest_attempt_analysis.get("next_focus"), dict)
+            else analysis.get("next_focus")
+            if isinstance(analysis.get("next_focus"), dict)
+            else None
+        )
         if not next_focus and mode == "technical" and technical.get("weak_topics"):
             weak_topic = next((item for item in technical["weak_topics"] if isinstance(item, dict)), None)
             if weak_topic:
@@ -1332,24 +1819,16 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                     "description": weak_topic.get("repair_action"),
                 }
         source_analysis_ids = [item["analysis_id"] for item in comparable]
-        response_ids = {
-            str(item.get("response_id"))
-            for item in latest["evidence_index"].get("responses", [])
-            if isinstance(item, dict) and item.get("response_id")
-        }
-        response_ids.update(str(value) for value in latest["evidence_index"].get("response_ids", []) if value)
-        round_ids = {
-            str(item.get("submission_id") or item.get("round_id"))
-            for item in latest["evidence_index"].get("technical_rounds", [])
-            if isinstance(item, dict) and (item.get("submission_id") or item.get("round_id"))
-        }
-        round_ids.update(str(value) for value in latest["evidence_index"].get("submission_ids", []) if value)
-        round_ids.update(str(value) for value in latest["evidence_index"].get("round_ids", []) if value)
-        evidence_count = len(response_ids | round_ids)
+        latest_attempt_evidence_count = len(evidence_ids_for(latest_attempt))
+        score_evidence_count = len(evidence_ids_for(latest))
         confidence = (
             "insufficient"
-            if latest["evidence_status"] != "sufficient"
-            else ("high" if len(comparable) >= 3 and evidence_count >= 3 else ("medium" if evidence_count >= 2 else "low"))
+            if not latest_has_official_score
+            else (
+                "high"
+                if len(comparable) >= 3 and score_evidence_count >= 3
+                else ("medium" if score_evidence_count >= 2 else "low")
+            )
         )
         cohort_material = "|".join(str(value or "") for value in (
             mode, latest["evaluator_version"], latest["taxonomy_version"],
@@ -1358,21 +1837,66 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
         excluded_count = len(rows) - len(comparable)
         overview.extend([
             {"label": "Confidence", "value": _human_label(confidence)},
-            {"label": "Evidence items", "value": str(evidence_count), "raw_value": evidence_count},
+            {
+                "label": "Latest-attempt evidence",
+                "value": str(latest_attempt_evidence_count),
+                "raw_value": latest_attempt_evidence_count,
+            },
             {"label": "Comparable sessions", "value": str(len(comparable)), "raw_value": len(comparable)},
         ])
+        communication_summary = _canonical_communication_summary(comparable)
+        dimension_directions = _canonical_dimension_directions(comparable)
+        technical_summary = _canonical_technical_summary(
+            comparable,
+            trend if mode == "technical" else [],
+        )
+        if mode != "technical":
+            interview_dimensions = _analysis_dimensions(latest.get("analysis") or {})
+            technical_summary["latest_score"] = _performance_number(
+                interview_dimensions.get("technical_competency"),
+                interview_dimensions.get("technical_accuracy"),
+                interview_dimensions.get("correctness"),
+                interview_dimensions.get("depth"),
+            )
+        project_explanation = _canonical_project_explanation(comparable)
+        strengths = _canonical_strengths(comparable)
+        ai_insights = _canonical_ai_insights(
+            comparable,
+            trend,
+            communication_summary,
+            dimension_directions,
+        )
         payload = _dynamic_payload(mode, True, overview, sections, next_focus)
         payload.update({
             "source": "canonical",
-            "analysis_id": latest["analysis_id"],
-            "interview_id": latest["interview_id"],
-            "overall_score": latest["overall_score"] if latest["evidence_status"] == "sufficient" else None,
-            "duration_seconds": latest["duration_seconds"],
-            "evidence_status": latest["evidence_status"],
-            "evidence_index": latest["evidence_index"],
-            "current_value": latest["overall_score"] if latest["evidence_status"] == "sufficient" else None,
+            "source_kind": "canonical_v4",
+            "analysis_id": latest_attempt["analysis_id"],
+            "interview_id": latest_attempt["interview_id"],
+            "official_analysis_id": latest["analysis_id"] if has_official_score else None,
+            "official_interview_id": latest["interview_id"] if has_official_score else None,
+            "official_score": latest["overall_score"] if has_official_score else None,
+            "official_scored_at": latest["created_at"].isoformat() if has_official_score and latest["created_at"] else None,
+            "overall_score": latest_attempt["overall_score"] if latest_has_official_score else None,
+            "duration_seconds": latest_attempt["duration_seconds"],
+            "evidence_status": latest_attempt["evidence_status"],
+            "evidence_index": latest_attempt["evidence_index"],
+            "current_value": latest_attempt["overall_score"] if latest_has_official_score else None,
             "confidence": confidence,
-            "evidence_count": evidence_count,
+            "evidence_count": latest_attempt_evidence_count,
+            "has_evidence": latest_attempt_evidence_count > 0,
+            "has_official_score": has_official_score,
+            "score_state": (
+                "ready"
+                if latest_attempt["overall_score"] is not None
+                and latest_attempt["evidence_status"] == "sufficient"
+                else "run_only"
+                if latest_attempt["evidence_status"] == "draft_or_run_only"
+                else "insufficient"
+            ),
+            "included_in_trend": (
+                latest_attempt["overall_score"] is not None
+                and latest_attempt["evidence_status"] == "sufficient"
+            ),
             "time_window": {
                 "from": trend[0]["date"] if trend else None,
                 "to": trend[-1]["date"] if trend else None,
@@ -1381,13 +1905,17 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             "next_recommended_focus": next_focus,
             "empty_state_explanation": (
                 "This cohort does not have enough official evidence for a readiness percentage."
-                if latest["evidence_status"] != "sufficient" else None
+                if not latest_has_official_score else None
             ),
             "comparison_notice": (
-                f"{excluded_count} historical session(s) use incompatible assessment criteria and are preserved outside this trend."
-                if excluded_count else (
+                "The latest attempt did not produce an official score. The previous official score is shown separately for reference."
+                if latest_attempt["analysis_id"] != latest["analysis_id"]
+                else (
+                    f"{excluded_count} session(s) use incompatible assessment criteria and are preserved outside this trend."
+                    if excluded_count else (
                     f"Trend lines compare {len(comparable)} session(s) assessed with the same mode, profile family, evidence sufficiency, evaluator, taxonomy, and rubric."
                     if len(comparable) > 1 else None
+                    )
                 )
             ),
             "comparability": {
@@ -1396,14 +1924,236 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                 "evaluator_version": latest["evaluator_version"],
                 "profile_family": latest["profile_family"],
                 "evidence_status": latest["evidence_status"],
+                "latest_attempt_evidence_status": latest_attempt["evidence_status"],
                 "cohort_id": hashlib.sha256(cohort_material.encode("utf-8")).hexdigest()[:20],
                 "comparable_analysis_count": len(comparable),
                 "excluded_incompatible_count": excluded_count,
             },
             "trend": trend,
+            "page_summary": {
+                "communication": communication_summary,
+                "technical": technical_summary,
+                "project_explanation": project_explanation,
+                "insights": {
+                    "recurring_mistakes": [
+                        item for item in communication_summary.get("patterns", [])
+                        if item.get("recurring")
+                    ],
+                    "improving": dimension_directions.get("improving", []),
+                    "declining": dimension_directions.get("declining", []),
+                    "ai_insights": ai_insights,
+                },
+                "strengths": strengths,
+            },
         })
         payloads[mode] = payload
     return payloads
+
+
+def _performance_payload_score(payload: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not payload:
+        return None
+    direct = _performance_number(payload.get("overall_score"), payload.get("current_value"))
+    if direct is not None:
+        return direct
+    return None
+
+
+def _performance_payload_trend(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not payload:
+        return []
+    trend = payload.get("trend")
+    if not isinstance(trend, list):
+        trend = next((
+            section.get("trend")
+            for section in payload.get("sections") or []
+            if isinstance(section, dict) and section.get("kind") == "trend" and section.get("trend")
+        ), [])
+    return [item for item in trend or [] if isinstance(item, dict) and item.get("score") is not None][-5:]
+
+
+def _performance_role_context(cursor: Any, user_id: str) -> Dict[str, Optional[str]]:
+    cursor.execute(
+        """
+        SELECT role, company
+        FROM JobProfiles
+        WHERE user_id = %s
+        ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+    selected = cursor.fetchone()
+    if selected:
+        return {"role": selected[0], "company": selected[1]}
+    try:
+        profile = _profile_context(cursor, user_id).get("profile_context") or {}
+        role = _target_role(profile)
+        return {"role": role if role != "your target role" else None, "company": None}
+    except Exception:
+        logger.exception("Failed to load performance role context")
+        return {"role": None, "company": None}
+
+
+def _readiness_summary(
+    interview_payload: Optional[Dict[str, Any]],
+    technical_payload: Optional[Dict[str, Any]],
+    role: Optional[str],
+) -> Dict[str, Any]:
+    interview_summary = (interview_payload or {}).get("page_summary") or {}
+    communication = ((interview_summary.get("communication") or {}).get("fluency_clarity") or {}).get("score")
+    interview_technical = (interview_summary.get("technical") or {}).get("latest_score")
+    technical_round_score = _performance_payload_score(technical_payload)
+    technical = _performance_number(technical_round_score, interview_technical)
+    communication = _performance_number(communication)
+    trend = _performance_payload_trend(interview_payload)
+    scores = [float(item["score"]) for item in trend if item.get("score") is not None]
+    consistency = None
+    if len(scores) >= 2:
+        changes = [abs(scores[index] - scores[index - 1]) for index in range(1, len(scores))]
+        consistency = _clip(100 - ((sum(changes) / len(changes)) * 2.0))
+    history = _clip((len(scores) / 5.0) * 100)
+
+    components = [
+        {"key": "communication", "label": "Communication", "score": communication, "weight": 30},
+        {"key": "technical", "label": "Technical performance", "score": technical, "weight": 30},
+        {"key": "consistency", "label": "Consistency", "score": consistency, "weight": 20},
+        {"key": "history", "label": "Interview history", "score": history, "weight": 20},
+    ]
+    readiness = None
+    if communication is not None and technical is not None and consistency is not None:
+        readiness = _clip(
+            communication * 0.30
+            + technical * 0.30
+            + consistency * 0.20
+            + history * 0.20
+        )
+    return {
+        "score": readiness,
+        "label": _score_band(readiness) if readiness is not None else "Building evidence",
+        "role": role,
+        "components": components,
+        "detail": (
+            "Weighted from communication (30%), technical performance (30%), consistency (20%), and up to five comparable interviews (20%)."
+            if readiness is not None
+            else "Complete at least two comparable interviews with communication and technical evidence to calculate readiness."
+        ),
+    }
+
+
+def _unique_performance_items(items: List[Any], limit: int = 5) -> List[Any]:
+    unique: List[Any] = []
+    seen: set[str] = set()
+    for item in items:
+        if item in (None, "", {}):
+            continue
+        key = json.dumps(item, sort_keys=True, default=str).lower() if isinstance(item, dict) else str(item).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if len(unique) == limit:
+            break
+    return unique
+
+
+def _build_performance_page_payload(
+    interview_payload: Optional[Dict[str, Any]],
+    technical_payload: Optional[Dict[str, Any]],
+    role_context: Dict[str, Optional[str]],
+) -> Dict[str, Any]:
+    interview_summary = (interview_payload or {}).get("page_summary") or {}
+    technical_round_summary = (technical_payload or {}).get("page_summary") or {}
+    interview_insights = interview_summary.get("insights") or {}
+    technical_insights = technical_round_summary.get("insights") or {}
+    communication = interview_summary.get("communication") or {
+        "fluency_clarity": {"score": None, "detail": "Communication analysis is not available yet."},
+        "confidence": {"score": None, "detail": "Voice delivery evidence is not available yet."},
+        "patterns": [],
+    }
+    interview_technical = interview_summary.get("technical") or {}
+    technical_round = technical_round_summary.get("technical") or {}
+    technical = {
+        **interview_technical,
+        **technical_round,
+        "knowledge_gaps": _unique_performance_items([
+            *(technical_round.get("knowledge_gaps") or []),
+            *(interview_technical.get("knowledge_gaps") or []),
+        ], limit=6),
+    }
+    project_explanation = interview_summary.get("project_explanation") or {
+        "score": None,
+        "answer_count": 0,
+        "session_count": 0,
+        "breakdown": [],
+        "detail": "No project explanation has enough scored evidence yet.",
+    }
+    recurring = _unique_performance_items([
+        *(interview_insights.get("recurring_mistakes") or []),
+        *(technical_insights.get("recurring_mistakes") or []),
+    ])
+    improving = _unique_performance_items([
+        *(interview_insights.get("improving") or []),
+        *(technical_insights.get("improving") or []),
+    ])
+    declining = _unique_performance_items([
+        *(interview_insights.get("declining") or []),
+        *(technical_insights.get("declining") or []),
+    ])
+    ai_insights = _unique_performance_items([
+        *(interview_insights.get("ai_insights") or []),
+        *(technical_insights.get("ai_insights") or []),
+    ])
+    strengths = _unique_performance_items([
+        *(interview_summary.get("strengths") or []),
+        *(technical_round_summary.get("strengths") or []),
+    ])
+    role = role_context.get("role")
+    return {
+        "role": role_context,
+        "interview_view": {
+            "latest_score": _performance_payload_score(interview_payload),
+            "trend": _performance_payload_trend(interview_payload),
+            "communication": communication,
+            "project_explanation": project_explanation,
+            "insights": {
+                "recurring_mistakes": interview_insights.get("recurring_mistakes") or [],
+                "improving": interview_insights.get("improving") or [],
+                "declining": interview_insights.get("declining") or [],
+            },
+            "strengths": interview_summary.get("strengths") or [],
+        },
+        "technical_view": {
+            "latest_score": _performance_payload_score(technical_payload),
+            "trend": _performance_payload_trend(technical_payload),
+            "knowledge_gaps": technical_round.get("knowledge_gaps") or [],
+            "insights": {
+                "recurring_mistakes": technical_insights.get("recurring_mistakes") or [],
+                "improving": technical_insights.get("improving") or [],
+                "declining": technical_insights.get("declining") or [],
+            },
+            "strengths": technical_round_summary.get("strengths") or [],
+        },
+        "overall": {
+            "latest_interview_score": _performance_payload_score(interview_payload),
+            "performance_trend": _performance_payload_trend(interview_payload),
+            "readiness": _readiness_summary(interview_payload, technical_payload, role),
+        },
+        "communication": communication,
+        "technical": {
+            "trend": _performance_payload_trend(technical_payload),
+            "latest_score": _performance_payload_score(technical_payload),
+            "knowledge_gaps": technical.get("knowledge_gaps") or [],
+            "project_explanation": project_explanation,
+        },
+        "insights": {
+            "recurring_mistakes": recurring,
+            "improving": improving,
+            "declining": declining,
+            "ai_insights": ai_insights,
+        },
+        "strengths": strengths,
+    }
 
 
 def _question_type_label(question_type: str, question: str, is_followup: bool) -> str:
@@ -1420,7 +2170,7 @@ def _question_type_label(question_type: str, question: str, is_followup: bool) -
     if any(token in text for token in ("technical", "algorithm", "system", "database", "api", "concept")):
         return "Technical"
     if any(token in text for token in ("behavior", "conflict", "failure", "team", "leadership")):
-        return "Behavioural"
+        return "Interview Round"
     return "General"
 
 
@@ -1493,13 +2243,21 @@ def _interview_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
     if not interviews or not responses:
         return _dynamic_payload("interview", False, [], [])
 
+    scores_by_interview: Dict[str, List[float]] = defaultdict(list)
+    for response in scored_responses:
+        if response.get("interview_id"):
+            scores_by_interview[str(response["interview_id"])].append(float(response["score"]))
     score_trend = [
-        {"label": item.get("date"), "score": item.get("score"), "interview_id": item.get("interview_id")}
+        {
+            "label": item.get("date"),
+            "score": _nullable_avg(scores_by_interview.get(str(item.get("interview_id")), [])),
+            "interview_id": item.get("interview_id"),
+        }
         for item in interviews
-        if item.get("score") is not None
-    ]
+        if scores_by_interview.get(str(item.get("interview_id")))
+    ][-5:]
     response_scores = [float(item["score"]) for item in scored_responses]
-    latest_score = float(interviews[-1]["score"]) if interviews and interviews[-1].get("score") is not None else None
+    latest_score = float(score_trend[-1]["score"]) if score_trend and score_trend[-1].get("score") is not None else None
     overview: List[Dict[str, Any]] = []
     if latest_score is not None:
         overview.append({"label": "Overall interview score", "value": _format_percent_value(latest_score), "raw_value": latest_score})
@@ -1527,12 +2285,12 @@ def _interview_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         overview.append({"label": "Main improvement area", "value": weakest["metric"], "detail": _format_percent_value(weakest["score"])})
 
     sections: List[Dict[str, Any]] = []
-    if len(score_trend) >= 2:
+    if score_trend:
         _add_section(sections, {
             "id": "score_trend",
             "title": "Score Trend",
             "kind": "trend",
-            "trend": score_trend[-8:],
+            "trend": score_trend,
         })
 
     answer_rows = []
@@ -1691,7 +2449,98 @@ def _interview_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
             "description": f"Raise {weakest['metric'].lower()} on the next full mock interview.",
         }
 
-    return _dynamic_payload("interview", bool(responses), overview, sections, next_focus)
+    dimension_by_label = {str(item["metric"]).lower(): item["score"] for item in dimensions}
+    pattern_sessions: Dict[str, set[str]] = defaultdict(set)
+    pattern_counts: Counter[str] = Counter()
+    fallback_flag_labels = {
+        "too_short": "Incomplete answers",
+        "no_response": "Incomplete answers",
+        "vague": "Vague explanations",
+        "off_topic": "Rambling or indirect answers",
+        "low_lexical_relevance": "Rambling or indirect answers",
+        "no_evidence": "Missing evidence",
+        "insufficient_evidence": "Missing evidence",
+    }
+    for response in responses:
+        session_id = str(response.get("interview_id") or "unknown")
+        for flag in response.get("answer_quality_flags") or []:
+            label = fallback_flag_labels.get(str(flag).lower())
+            if label:
+                pattern_sessions[label].add(session_id)
+                pattern_counts.update([label])
+    patterns = [
+        {
+            "label": label,
+            "detail": "This pattern is based on persisted answer assessments.",
+            "count": int(pattern_counts[label]),
+            "session_count": len(sessions),
+            "recurring": len(sessions) >= 2,
+        }
+        for label, sessions in sorted(pattern_sessions.items(), key=lambda item: (-len(item[1]), item[0]))
+    ][:5]
+    project_responses = [
+        response for response in responses
+        if _question_type_label(
+            str(response.get("question_type") or ""),
+            str(response.get("question") or ""),
+            bool(response.get("is_followup")),
+        ) == "Project"
+        and response.get("score") is not None
+    ]
+    project_scores = [float(response["score"]) for response in project_responses]
+    strengths = [
+        f"{item['metric']} is a current strength at {round(float(item['score'])):g}%."
+        for item in sorted(dimensions, key=lambda item: -float(item["score"]))
+        if float(item["score"]) >= 75 and len(interviews) >= 2
+    ][:4]
+    payload = _dynamic_payload("interview", bool(responses), overview, sections, next_focus)
+    payload["trend"] = score_trend
+    payload["overall_score"] = latest_score
+    payload["has_evidence"] = bool(responses)
+    payload["has_official_score"] = latest_score is not None
+    payload["score_state"] = "ready" if latest_score is not None else "insufficient"
+    payload["source_kind"] = "recorded_evidence"
+    payload["included_in_trend"] = False
+    payload["page_summary"] = {
+        "communication": {
+            "fluency_clarity": {
+                "score": _performance_number(dimension_by_label.get("clarity")),
+                "detail": "Based on persisted transcript clarity assessments.",
+            },
+            "confidence": {
+                "score": None,
+                "detail": "Voice delivery analysis is still being prepared.",
+            },
+            "patterns": patterns,
+        },
+        "technical": {
+            "trend": [],
+            "knowledge_gaps": [],
+            "latest_score": _performance_number(dimension_by_label.get("correctness")),
+        },
+        "project_explanation": {
+            "score": round(sum(project_scores) / len(project_scores), 1) if project_scores else None,
+            "answer_count": len(project_scores),
+            "session_count": len({response.get("interview_id") for response in project_responses}),
+            "breakdown": [],
+            "detail": (
+                f"Based on {len(project_scores)} persisted project answer{'s' if len(project_scores) != 1 else ''}."
+                if project_scores else "No project explanation has enough scored evidence yet."
+            ),
+        },
+        "insights": {
+            "recurring_mistakes": [item for item in patterns if item.get("recurring")],
+            "improving": [],
+            "declining": [],
+            "ai_insights": [
+                _short_text(next_focus.get("description"), 180)
+                for _ in [0]
+                if next_focus and next_focus.get("description")
+            ],
+        },
+        "strengths": strengths,
+    }
+    return payload
 
 
 def _metadata_values(metadata: Dict[str, Any], keys: List[str]) -> List[str]:
@@ -1969,7 +2818,8 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
 
     cursor.execute(
         """
-        SELECT round_id, evidence_type, content, payload, created_at
+        SELECT round_id, evidence_type, content, payload,
+               content_encrypted, created_at
         FROM TechnicalReasoningEvidence
         WHERE user_id = %s AND round_id = ANY(%s)
         ORDER BY created_at ASC
@@ -1977,11 +2827,22 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         (user_id, round_ids),
     )
     for row in cursor.fetchall():
+        decrypted_payload = _encrypted_json_object(row[4]) if row[4] else {}
+        decrypted_content = str(
+            decrypted_payload.get("content")
+            or decrypted_payload.get("text")
+            or decrypted_payload.get("transcript")
+            or decrypted_payload.get("question")
+            or decrypted_payload.get("approach")
+            or ""
+        ).strip()
+        if not decrypted_content and row[2] and row[2] != "[encrypted]":
+            decrypted_content = str(row[2]).strip()
         reasoning_by_round[row[0]].append({
             "type": row[1],
-            "content": row[2] or "",
+            "content": decrypted_content,
             "payload": _json_object(row[3]),
-            "created_at": row[4],
+            "created_at": row[5],
         })
 
     problem_rows: List[Dict[str, Any]] = []
@@ -2029,7 +2890,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         )
         correctness = submission_correctness or run_correctness
         correctness_evidence = "Final submit" if submission_correctness else "Latest run" if run_correctness else ""
-        if correctness:
+        if submission_correctness:
             scores.append({"label": created_at.isoformat() if created_at else None, "score": correctness["score"], "round_id": round_id, "interview_id": interview_id})
             if submitted and correctness["status"] == "Correct":
                 solved_count += 1
@@ -2102,8 +2963,13 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         overview.append({"label": "Score trend", "value": f"{delta:+g} pts", "raw_value": delta})
 
     sections: List[Dict[str, Any]] = []
-    if len(scores) >= 2:
-        _add_section(sections, {"id": "coding_score_trend", "title": "Coding Score Trend", "kind": "trend", "trend": scores[-8:]})
+    if scores:
+        _add_section(sections, {
+            "id": "coding_score_trend",
+            "title": "Coding Score Trend",
+            "kind": "trend",
+            "trend": scores[-5:],
+        })
 
     topic_rows = []
     for topic, values in sorted(topic_totals.items()):
@@ -2252,8 +3118,255 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
                 "description": weak_topic.get("main_issue") or "Improve this attempted topic next.",
             }
 
-    return _dynamic_payload("technical", True, overview, sections, next_focus)
+    payload = _dynamic_payload("technical", True, overview, sections, next_focus)
+    payload["trend"] = scores[-5:]
+    payload["overall_score"] = scores[-1]["score"] if scores else None
+    payload["has_evidence"] = True
+    payload["has_official_score"] = bool(scores)
+    payload["score_state"] = (
+        "ready"
+        if scores
+        else "run_only"
+        if submitted_count == 0
+        else "insufficient"
+    )
+    payload["source_kind"] = "recorded_evidence"
+    payload["included_in_trend"] = False
+    payload["page_summary"] = {
+        "communication": {},
+        "technical": {
+            "trend": scores[-5:],
+            "knowledge_gaps": [],
+            "latest_score": scores[-1]["score"] if scores else None,
+        },
+        "project_explanation": {},
+        "insights": {
+            "recurring_mistakes": [],
+            "improving": [],
+            "declining": [],
+            "ai_insights": [
+                _short_text(next_focus.get("description"), 180)
+                for _ in [0]
+                if next_focus and next_focus.get("description")
+            ],
+        },
+        "strengths": [],
+    }
+    return payload
 
+
+def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT i.interview_id,
+               CASE
+                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%%technical%%'
+                        OR EXISTS (
+                            SELECT 1 FROM TechnicalInterviewRounds round
+                            WHERE round.interview_id = i.interview_id
+                        )
+                   THEN 'technical'
+                   ELSE 'interview'
+               END AS mode,
+               i.overall_score,
+               COALESCE(i.completed_at, i.created_at) AS completed_at,
+               i.interview_type,
+               i.job_title
+        FROM Interviews i
+        WHERE i.user_id = %s
+          AND i.attempt_status = 'completed'
+          AND i.overall_score > 0
+          AND (i.report_json IS NOT NULL OR i.report_json_encrypted IS NOT NULL)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM SessionPerformanceAnalyses analysis
+              WHERE analysis.interview_id = i.interview_id
+                AND analysis.user_id = i.user_id
+                AND analysis.schema_version = 'session-performance-v4'
+                AND analysis.status = 'ready'
+                AND analysis.is_current = TRUE
+                AND analysis.analysis_json_encrypted IS NOT NULL
+                AND analysis.evidence_index_encrypted IS NOT NULL
+          )
+        ORDER BY COALESCE(i.completed_at, i.created_at) DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    )
+    return [
+        {
+            "interview_id": str(row[0]),
+            "mode": str(row[1]),
+            "score": float(row[2]),
+            "date": row[3].isoformat() if row[3] else None,
+            "label": row[4] or ("Technical Round" if row[1] == "technical" else "Interview Round"),
+            "role": row[5],
+            "source_kind": "legacy_report",
+            "score_state": "legacy",
+            "included_in_trend": False,
+            "detail": "Saved from an older report without current evidence provenance.",
+        }
+        for row in cursor.fetchall() or []
+    ]
+
+
+def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
+    cursor.execute(
+        """
+        SELECT i.interview_id,
+               CASE
+                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%%technical%%'
+                        OR EXISTS (
+                            SELECT 1 FROM TechnicalInterviewRounds round
+                            WHERE round.interview_id = i.interview_id
+                        )
+                   THEN 'technical'
+                   ELSE 'interview'
+               END AS mode,
+               analysis.analysis_id,
+               analysis.overall_score,
+               analysis.evidence_status,
+               job.status,
+               job.retry_count,
+               (i.report_json IS NOT NULL OR i.report_json_encrypted IS NOT NULL)
+                   AND i.overall_score > 0 AS legacy_score_present,
+               EXISTS (
+                   SELECT 1 FROM TechnicalSubmissions submission
+                   WHERE submission.interview_id = i.interview_id
+                     AND submission.user_id = i.user_id
+               ) AS final_submission_present,
+               (
+                   EXISTS (
+                       SELECT 1 FROM TechnicalRunEvents event
+                       JOIN TechnicalInterviewRounds round ON round.round_id = event.round_id
+                       WHERE round.interview_id = i.interview_id
+                         AND event.user_id = i.user_id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM TechnicalCodeSnapshots snapshot
+                       WHERE snapshot.interview_id = i.interview_id
+                         AND snapshot.user_id = i.user_id
+                         AND snapshot.source_chars > 0
+                   )
+               ) AS run_or_draft_present,
+               EXISTS (
+                   SELECT 1 FROM InterviewResponses response
+                   WHERE response.interview_id = i.interview_id
+               ) AS response_present
+        FROM Interviews i
+        LEFT JOIN LATERAL (
+            SELECT analysis_id, overall_score, evidence_status
+            FROM SessionPerformanceAnalyses current_analysis
+            WHERE current_analysis.interview_id = i.interview_id
+              AND current_analysis.user_id = i.user_id
+              AND current_analysis.schema_version = 'session-performance-v4'
+              AND current_analysis.is_current = TRUE
+              AND current_analysis.status = 'ready'
+              AND current_analysis.analysis_json_encrypted IS NOT NULL
+              AND current_analysis.evidence_index_encrypted IS NOT NULL
+            LIMIT 1
+        ) analysis ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT status, retry_count
+            FROM AnalysisJobs latest_job
+            WHERE latest_job.interview_id = i.interview_id
+            ORDER BY latest_job.created_at DESC
+            LIMIT 1
+        ) job ON TRUE
+        WHERE i.user_id = %s
+          AND i.attempt_status = 'completed'
+          AND i.status IN (
+              'analysis_pending', 'analysis_running',
+              'completed', 'partial', 'failed'
+          )
+        ORDER BY COALESCE(i.completed_at, i.created_at) DESC
+        """,
+        (user_id,),
+    )
+    availability_rows = cursor.fetchall() or []
+    cursor.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM WorkerHeartbeats
+            WHERE worker_type = 'analysis'
+              AND heartbeat_at >= NOW() - INTERVAL '30 seconds'
+        )
+        """
+    )
+    worker_available = bool((cursor.fetchone() or [False])[0])
+    state_names = (
+        "ready", "processing", "blocked", "failed",
+        "insufficient", "run_only", "legacy", "missing",
+    )
+    by_mode: Dict[str, Dict[str, int]] = {
+        mode: {"completed_count": 0, **{name: 0 for name in state_names}}
+        for mode in ("interview", "technical")
+    }
+    sessions: List[Dict[str, Any]] = []
+    missing_canonical_count = 0
+    for row in availability_rows:
+        mode = "technical" if str(row[1]) == "technical" else "interview"
+        analysis_id = row[2]
+        overall_score = row[3]
+        evidence_status = str(row[4] or "")
+        job_status = str(row[5] or "")
+        legacy_score_present = bool(row[7])
+        final_submission_present = bool(row[8])
+        run_or_draft_present = bool(row[9])
+        response_present = bool(row[10])
+        if analysis_id:
+            if overall_score is not None and evidence_status == "sufficient":
+                state_name = "ready"
+            elif evidence_status == "draft_or_run_only":
+                state_name = "run_only"
+            else:
+                state_name = "insufficient"
+        elif job_status in {"queued", "running"}:
+            state_name = "processing" if worker_available else "blocked"
+        elif job_status == "failed":
+            state_name = "failed"
+        elif mode == "technical" and run_or_draft_present and not final_submission_present:
+            state_name = "run_only"
+        elif legacy_score_present:
+            state_name = "legacy"
+        elif response_present or final_submission_present:
+            state_name = "missing"
+        else:
+            state_name = "insufficient"
+        if not analysis_id:
+            missing_canonical_count += 1
+        by_mode[mode]["completed_count"] += 1
+        by_mode[mode][state_name] += 1
+        sessions.append({
+            "interview_id": str(row[0]),
+            "mode": mode,
+            "score_state": state_name,
+            "analysis_id": str(analysis_id) if analysis_id else None,
+            "job_status": job_status or None,
+            "retry_count": int(row[6] or 0),
+            "has_evidence": bool(
+                response_present or final_submission_present or run_or_draft_present
+            ),
+            "has_official_score": state_name == "ready",
+        })
+    return {
+        "completed_count": len(availability_rows),
+        "missing_canonical_count": missing_canonical_count,
+        "pending_count": sum(
+            1 for item in sessions
+            if item["score_state"] in {"processing", "blocked"}
+        ),
+        "blocked_count": sum(
+            1 for item in sessions if item["score_state"] == "blocked"
+        ),
+        "failed_count": sum(
+            1 for item in sessions if item["score_state"] == "failed"
+        ),
+        "worker_available": worker_available,
+        "processing_sla_minutes": 15,
+        "by_mode": by_mode,
+        "sessions": sessions,
+    }
 
 def _weak_pattern_details(flag: str) -> Dict[str, str]:
     mapping = {
@@ -2936,14 +4049,16 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
                       SELECT 1 FROM SessionPerformanceAnalyses spa
                       WHERE spa.interview_id = i.interview_id
                         AND spa.user_id = i.user_id
-                        AND spa.schema_version = 'session-performance-v3'
+                        AND spa.schema_version = 'session-performance-v4'
                         AND spa.status = 'ready'
+                        AND spa.is_current = TRUE
                         AND spa.analysis_json_encrypted IS NOT NULL
+                        AND spa.evidence_index_encrypted IS NOT NULL
                   )
             )
         FROM Interviews i
         WHERE i.user_id = %s
-          AND i.status IN ('completed', 'partial', 'failed')
+          AND i.status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
           AND (
               i.attempt_status = 'completed'
               OR EXISTS (
@@ -3066,17 +4181,7 @@ async def create_exercise_attempt_session(
         )
     ownership = await async_execute(
         """
-        SELECT ge.exercise_id,
-               COALESCE(
-                   ge.timer_seconds,
-                   CASE
-                       WHEN ge.prompt->>'timer_seconds' ~ '^[0-9]+$'
-                       THEN (ge.prompt->>'timer_seconds')::INTEGER
-                       ELSE NULL
-                   END,
-                   node.estimated_minutes * 60,
-                   0
-               ) AS timer_seconds
+        SELECT ge.exercise_id
         FROM GeneratedExercises ge
         JOIN ImprovementMissions mission ON mission.mission_id = ge.mission_id
         JOIN ImprovementRoadmapNodes node ON node.roadmap_node_id = ge.roadmap_node_id
@@ -3103,7 +4208,6 @@ async def create_exercise_attempt_session(
     )
     if not ownership:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exercise or roadmap node not available")
-    timer_seconds = max(0, min(3600, int(ownership[1] or 0)))
 
     existing = await async_execute(
         """
@@ -3116,17 +4220,12 @@ async def create_exercise_attempt_session(
           AND exercise_id = %s
           AND status IN ('draft', 'in_progress', 'save_failed')
           AND (expires_at IS NULL OR expires_at > NOW())
-          AND (
-              deadline_at > NOW()
-              OR (deadline_at IS NULL AND COALESCE(remaining_seconds, %s) > 0)
-              OR (deadline_at IS NULL AND %s = 0)
-          )
         ORDER BY updated_at DESC
         LIMIT 1
         """,
         (
             current_user["user_id"], request.mission_id, request.roadmap_node_id,
-            exercise_id, timer_seconds, timer_seconds,
+            exercise_id,
         ),
         fetchone=True,
     )
@@ -3138,13 +4237,10 @@ async def create_exercise_attempt_session(
         """
         INSERT INTO ImprovementAttemptSessions (
             attempt_session_id, user_id, mission_id, roadmap_node_id, exercise_id,
-            status, draft_payload, draft_payload_encrypted, idempotency_key, deadline_at,
-            remaining_seconds, expires_at
+            status, draft_payload, draft_payload_encrypted, idempotency_key, expires_at
         )
         VALUES (
-            %s, %s, %s, %s, %s, 'in_progress', %s, %s, %s,
-            CASE WHEN %s > 0 THEN NOW() + (%s * INTERVAL '1 second') ELSE NULL END,
-            %s, NOW() + INTERVAL '24 hours'
+            %s, %s, %s, %s, %s, 'in_progress', %s, %s, %s, NOW() + INTERVAL '24 hours'
         )
         ON CONFLICT (user_id, exercise_id, idempotency_key)
         DO UPDATE SET
@@ -3163,9 +4259,6 @@ async def create_exercise_attempt_session(
             _sensitive_json_marker(request.draft_payload),
             _encrypt_json_bytes(request.draft_payload),
             request.idempotency_key,
-            timer_seconds,
-            timer_seconds,
-            timer_seconds,
         ),
         fetchone=True,
     )
@@ -3202,21 +4295,8 @@ async def update_exercise_attempt_session(
         SET status = COALESCE(%s, status),
             draft_payload = COALESCE(%s::jsonb, draft_payload),
             draft_payload_encrypted = COALESCE(%s, draft_payload_encrypted),
-            remaining_seconds = CASE
-                WHEN %s IN ('draft', 'save_failed', 'abandoned')
-                     AND deadline_at IS NOT NULL
-                THEN GREATEST(0, CEIL(EXTRACT(EPOCH FROM (deadline_at - NOW())))::INTEGER)
-                ELSE remaining_seconds
-            END,
-            deadline_at = CASE
-                WHEN %s IN ('draft', 'save_failed', 'abandoned') THEN NULL
-                WHEN %s = 'in_progress'
-                     AND status IN ('draft', 'save_failed')
-                     AND deadline_at IS NULL
-                     AND COALESCE(remaining_seconds, 0) > 0
-                THEN NOW() + (remaining_seconds * INTERVAL '1 second')
-                ELSE deadline_at
-            END,
+            remaining_seconds = NULL,
+            deadline_at = NULL,
             updated_at = NOW()
         WHERE attempt_session_id = %s
           AND exercise_id = %s
@@ -3226,11 +4306,6 @@ async def update_exercise_attempt_session(
           AND idempotency_key = %s
           AND status IN ('draft', 'in_progress', 'save_failed')
           AND (expires_at IS NULL OR expires_at > NOW())
-          AND (
-              %s IN ('draft', 'save_failed', 'abandoned')
-              OR deadline_at IS NULL
-              OR deadline_at > NOW()
-          )
         RETURNING attempt_session_id, status, draft_payload_encrypted, draft_payload,
                   idempotency_key,
                   deadline_at, remaining_seconds, updated_at, expires_at,
@@ -3240,16 +4315,12 @@ async def update_exercise_attempt_session(
             request.status,
             draft_marker,
             draft_encrypted,
-            request.status,
-            request.status,
-            request.status,
             attempt_session_id,
             exercise_id,
             current_user["user_id"],
             request.mission_id,
             request.roadmap_node_id,
             request.idempotency_key,
-            request.status,
         ),
         fetchone=True,
     )
@@ -3491,7 +4562,7 @@ async def get_job_profiles(
     try:
         cursor.execute(
             JOB_PROFILE_SELECT
-            + " WHERE user_id = %s ORDER BY is_selected DESC, created_at DESC",
+            + " WHERE user_id = %s ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC",
             (current_user["user_id"],)
         )
         return [_job_profile_from_row(row) for row in cursor.fetchall()]
@@ -3532,6 +4603,33 @@ async def create_job_profile(
 
         job_description = str(request.job_description or "").strip()
         description_hash = hashlib.sha256(job_description.encode("utf-8")).hexdigest() if job_description else None
+        cursor.execute(
+            """
+            SELECT profile_id
+            FROM JobProfiles reusable_profile
+            WHERE reusable_profile.user_id = %s
+              AND LOWER(BTRIM(reusable_profile.role)) = LOWER(BTRIM(%s))
+              AND LOWER(BTRIM(COALESCE(reusable_profile.company, ''))) = LOWER(BTRIM(%s))
+              AND reusable_profile.job_description_hash IS NOT DISTINCT FROM %s
+            ORDER BY reusable_profile.updated_at DESC NULLS LAST, reusable_profile.created_at DESC
+            LIMIT 1
+            """,
+            (
+                current_user["user_id"],
+                request.role,
+                request.company or "",
+                description_hash,
+            ),
+        )
+        reusable = cursor.fetchone()
+        if reusable:
+            cursor.execute(
+                JOB_PROFILE_SELECT + " WHERE profile_id = %s AND user_id = %s",
+                (reusable[0], current_user["user_id"]),
+            )
+            existing = cursor.fetchone()
+            connection.commit()
+            return _job_profile_from_row(existing)
         normalized_requirements = normalize_job_requirements(
             job_description,
             request.tech_stack,
@@ -3687,17 +4785,30 @@ async def delete_job_profile(
         if not cursor.fetchone():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job profile not found")
         cursor.execute(
-            "SELECT COUNT(*) FROM Interviews WHERE user_id = %s AND job_profile_id = %s",
+            """
+            UPDATE InterviewBlueprints
+            SET status = CASE WHEN status = 'ready' THEN 'expired' ELSE status END
+            WHERE user_id = %s AND job_profile_id = %s
+            """,
             (current_user["user_id"], profile_id),
         )
-        if int((cursor.fetchone() or [0])[0] or 0) > 0:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This job target is frozen into interview history and cannot be deleted",
-            )
         cursor.execute(
             "DELETE FROM JobProfiles WHERE profile_id = %s AND user_id = %s",
             (profile_id, current_user["user_id"]),
+        )
+        cursor.execute(
+            """
+            UPDATE JobProfiles
+            SET is_selected = TRUE, updated_at = NOW()
+            WHERE profile_id = (
+                SELECT profile_id
+                FROM JobProfiles
+                WHERE user_id = %s
+                ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+            )
+            """,
+            (current_user["user_id"],),
         )
         connection.commit()
         return {"success": True, "profile_id": profile_id}
@@ -3767,6 +4878,159 @@ async def select_job_profile(
             detail="Failed to select job profile"
         )
 
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+def _historical_job_target(
+    *,
+    settings_value: Any,
+    linked_job_profile_id: Any = None,
+    snapshot_profile_type: Any = None,
+    snapshot_job_value: Any = None,
+    fallback_title: Any = None,
+) -> Dict[str, Any]:
+    settings_payload = _json_object(settings_value)
+    snapshot_job = _encrypted_json_object(snapshot_job_value) if snapshot_job_value is not None else {}
+    compact_job = settings_payload.get("job_context")
+    if not isinstance(compact_job, dict):
+        compact_job = {}
+    role = str(snapshot_job.get("role") or compact_job.get("role") or fallback_title or "").strip()
+    company = str(snapshot_job.get("company") or compact_job.get("company") or "").strip()
+    job_description = str(snapshot_job.get("job_description") or "").strip()
+    if not job_description and settings_payload.get("job_description_encrypted"):
+        job_description = str(decrypt_data(str(settings_payload["job_description_encrypted"])) or "").strip()
+    raw_profile_type = snapshot_profile_type or compact_job.get("profile_type") or settings_payload.get("profile_type")
+    profile_type = normalize_profile_type(str(raw_profile_type or DEFAULT_PROFILE_TYPE))
+    legacy_saved_target = bool(
+        not raw_profile_type
+        and (
+            linked_job_profile_id
+            or snapshot_job.get("job_profile_id")
+            or str(settings_payload.get("job_context_source") or "").strip().lower() == "saved_profile"
+            or str(compact_job.get("source") or "").strip().lower() == "saved_profile"
+        )
+    )
+    is_custom = profile_type == "custom" or legacy_saved_target
+    description_hash = (
+        hashlib.sha256(job_description.encode("utf-8")).hexdigest()
+        if job_description
+        else settings_payload.get("job_description_hash")
+    )
+    return {
+        "profile_type": profile_type,
+        "is_custom": is_custom,
+        "role": role,
+        "company": company or None,
+        "job_description": job_description,
+        "job_description_hash": description_hash,
+    }
+
+
+@router.post("/interviews/{interview_id}/copy-profile")
+async def copy_interview_profile(
+    interview_id: str,
+    current_user: Dict = Depends(get_current_user),
+):
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT i.job_title, i.settings, i.job_profile_id,
+                   snapshot.profile_type, snapshot.job_context_encrypted
+            FROM Interviews i
+            LEFT JOIN AttemptContextSnapshots snapshot
+              ON snapshot.interview_id = i.interview_id AND snapshot.user_id = i.user_id
+            WHERE i.interview_id = %s AND i.user_id = %s
+            FOR UPDATE OF i
+            """,
+            (interview_id, current_user["user_id"]),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+        target = _historical_job_target(
+            settings_value=row[1],
+            linked_job_profile_id=row[2],
+            snapshot_profile_type=row[3],
+            snapshot_job_value=row[4],
+            fallback_title=row[0],
+        )
+        if not target["is_custom"]:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only interviews created from a custom job profile can be copied")
+        if not target["role"] or not target["job_description"]:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This interview does not contain a reusable role and full job description")
+
+        cursor.execute(
+            """
+            SELECT profile_id
+            FROM JobProfiles
+            WHERE user_id = %s
+              AND LOWER(BTRIM(role)) = LOWER(BTRIM(%s))
+              AND LOWER(BTRIM(COALESCE(company, ''))) = LOWER(BTRIM(%s))
+              AND job_description_hash IS NOT DISTINCT FROM %s
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            (
+                current_user["user_id"],
+                target["role"],
+                target["company"] or "",
+                target["job_description_hash"],
+            ),
+        )
+        existing = cursor.fetchone()
+        created = False
+        cursor.execute("UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s", (current_user["user_id"],))
+        if existing:
+            profile_id = int(existing[0])
+            cursor.execute(
+                "UPDATE JobProfiles SET is_selected = TRUE, updated_at = NOW() WHERE profile_id = %s AND user_id = %s",
+                (profile_id, current_user["user_id"]),
+            )
+        else:
+            created = True
+            normalized_requirements = normalize_job_requirements(target["job_description"], [])
+            cursor.execute(
+                """
+                INSERT INTO JobProfiles (
+                    user_id, role, company, tech_stack, is_selected,
+                    job_description_encrypted, job_description_hash,
+                    normalized_requirements, normalization_version,
+                    experience_level, parser_version, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, '[]', TRUE, %s, %s, %s, %s, NULL, %s, NOW(), NOW())
+                RETURNING profile_id
+                """,
+                (
+                    current_user["user_id"],
+                    target["role"],
+                    target["company"],
+                    _encrypt_job_description(target["job_description"]),
+                    target["job_description_hash"],
+                    json.dumps(normalized_requirements),
+                    JOB_REQUIREMENT_NORMALIZATION_VERSION,
+                    JOB_PROFILE_PARSER_VERSION,
+                ),
+            )
+            profile_id = int(cursor.fetchone()[0])
+
+        cursor.execute(
+            JOB_PROFILE_SELECT + " WHERE profile_id = %s AND user_id = %s",
+            (profile_id, current_user["user_id"]),
+        )
+        profile = _job_profile_from_row(cursor.fetchone())
+        connection.commit()
+        return {"profile": profile, "created": created}
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        logger.exception("Failed to copy interview profile")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to copy interview profile")
     finally:
         cursor.close()
         return_db_connection(connection)
@@ -3956,11 +5220,16 @@ async def get_recent_activity(
                        WHERE analysis.interview_id = i.interview_id
                          AND analysis.user_id = i.user_id
                          AND analysis.status = 'ready'
-                         AND analysis.schema_version = 'session-performance-v3'
+                         AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.is_current = TRUE
                          AND analysis.analysis_json_encrypted IS NOT NULL
                          AND analysis.evidence_index_encrypted IS NOT NULL
-                   ) AS canonical_report_ready
+                   ) AS canonical_report_ready,
+                   i.job_profile_id, i.settings,
+                   snapshot.profile_type, snapshot.job_context_encrypted
             FROM Interviews i
+            LEFT JOIN AttemptContextSnapshots snapshot
+              ON snapshot.interview_id = i.interview_id AND snapshot.user_id = i.user_id
             WHERE i.user_id = %s AND i.created_at >= %s
             {_non_technical_interview_where("i")}
             ORDER BY i.created_at DESC
@@ -3969,9 +5238,41 @@ async def get_recent_activity(
         )
 
         rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT profile_id, role, company, job_description_hash
+            FROM JobProfiles
+            WHERE user_id = %s
+            """,
+            (current_user["user_id"],),
+        )
+        saved_profiles = cursor.fetchall()
+        saved_by_id = {int(profile[0]): int(profile[0]) for profile in saved_profiles}
+        saved_by_content = {
+            (
+                str(profile[1] or "").strip().lower(),
+                str(profile[2] or "").strip().lower(),
+                profile[3],
+            ): int(profile[0])
+            for profile in saved_profiles
+        }
         activities = []
 
         for row in rows:
+            job_target = _historical_job_target(
+                settings_value=row[12],
+                linked_job_profile_id=row[11],
+                snapshot_profile_type=row[13],
+                snapshot_job_value=row[14],
+                fallback_title=row[2],
+            )
+            saved_profile_id = saved_by_id.get(int(row[11])) if row[11] is not None else None
+            if saved_profile_id is None:
+                saved_profile_id = saved_by_content.get((
+                    str(job_target["role"] or "").strip().lower(),
+                    str(job_target["company"] or "").strip().lower(),
+                    job_target["job_description_hash"],
+                ))
             activities.append({
                 "interview_id": row[0],
                 "interview_type": row[1],
@@ -3981,6 +5282,19 @@ async def get_recent_activity(
                 "completed_at": row[5].isoformat() if row[5] else None,
                 "duration_seconds": int(row[6]) if row[6] is not None else None,
                 "status": row[7],
+                "job_target": {
+                    "profile_type": job_target["profile_type"],
+                    "is_custom": job_target["is_custom"],
+                    "role": job_target["role"],
+                    "company": job_target["company"],
+                    "saved_profile_id": saved_profile_id,
+                    "can_copy": bool(
+                        job_target["is_custom"]
+                        and saved_profile_id is None
+                        and job_target["role"]
+                        and job_target["job_description"]
+                    ),
+                },
                 "cta": _candidate_report_cta(
                     row[0],
                     interview_status=row[7],
@@ -4030,6 +5344,7 @@ async def get_technical_rounds(
                    i.status AS interview_status,
                    i.completed_at AS interview_completed_at,
                    i.settings->>'profile_type' AS profile_type,
+                   i.job_title,
                    i.duration_seconds,
                    (i.report_json IS NOT NULL OR i.report_json_encrypted IS NOT NULL) AS report_present,
                    (
@@ -4064,10 +5379,27 @@ async def get_technical_rounds(
                          AND analysis.user_id = i.user_id
                          AND analysis.mode = 'technical'
                          AND analysis.status = 'ready'
-                         AND analysis.schema_version = 'session-performance-v3'
+                         AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.is_current = TRUE
                          AND analysis.analysis_json_encrypted IS NOT NULL
                          AND analysis.evidence_index_encrypted IS NOT NULL
-                   ) AS canonical_report_ready
+                   ) AS canonical_report_ready,
+                   (
+                       SELECT analysis.overall_score
+                       FROM SessionPerformanceAnalyses analysis
+                       WHERE analysis.interview_id = i.interview_id
+                         AND analysis.user_id = i.user_id
+                         AND analysis.mode = 'technical'
+                         AND analysis.status = 'ready'
+                         AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.is_current = TRUE
+                         AND analysis.evidence_status = 'sufficient'
+                         AND analysis.overall_score IS NOT NULL
+                         AND analysis.analysis_json_encrypted IS NOT NULL
+                         AND analysis.evidence_index_encrypted IS NOT NULL
+                       ORDER BY analysis.created_at DESC
+                       LIMIT 1
+                   ) AS official_score
             FROM TechnicalInterviewRounds tir
             LEFT JOIN TechnicalRunEvents tre ON tre.round_id = tir.round_id
             LEFT JOIN TechnicalSubmissions ts ON ts.round_id = tir.round_id
@@ -4106,10 +5438,12 @@ async def get_technical_rounds(
                 "interview_status": row[19],
                 "interview_completed_at": row[20].isoformat() if row[20] else None,
                 "profile_type": row[21],
-                "duration_seconds": int(row[22]) if row[22] is not None else None,
-                "report_present": bool(row[23]),
-                "has_candidate_evidence": bool(row[24]),
-                "canonical_report_ready": bool(row[25]),
+                "job_title": row[22],
+                "duration_seconds": int(row[23]) if row[23] is not None else None,
+                "report_present": bool(row[24]),
+                "has_candidate_evidence": bool(row[25]),
+                "canonical_report_ready": bool(row[26]),
+                "official_score": float(row[27]) if row[27] is not None else None,
             }
             for row in rows
         ]
@@ -4118,9 +5452,11 @@ async def get_technical_rounds(
             session = grouped.setdefault(item["interview_id"], {
                 "interview_id": item["interview_id"],
                 "profile_type": item.get("profile_type"),
+                "job_title": item.get("job_title"),
                 "interview_status": item.get("interview_status"),
                 "interview_completed_at": item.get("interview_completed_at"),
                 "duration_seconds": item.get("duration_seconds"),
+                "official_score": item.get("official_score"),
                 "cta": _candidate_report_cta(
                     item["interview_id"],
                     interview_status=item.get("interview_status"),
@@ -4157,66 +5493,8 @@ async def get_performance(
     cursor = connection.cursor()
     try:
         canonical = _canonical_performance_payloads(cursor, current_user["user_id"])
-        cursor.execute(
-            """
-            SELECT
-                COUNT(*),
-                COUNT(*) FILTER (
-                    WHERE NOT EXISTS (
-                          SELECT 1 FROM SessionPerformanceAnalyses spa
-                          WHERE spa.interview_id = i.interview_id
-                            AND spa.user_id = i.user_id
-                            AND spa.schema_version = 'session-performance-v3'
-                            AND spa.status = 'ready'
-                            AND spa.analysis_json_encrypted IS NOT NULL
-                      )
-                ),
-                COUNT(*) FILTER (WHERE latest_job.status IN ('queued', 'running')),
-                COUNT(*) FILTER (WHERE latest_job.status = 'failed')
-            FROM Interviews i
-            LEFT JOIN LATERAL (
-                SELECT status
-                FROM AnalysisJobs
-                WHERE interview_id = i.interview_id
-                ORDER BY created_at DESC
-                LIMIT 1
-            ) latest_job ON TRUE
-            WHERE i.user_id = %s
-              AND i.status IN ('completed', 'partial', 'failed')
-              AND (
-                  i.attempt_status = 'completed'
-                  OR EXISTS (
-                      SELECT 1 FROM InterviewResponses response
-                      WHERE response.interview_id = i.interview_id
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM TechnicalSubmissions submission
-                      WHERE submission.interview_id = i.interview_id
-                        AND submission.user_id = i.user_id
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM TechnicalRunEvents event
-                      JOIN TechnicalInterviewRounds round ON round.round_id = event.round_id
-                      WHERE round.interview_id = i.interview_id
-                        AND event.user_id = i.user_id
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM TechnicalCodeSnapshots snapshot
-                      WHERE snapshot.interview_id = i.interview_id
-                        AND snapshot.user_id = i.user_id
-                        AND snapshot.source_chars > 0
-                  )
-                  OR EXISTS (
-                      SELECT 1 FROM TechnicalExecutionJobs execution
-                      WHERE execution.interview_id = i.interview_id
-                        AND execution.user_id = i.user_id
-                        AND execution.status IN ('queued', 'leased', 'running', 'completed')
-                  )
-              )
-            """,
-            (current_user["user_id"],),
-        )
-        availability_row = cursor.fetchone() or (0, 0, 0, 0)
+        availability = _performance_availability(cursor, current_user["user_id"])
+        legacy_history = _legacy_performance_history(cursor, current_user["user_id"])
         interview_payload = canonical.get("interview")
         technical_payload = canonical.get("technical")
         try:
@@ -4227,11 +5505,8 @@ async def get_performance(
             ):
                 recorded_interview.update({
                     "source": "recorded_evidence",
+                    "source_kind": "recorded_evidence",
                     "evidence_status": "coaching_evidence",
-                    "comparison_notice": (
-                        "Includes recorded answers from an incomplete practice attempt for coaching. "
-                        "Complete a full Interview Round before treating any score as readiness."
-                    ),
                     "empty_state_explanation": None,
                 })
                 interview_payload = recorded_interview
@@ -4243,6 +5518,7 @@ async def get_performance(
                 if recorded_technical.get("has_data"):
                     recorded_technical.update({
                         "source": "recorded_evidence",
+                        "source_kind": "recorded_evidence",
                         "comparison_notice": "Showing submitted tests, runs, and attempted-problem evidence while the full analysis is prepared.",
                     })
                     technical_payload = recorded_technical
@@ -4250,21 +5526,45 @@ async def get_performance(
                 logger.exception("Failed to build recorded technical performance fallback")
         empty_interview = _dynamic_payload("interview", False, [], [])
         empty_interview["empty_reason"] = "Complete an Interview Round to create evidence-backed performance."
+        empty_interview.update({
+            "has_evidence": False,
+            "has_official_score": False,
+            "score_state": "missing",
+            "source_kind": "unavailable",
+            "included_in_trend": False,
+        })
         empty_technical = _dynamic_payload("technical", False, [], [])
         empty_technical["empty_reason"] = "Complete a Technical Round to create evidence-backed performance."
+        empty_technical.update({
+            "has_evidence": False,
+            "has_official_score": False,
+            "score_state": "missing",
+            "source_kind": "unavailable",
+            "included_in_trend": False,
+        })
+        interview_payload = interview_payload or empty_interview
+        technical_payload = technical_payload or empty_technical
+        role_context = _performance_role_context(cursor, current_user["user_id"])
         return {
-            "interview": interview_payload or empty_interview,
-            "technical": technical_payload or empty_technical,
+            "interview": interview_payload,
+            "technical": technical_payload,
+            "page": _build_performance_page_payload(
+                interview_payload,
+                technical_payload,
+                role_context,
+            ),
             "source": {
-                "interview": interview_payload.get("source", "canonical") if interview_payload else "unavailable",
-                "technical": technical_payload.get("source", "canonical") if technical_payload else "unavailable",
+                "interview": interview_payload.get("source", "unavailable"),
+                "technical": technical_payload.get("source", "unavailable"),
             },
-            "availability": {
-                "completed_count": int(availability_row[0] or 0),
-                "missing_canonical_count": int(availability_row[1] or 0),
-                "pending_count": int(availability_row[2] or 0),
-                "failed_count": int(availability_row[3] or 0),
+            "history": {
+                "official": [
+                    *(_performance_payload_trend(interview_payload)),
+                    *(_performance_payload_trend(technical_payload)),
+                ],
+                "legacy": legacy_history,
             },
+            "availability": availability,
         }
     finally:
         cursor.close()

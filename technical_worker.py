@@ -193,6 +193,14 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
             """
             UPDATE Interviews
             SET status = 'analysis_pending',
+                attempt_status = 'completed',
+                analysis_status = 'queued',
+                completion_kind = CASE
+                    WHEN deadline_at IS NOT NULL AND NOW() >= deadline_at THEN 'deadline'
+                    ELSE 'natural'
+                END,
+                recovery_deadline_at = NULL,
+                lifecycle_revision = lifecycle_revision + 1,
                 settings = %s,
                 completed_at = COALESCE(completed_at, NOW()),
                 duration_seconds = CASE
@@ -214,6 +222,22 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
                 interview_id,
             ),
         )
+        cursor.execute(
+            """
+            UPDATE TechnicalInterviewRounds round
+            SET status = CASE
+                    WHEN interview.completion_kind = 'deadline' THEN 'expired'
+                    ELSE 'completed'
+                END,
+                completed_at = COALESCE(round.completed_at, interview.completed_at, NOW())
+            FROM Interviews interview
+            WHERE round.interview_id = interview.interview_id
+              AND round.user_id = interview.user_id
+              AND interview.interview_id = %s
+              AND round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
+            """,
+            (interview_id,),
+        )
         connection.commit()
         return str(interview[0])
     except Exception:
@@ -231,11 +255,43 @@ async def finalize_requested_interview_if_drained(interview_id: str) -> Optional
     from analysis_pipeline import enqueue_analysis
     from database import async_execute
 
-    job_id = await enqueue_analysis(interview_id, user_id, "technical_execution_drained")
+    try:
+        job_id = await enqueue_analysis(
+            interview_id,
+            user_id,
+            "technical_execution_drained",
+        )
+    except Exception:
+        logger.exception(
+            "Could not queue analysis after technical execution drained: %s",
+            interview_id,
+        )
+        await async_execute(
+            """
+            UPDATE Interviews
+            SET analysis_status = 'failed',
+                feedback_summary = 'Technical execution completed, but analysis could not be queued. It will be retried automatically.'
+            WHERE interview_id = %s AND user_id = %s
+              AND attempt_status = 'completed'
+            """,
+            (interview_id, user_id),
+        )
+        return None
     if job_id:
         await async_execute(
             "UPDATE Interviews SET analysis_job_id = %s WHERE interview_id = %s AND user_id = %s",
             (job_id, interview_id, user_id),
+        )
+    else:
+        await async_execute(
+            """
+            UPDATE Interviews
+            SET analysis_status = 'failed',
+                feedback_summary = 'Technical execution completed, but analysis could not be queued. It will be retried automatically.'
+            WHERE interview_id = %s AND user_id = %s
+              AND attempt_status = 'completed'
+            """,
+            (interview_id, user_id),
         )
     return job_id
 

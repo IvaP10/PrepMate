@@ -17,8 +17,6 @@ from typing import Any, Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-from security_utils import encrypt_data
-
 
 revision: str = "009_technical_runtime_integrity"
 down_revision: Union[str, None] = "008_improve_attempt_deadlines"
@@ -32,8 +30,17 @@ def _json_text(value: Any) -> str:
     return json.dumps(value if value is not None else {}, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
+def _encrypt_data(value: str) -> str:
+    # Keep Alembic metadata commands independent of the application import
+    # path. The application crypto module is only required when this migration
+    # actually performs its data backfill.
+    from security_utils import encrypt_data
+
+    return encrypt_data(value)
+
+
 def _encrypted_bytes(value: Any) -> bytes:
-    return encrypt_data(_json_text(value)).encode("utf-8")
+    return _encrypt_data(_json_text(value)).encode("utf-8")
 
 
 def _backfill_legacy_code(bind: Any, table: str, id_column: str) -> None:
@@ -60,7 +67,7 @@ def _backfill_legacy_code(bind: Any, table: str, id_column: str) -> None:
                 WHERE {id_column} = :row_id
                 """
             ),
-            {"encrypted": encrypt_data(str(source)).encode("utf-8"), "row_id": row["row_id"]},
+            {"encrypted": _encrypt_data(str(source)).encode("utf-8"), "row_id": row["row_id"]},
         )
 
 

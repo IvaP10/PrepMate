@@ -1,4 +1,6 @@
+import inspect
 import os
+from pathlib import Path
 from datetime import datetime, timezone
 
 import pytest
@@ -6,17 +8,29 @@ from pydantic import ValidationError
 
 os.environ.setdefault("ENVIRONMENT", "test")
 
-from workspace_api import ExerciseAttemptCreate, ExerciseAttemptSessionUpdate, _attempt_session_response
+from workspace_api import (
+    ExerciseAttemptCreate,
+    ExerciseAttemptSessionUpdate,
+    _attempt_session_response,
+    create_exercise_attempt_session,
+    update_exercise_attempt_session,
+)
 from improve_scoring import mastery_status_for_checkpoint
 from learning_engine import (
     _deterministic_activity_result,
     _decrypt_sensitive_json,
     _encrypted_json_bytes,
+    _active_mission_payload,
     _phase_one_activity_definitions,
+    _persist_mission_attempt_transaction,
     _public_checkpoint_material,
     _reassessment_is_compatible,
+    _reassessment_resource,
     _sanitize_mission_attempt_payload,
 )
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _score(activity, payload, answer=""):
@@ -32,7 +46,8 @@ def _score(activity, payload, answer=""):
 
 def test_all_interview_activity_types_accept_valid_server_measurable_evidence():
     activities = _phase_one_activity_definitions("communication", "A weak answer.", mode="mock")
-    compare, arrange, rewrite, spoken, checkpoint = activities[1:]
+    assert "compare_answers" not in {activity["activity_type"] for activity in activities}
+    outline, arrange, rewrite, spoken, checkpoint = activities[1:]
     answer = (
         "I would use a database index because the API needs predictable lookups. "
         "A B-tree narrows the search, and my project test showed lower latency, "
@@ -41,12 +56,9 @@ def test_all_interview_activity_types_accept_valid_server_measurable_evidence():
 
     results = [
         _score(
-            compare,
-            {
-                "selected_option": "b",
-                "reason": "It answers directly, uses a clear structure, and gives a concrete example.",
-            },
-            "It answers directly, uses a clear structure, and gives a concrete example.",
+            outline,
+            {"rewrite": answer},
+            answer,
         ),
         _score(
             arrange,
@@ -59,6 +71,57 @@ def test_all_interview_activity_types_accept_valid_server_measurable_evidence():
     ]
 
     assert [item["result_status"] for item in results] == ["strong_pass"] * 5
+
+
+def test_generated_path_titles_tell_the_user_exactly_what_to_do():
+    interview_activities = _phase_one_activity_definitions("communication", "A weak answer.", mode="mock")
+    technical_activities = _phase_one_activity_definitions("hash maps", "A failed attempt.", mode="technical")
+    interview_titles = [activity["title"] for activity in interview_activities]
+    technical_titles = [activity["title"] for activity in technical_activities]
+
+    assert "Write a 4-Part Answer: Direct Point, Decision, Proof, and Result" in interview_titles
+    assert "Place the Direct Answer First, Then Context, Proof, and Result" in interview_titles
+    assert "Explain the Repaired Answer Aloud in 60 Seconds" in interview_titles
+    assert "State the Algorithm, Data Structure, Complexity, and Edge Cases Before Coding" in technical_titles
+    assert "List the Exact Edge Cases and Expected Outputs Before Submitting" in technical_titles
+    assert not {"Transfer Checkpoint", "Arrange the Answer", "Retry Plan Before Coding"}.intersection(
+        interview_titles + technical_titles
+    )
+    assert all("recommended_resource" not in activity.get("prompt", {}) for activity in interview_activities + technical_activities)
+
+
+def test_activity_title_is_only_rendered_in_the_modal_header():
+    source = (ROOT / "Frontend/components/improve/improve-content.tsx").read_text()
+
+    assert "Before attempt" not in source
+    assert "Attempt in progress" not in source
+    assert "Time expired. This attempt cannot be submitted" not in source
+    assert "secondsLeft" not in source
+    assert "formatActivityType(node.activity_type)" not in source
+    assert '<h3 className="mt-1 text-2xl font-semibold text-foreground">{roadmapDisplayTitle(node, mode)}</h3>' not in source
+
+
+def test_improve_attempts_have_no_countdown_or_hidden_deadline():
+    sources = (
+        inspect.getsource(create_exercise_attempt_session),
+        inspect.getsource(update_exercise_attempt_session),
+        inspect.getsource(_persist_mission_attempt_transaction),
+        inspect.getsource(_active_mission_payload),
+    )
+
+    assert all("deadline_at > NOW()" not in source for source in sources)
+    assert "timer_seconds" not in sources[0]
+    assert "remaining_seconds = NULL" in sources[1]
+
+
+def test_learning_resources_are_selected_after_official_reassessment():
+    interview_resource = _reassessment_resource("mock")
+    technical_resource = _reassessment_resource("technical")
+
+    assert interview_resource["provider"] == "YouTube"
+    assert "youtube.com" in interview_resource["url"]
+    assert technical_resource["provider"] == "GeeksforGeeks"
+    assert "geeksforgeeks.org" in technical_resource["url"]
 
 
 def test_technical_spoken_plan_recognizes_algorithm_complexity_and_edge_case():
