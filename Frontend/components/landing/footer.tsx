@@ -21,10 +21,7 @@ const footerLinks = [
     ],
   },
 ]
-interface FooterProps {
-  theme?: "light" | "dark"
-}
-export function Footer({ theme = "dark" }: FooterProps) {
+export function Footer() {
   return (
     <footer className="relative z-10 border-t border-border/80 bg-background/95 px-6 py-14 backdrop-blur-md">
       <div className="mx-auto max-w-6xl">

@@ -25,7 +25,6 @@ export function useStreamingMetrics(config: MetricsConfig = {}) {
   const wordCountRef = useRef(0)
   const speechStartRef = useRef<number | null>(null)
   const responseTimesRef = useRef<number[]>([])
-  const lastUpdateRef = useRef(0)
   const updateIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const updateEngagement = useCallback(

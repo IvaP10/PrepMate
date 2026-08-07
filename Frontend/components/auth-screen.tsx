@@ -220,7 +220,7 @@ export function AuthScreen({ onLogin, onBack, theme = "dark", verified = false, 
               {mode === "login"
                 ? "Sign in to continue your professional interview preparation"
                 : mode === "signup"
-                  ? "Create your account by 30 July 2026 to get Premium free for 30 days"
+                  ? "Create your account by 31 August 2026 to get Premium free for 30 days"
                   : "Enter your email to receive a secure password reset link"}
             </p>
           </div>

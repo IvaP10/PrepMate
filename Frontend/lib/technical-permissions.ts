@@ -233,7 +233,7 @@ export async function requestTechnicalScreenShare(): Promise<TechnicalPermission
           video: { displaySurface: "monitor" } as MediaTrackConstraints,
           audio: false,
         }),
-        "Screen sharing timed out. Click Start again and choose Entire screen within one minute.",
+        "Screen sharing timed out. Try again and choose Entire screen within one minute.",
       )
       const settings = stream.getVideoTracks()[0]?.getSettings?.() as MediaTrackSettings & { displaySurface?: string }
       if (settings?.displaySurface && settings.displaySurface !== "monitor") {
@@ -302,7 +302,7 @@ export async function requestTechnicalCamera(): Promise<TechnicalPermissionResul
           video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
           audio: false,
         }),
-        "Camera permission timed out. Click Start again and allow camera access within one minute.",
+        "Camera permission timed out. Try again and allow camera access within one minute.",
       )
       holdCameraStream(stream)
     } catch (error) {
@@ -328,7 +328,7 @@ export async function requestTechnicalMicrophone(): Promise<TechnicalPermissionR
     try {
       const stream = await requestMediaWithTimeout(
         navigator.mediaDevices.getUserMedia({ audio: true, video: false }),
-        "Microphone permission timed out. Click Start again and allow microphone access within one minute.",
+        "Microphone permission timed out. Try again and allow microphone access within one minute.",
       )
       const readiness = await verifyMediaReadiness(stream, { requireAudio: true, requireVideo: false })
       if (!readiness.ok) {
@@ -363,7 +363,7 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
         video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
         audio: true,
       }),
-      "Camera and microphone permission timed out. Click Start again and allow access within one minute.",
+      "Camera and microphone permission timed out. Try again and allow access within one minute.",
     )
     const readiness = await verifyMediaReadiness(stream, { requireAudio: true, requireVideo: true })
     if (!readiness.ok) {
@@ -392,10 +392,10 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
 }
 
 export async function requestTechnicalPermissions(): Promise<TechnicalPermissionResult> {
-  const media = await requestTechnicalMedia()
-  if (!media.ok) return media
   const screen = await requestTechnicalScreenShare()
   if (!screen.ok) return screen
+  const media = await requestTechnicalMedia()
+  if (!media.ok) return media
   return { ok: true, state: computeState() }
 }
 

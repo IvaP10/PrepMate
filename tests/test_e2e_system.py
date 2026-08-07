@@ -89,6 +89,8 @@ class InterAIE2ESystemTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cursor.close()
 
+    @patch.object(settings, "TECHNICAL_CODING_ONLY", False)
+    @patch.object(settings, "TECHNICAL_ALLOW_AUTHORED_FALLBACK", True)
     def test_complete_e2e_candidate_flow(self):
         # We also wrap in the with TestClient(app) block to trigger FastAPI's lifespan correctly
         with TestClient(app) as client:
@@ -263,9 +265,6 @@ class InterAIE2ESystemTests(unittest.IsolatedAsyncioTestCase):
                         camera_rejected = socket.receive_json()
                     self.assertEqual(camera_rejected["code"], "camera_required")
                     socket.send_json(ws_event(behavioral_id, "init_pipeline", {"camera_enabled": True, "screen_share_enabled": False}, first_client_session, 3))
-                    screen_rejected = socket.receive_json()
-                    self.assertEqual(screen_rejected["code"], "screen_share_required")
-                    socket.send_json(ws_event(behavioral_id, "init_pipeline", {"camera_enabled": True, "screen_share_enabled": True, "input_mode": "voice"}, first_client_session, 4))
                     pipeline_ready = socket.receive_json()
                     self.assertEqual(pipeline_ready["type"], "pipeline_ready")
                     duplicate_ticket = client.post("/api/interview/ws-ticket", headers=auth_headers)

@@ -9,7 +9,6 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select"
 import { getNotificationPrefs, updateNotificationPrefs } from "@/lib/api"
-import type { NotificationPrefs } from "@/lib/api"
 
 function Toggle({ checked, onChange, label, description }: {
   checked: boolean; onChange: (v: boolean) => void; label: string; description: string

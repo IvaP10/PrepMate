@@ -13,23 +13,18 @@ import {
   Sun,
   Moon,
   Upload,
-  Briefcase,
   Code,
   X,
   Check,
   Edit3,
   Save,
   Play,
-  AlertTriangle,
   CreditCard,
   Eye,
   Loader2,
   Send,
   Star,
   Target,
-  Wrench,
-  GitBranch,
-  BadgeCheck,
   PanelLeft,
   Copy,
 } from "lucide-react"
@@ -54,35 +49,14 @@ import {
 import { AuthUser } from "@/lib/auth"
 import { PremiumBackground } from "./premium-background"
 import {
-  getTechnicalPermissionState,
   releaseTechnicalPermissions,
-  subscribeTechnicalPermissionState,
-  type TechnicalPermissionState,
 } from "@/lib/technical-permissions"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import {
   uploadResume,
   submitResume,
-  startInterviewSession,
   startInterviewFromBlueprint,
   cancelInterviewSession,
   createSupportSubmission,
-  fetchInterviewProfile,
-  updateInterviewProfile,
-  changePassword,
-  deleteAccount,
-  updateAccountInfo,
-  uploadAvatar,
-  exportUserData,
-  getNotificationPrefs,
-  updateNotificationPrefs,
-  fetchPaymentTransactions,
   fetchPaymentPlans,
   fetchTechnicalRoundHistory,
   fetchLearningDashboard,
@@ -90,7 +64,7 @@ import {
   prepareTechnicalRounds,
   copyInterviewJobProfile,
 } from "@/lib/api"
-import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileOption, InterviewProfileType, LearningDashboard, NotificationPrefs, TechnicalRoundHistoryItem, TechnicalRoundSession } from "@/lib/api"
+import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileType, LearningDashboard, TechnicalRoundSession } from "@/lib/api"
 import { useResume } from "@/context/resume-context"
 import type { ResumeData } from "@/types/resume"
 import { RESUME_MAX_FILE_BYTES } from "@/lib/config"
@@ -134,19 +108,6 @@ interface AppShellProps {
   initialImproveTarget?: ExactImproveTarget | null
 }
 type ActiveNav = "improve" | "interview" | "coding" | "resume" | "performance" | "membership" | "settings"
-const INTERVIEW_PROFILE_STORAGE_KEY = "interview-profile-type"
-
-function readCachedProfileType(): InterviewProfileType {
-  if (typeof window === "undefined") return "top_tier"
-  const cached = safeStorageGet("session", INTERVIEW_PROFILE_STORAGE_KEY)
-  if (cached === "top_tier" || cached === "mid_tier" || cached === "startup" || cached === "custom") return cached
-  return "top_tier"
-}
-
-function cacheProfileType(profileType: InterviewProfileType) {
-  if (typeof window === "undefined") return
-  safeStorageSet("session", INTERVIEW_PROFILE_STORAGE_KEY, profileType)
-}
 const primaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
   { icon: FileText, label: "Resume", id: "resume" },
   { icon: Play, label: "Interview Round", id: "interview" },
@@ -157,40 +118,6 @@ const primaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
 const secondaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
   { icon: CreditCard, label: "Membership", id: "membership" },
   { icon: Settings, label: "Settings", id: "settings" },
-]
-const defaultInterviewProfileOptions: InterviewProfileOption[] = [
-  {
-    profile_type: "top_tier",
-    label: "Top Tier",
-    interview_instruction: "Rigorous project-depth interview with tough follow-ups.",
-    technical_instruction: "Medium-hard DSA first: arrays, strings, hash maps, trees, graphs, DP, heaps, binary search, sliding window, backtracking, complexity, and edge cases.",
-    behavioral_instruction: "Analytical behavioral questioning around failures, metrics, trade-offs, and proof.",
-    duration: { min_minutes: 40, target_minutes: 55, max_minutes: 55 },
-  },
-  {
-    profile_type: "mid_tier",
-    label: "Mid Tier",
-    interview_instruction: "In-depth but balanced interview focused on skill validation.",
-    technical_instruction: "Medium DSA first: arrays, strings, hash maps, trees, graphs, heaps, binary search, sliding window, recursion, complexity, and edge cases.",
-    behavioral_instruction: "Structured teamwork, execution, prioritization, and communication questions.",
-    duration: { min_minutes: 40, target_minutes: 50, max_minutes: 55 },
-  },
-  {
-    profile_type: "startup",
-    label: "Startup",
-    interview_instruction: "Practical, ownership-focused interview with some rigor.",
-    technical_instruction: "Practical DSA first: arrays, strings, hash maps, queues, trees, graph basics, sorting, binary search, recursion, complexity, and edge cases.",
-    behavioral_instruction: "Fast execution, ownership, uncertainty, and shipping trade-off questions.",
-    duration: { min_minutes: 40, target_minutes: 45, max_minutes: 55 },
-  },
-  {
-    profile_type: "custom",
-    label: "Custom",
-    interview_instruction: "Role- and JD-specific interview coverage with targeted follow-ups.",
-    technical_instruction: "Role- and JD-specific technical topics, round mix, and difficulty.",
-    behavioral_instruction: "Execution and collaboration questions aligned to the selected job target.",
-    duration: { min_minutes: 40, target_minutes: 50, max_minutes: 55 },
-  },
 ]
 interface DashboardResumeData {
   fullName: string
@@ -238,13 +165,6 @@ export interface PastInterview {
     can_copy?: boolean
   } | null
 }
-function getPlanLabel(planType?: string | null) {
-  const normalized = (planType || "starter").toLowerCase()
-  if (normalized.includes("premium")) return "Premium"
-  if (normalized.includes("pro")) return "Pro"
-  return "Free"
-}
-
 function isPaidPlanType(planType?: string | null) {
   const normalized = (planType || "starter").toLowerCase()
   return normalized.includes("premium") || normalized.includes("pro")
@@ -364,13 +284,11 @@ function InterviewContent({
   interviews = [],
   setActiveNav,
   mode = "interview",
-  user,
   onProfilesChanged,
 }: {
   interviews?: PastInterview[]
   setActiveNav: (nav: ActiveNav) => void
   mode?: "interview" | "technical"
-  user?: AuthUser | null
   onProfilesChanged?: () => void
 }) {
   const router = useRouter()
@@ -379,20 +297,9 @@ function InterviewContent({
   const [mockStartMessage, setMockStartMessage] = useState("")
   const [technicalStartMessage, setTechnicalStartMessage] = useState("")
   const [technicalPermissionError, setTechnicalPermissionError] = useState("")
-  const [technicalPermissionState, setTechnicalPermissionState] = useState<TechnicalPermissionState>(() => getTechnicalPermissionState())
-  const [mockPreflightOpen, setMockPreflightOpen] = useState(false)
-  const [technicalPreflightOpen, setTechnicalPreflightOpen] = useState(false)
-  const [selectedProfileType, setSelectedProfileType] = useState<InterviewProfileType>(readCachedProfileType)
-  const [profileOptions, setProfileOptions] = useState<InterviewProfileOption[]>(defaultInterviewProfileOptions)
-  const [loadingProfile, setLoadingProfile] = useState(true)
   const [technicalSessions, setTechnicalSessions] = useState<TechnicalRoundSession[]>([])
   const [loadingTechnicalRounds, setLoadingTechnicalRounds] = useState(false)
   const [technicalHistoryError, setTechnicalHistoryError] = useState("")
-  const [customJobTitle, setCustomJobTitle] = useState("")
-  const [customJobDescription, setCustomJobDescription] = useState("")
-  const [companyName, setCompanyName] = useState("")
-  const [readyBlueprint, setReadyBlueprint] = useState<InterviewBlueprint | null>(null)
-  const [runtimeChoice, setRuntimeChoice] = useState<BlueprintRuntimeChoice>({ inputMode: "voice", cameraEnabled: true, interviewMode: "mock" })
   const [profileRevision, setProfileRevision] = useState(0)
   const [copyingInterviewId, setCopyingInterviewId] = useState<string | number | null>(null)
   const [copiedInterviewIds, setCopiedInterviewIds] = useState<Set<string | number>>(() => new Set())
@@ -402,30 +309,6 @@ function InterviewContent({
     }
     setActiveNav("settings")
   }
-
-  useEffect(() => {
-    async function loadInterviewProfile() {
-      try {
-        setLoadingProfile(true)
-        const data = await fetchInterviewProfile()
-        setSelectedProfileType((current) => {
-          const next = data.profile_type
-          if (current === next) return current
-          return next
-        })
-        cacheProfileType(data.profile_type)
-        if (Array.isArray(data.options) && data.options.length > 0) {
-          setProfileOptions(data.options)
-        }
-      } catch (error: any) {
-        console.warn("Failed to load interview profile; using default profile options.", error)
-      } finally {
-        setLoadingProfile(false)
-      }
-    }
-    loadInterviewProfile()
-  }, [])
-  const visibleProfileOptions = profileOptions
 
   const loadTechnicalRounds = useCallback(async () => {
     if (mode !== "technical") return
@@ -443,20 +326,8 @@ function InterviewContent({
 
   useEffect(() => {
     if (mode !== "technical") return
-    const unsubscribe = subscribeTechnicalPermissionState(setTechnicalPermissionState)
     void loadTechnicalRounds()
-    return unsubscribe
   }, [loadTechnicalRounds, mode])
-
-  const handleSelectProfile = async (profileType: InterviewProfileType) => {
-    setSelectedProfileType(profileType)
-    cacheProfileType(profileType)
-    try {
-      await updateInterviewProfile(profileType)
-    } catch (error: any) {
-      toast.error(error?.message || "Failed to save interview profile.")
-    }
-  }
 
   const startMockInterview = async (preflightId: string, blueprint: InterviewBlueprint, runtime: BlueprintRuntimeChoice) => {
     if (!blueprint?.blueprint_id) {
@@ -502,19 +373,7 @@ function InterviewContent({
     }
   }
 
-  const openMockPreflight = () => {
-    setMockPreflightOpen(true)
-  }
-
-  const openTechnicalPreflight = () => {
-    setTechnicalPermissionError("")
-    setTechnicalStartMessage("")
-    setTechnicalPreflightOpen(true)
-  }
-
   const handleBlueprintReady = (blueprint: InterviewBlueprint, runtime: BlueprintRuntimeChoice, preflightId: string) => {
-    setReadyBlueprint(blueprint)
-    setRuntimeChoice(runtime)
     if (mode === "technical") void startTechnicalInterview(preflightId, blueprint)
     else void startMockInterview(preflightId, blueprint, runtime)
   }
@@ -564,7 +423,6 @@ function InterviewContent({
     }
   }
 
-  const formatRoundType = (value: string) => value.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase())
   const formatDate = (value: string | null) => value ? new Date(value).toLocaleDateString() : "Not recorded"
 
   const formatActivityDate = (value: string | null | undefined) => {
@@ -598,18 +456,6 @@ function InterviewContent({
     const s = seconds % 60
     return `${m}m ${s}s`
   }
-  const profileSegmentOptions = visibleProfileOptions.map((profile) => ({
-    value: profile.profile_type,
-    label: profile.label,
-    icon: profile.profile_type === "top_tier"
-      ? <BadgeCheck className="h-4 w-4" />
-      : profile.profile_type === "startup"
-        ? <GitBranch className="h-4 w-4" />
-        : profile.profile_type === "custom"
-          ? <Wrench className="h-4 w-4" />
-          : <Briefcase className="h-4 w-4" />,
-  }))
-
   const profilesChanged = () => {
     setProfileRevision((value) => value + 1)
     onProfilesChanged?.()
@@ -639,84 +485,6 @@ function InterviewContent({
           onReady={handleBlueprintReady}
           onProfilesChanged={profilesChanged}
         />
-        {false && (
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="space-y-4">
-
-            <SlidingSegmentControl
-              ariaLabel="Profile type"
-              options={profileSegmentOptions}
-              value={selectedProfileType}
-              onValueChange={handleSelectProfile}
-              className="dashboard-segment-tabs w-fit max-w-full gap-1 rounded-full border-0 bg-card p-1.5 shadow-[0_14px_36px_rgba(15,23,42,0.06)] dark:shadow-[0_16px_38px_rgba(0,0,0,0.2)]"
-              buttonClassName="h-10 px-4"
-              shape="pill"
-            />
-            {selectedProfileType === "custom" && (
-              <div className="mt-4 space-y-4 rounded-xl border border-border/40 bg-zinc-950/20 p-5 shadow-sm animate-fade-in-up w-full">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Custom Role Title</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Senior Backend Engineer"
-                      value={customJobTitle}
-                      onChange={(e) => setCustomJobTitle(e.target.value)}
-                      className="w-full rounded-lg border border-border/50 bg-background px-3.5 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all shadow-inner"
-                    />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Company Name</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Acme Corp"
-                      value={companyName}
-                      onChange={(e) => setCompanyName(e.target.value)}
-                      className="w-full rounded-lg border border-border/50 bg-background px-3.5 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all shadow-inner"
-                    />
-                  </div>
-                </div>
-                <div className="space-y-1.5">
-                  <label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Custom Job Description</label>
-                  <textarea
-                    placeholder="Paste the job description here..."
-                    value={customJobDescription}
-                    onChange={(e) => setCustomJobDescription(e.target.value)}
-                    className="min-h-[140px] w-full rounded-lg border border-border/50 bg-background px-3.5 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all resize-y shadow-inner leading-relaxed"
-                  />
-                </div>
-              </div>
-            )}
-          </div>
-          {mode === "technical" ? (
-            <Button
-              onClick={openTechnicalPreflight}
-              disabled={
-                isStartingTechnical ||
-                loadingProfile ||
-                (selectedProfileType === "custom" && (!customJobTitle.trim() || !customJobDescription.trim() || !companyName.trim()))
-              }
-              className="gap-2 rounded-lg px-6"
-            >
-              {isStartingTechnical ? <Loader2 className="h-4 w-4 animate-spin" /> : <Code className="h-4 w-4" />}
-              {isStartingTechnical ? "Starting..." : "Start Technical Round"}
-            </Button>
-          ) : (
-            <Button
-              onClick={openMockPreflight}
-              disabled={
-                isStartingMock ||
-                loadingProfile ||
-                (selectedProfileType === "custom" && (!customJobTitle.trim() || !customJobDescription.trim() || !companyName.trim()))
-              }
-              className="gap-2 rounded-lg px-6"
-            >
-              {isStartingMock ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-              {isStartingMock ? "Starting..." : "Start Interview"}
-            </Button>
-          )}
-        </div>
-        )}
       </div>
 
       {technicalPermissionError && mode === "technical" && (
@@ -729,6 +497,9 @@ function InterviewContent({
         <div className="dashboard-card overflow-hidden p-0">
           <div className={!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
             <h3 className="text-base font-semibold text-foreground">Technical Rounds</h3>
+            {!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 && (
+              <p className="mt-1 text-sm text-muted-foreground">Your completed technical rounds will appear here.</p>
+            )}
           </div>
           {(loadingTechnicalRounds || Boolean(technicalHistoryError) || technicalSessions.length > 0) && <div className="max-w-full overflow-x-auto">
             <table className="w-full">
@@ -868,6 +639,9 @@ function InterviewContent({
       <div className="dashboard-card overflow-hidden p-0">
         <div className={interviews.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
           <h3 className="text-base font-semibold text-foreground">Past Interviews</h3>
+          {interviews.length === 0 && (
+            <p className="mt-1 text-sm text-muted-foreground">Your completed interview rounds will appear here.</p>
+          )}
         </div>
         {interviews.length > 0 && <div className="max-w-full overflow-x-auto">
           <table className="w-full">
@@ -1017,7 +791,7 @@ function SkillsDisplay({ skills }: { skills: string }) {
   )
 }
 function ResumeContent() {
-  const { resumeData: contextResumeData, isLoading, justParsed, setJustParsed, setResumeData: setContextResumeData } = useResume()
+  const { resumeData: contextResumeData, justParsed, setJustParsed, setResumeData: setContextResumeData } = useResume()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [isUploading, setIsUploading] = useState(false)
   const [isEditing, setIsEditing] = useState(false)
@@ -1806,7 +1580,7 @@ function MembershipContent() {
               Free gives you one AI mock interview per week. Upgrade when you need technical assessments, custom JD-based rounds, and higher weekly limits.
             </p>
             <p className="mt-3 text-sm font-medium text-primary">
-              Early Bird: register by 30 July 2026 to get Premium free for 30 days.
+              Early Bird: register by 31 August 2026 to get Premium free for 30 days.
             </p>
           </div>
           <div className="flex flex-wrap gap-2 text-xs font-medium text-muted-foreground">
@@ -1958,7 +1732,7 @@ function MembershipContent() {
           </div>
           <p className="mb-5 text-sm text-muted-foreground">The ultimate solution with custom rounds for elite preparation.</p>
           <div className="mb-5 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-primary">
-            Register by 30 July 2026 and your first 30 days of Premium are free.
+            Register by 31 August 2026 and your first 30 days of Premium are free.
           </div>
           <div className="flex-1 space-y-2.5">
             {premiumFeatures.map((f) => (
@@ -2139,20 +1913,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
     })
     window.history.replaceState({}, "", `/?${params.toString()}`)
   }, [activeNav, improveTarget])
-  const openImproveTarget = (target: ExactImproveTarget) => {
-    setImproveTarget(target)
-    _setActiveNav("improve")
-    if (typeof window !== "undefined") {
-      const params = new URLSearchParams({
-        tab: "improve",
-        mode: target.mode === "technical" ? "technical" : "interview",
-        mission_id: target.mission_id,
-        roadmap_node_id: target.roadmap_node_id,
-        exercise_id: target.exercise_id,
-      })
-      window.history.replaceState({}, "", `/?${params.toString()}`)
-    }
-  }
   const refreshLearning = async () => {
     try {
       setLearningError("")
@@ -2570,7 +2330,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                       interviews={interviews}
                       setActiveNav={setActiveNav}
                       mode={activeNav === "coding" ? "technical" : "interview"}
-                      user={user}
                       onProfilesChanged={() => setRefreshTrigger((value) => value + 1)}
                     />
                   )

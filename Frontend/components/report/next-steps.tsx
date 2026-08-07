@@ -1,5 +1,3 @@
-import React from "react"
-
 interface ActionItem {
   title: string
   detail: string

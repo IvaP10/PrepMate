@@ -64,8 +64,8 @@ CSRF_COOKIE_NAME = "interai_csrf"
 
 SIGNUP_PROMO_PLAN_TYPE = "premium"
 SIGNUP_PROMO_DURATION_DAYS = 30
-# Registrations through July 30, 2026 get one free month of Premium.
-SIGNUP_PROMO_CUTOFF_UTC = datetime(2026, 7, 30, 23, 59, 59, tzinfo=timezone.utc)
+# Registrations through August 31, 2026 get one free month of Premium.
+SIGNUP_PROMO_CUTOFF_UTC = datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 PASSWORD_MIN_LENGTH = 8
 PASSWORD_PATTERN = re.compile(

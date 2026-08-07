@@ -9,6 +9,7 @@ interface VADConfig {
   silenceThreshold?: number
   speechThreshold?: number
   minSpeechDuration?: number
+  silenceDuration?: number
 }
 
 interface VADState {
@@ -21,7 +22,8 @@ export function useVAD(config: VADConfig = {}) {
   const {
     silenceThreshold = -45,
     speechThreshold = -35,
-    minSpeechDuration = 300,
+    minSpeechDuration = 700,
+    silenceDuration: silenceDurationMs = 1200,
   } = config
 
   const [state, setState] = useState<VADState>({
@@ -82,7 +84,7 @@ export function useVAD(config: VADConfig = {}) {
             }
 
             const silenceDuration = now - silenceStartRef.current
-            if (silenceDuration > 600) {
+            if (silenceDuration >= silenceDurationMs) {
               const spDuration = speechStartRef.current
                 ? now - speechStartRef.current
                 : 0
@@ -113,7 +115,7 @@ export function useVAD(config: VADConfig = {}) {
       setState((prev) => ({ ...prev, isListening: true }))
       detect()
     },
-    [config, silenceThreshold, speechThreshold, minSpeechDuration]
+    [config, silenceThreshold, speechThreshold, minSpeechDuration, silenceDurationMs]
   )
 
   const stopListening = useCallback(() => {

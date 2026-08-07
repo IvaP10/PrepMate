@@ -355,7 +355,7 @@ export default function Home() {
         <PricingSection onGetStarted={goToSignup} />
         <CtaSection onGetStarted={goToSignup} />
       </main>
-      <Footer theme={theme} />
+      <Footer />
     </div>
   )
 }

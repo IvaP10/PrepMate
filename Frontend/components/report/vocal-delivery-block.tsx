@@ -1,6 +1,5 @@
 "use client"
 
-import React from "react"
 import { AlertTriangle, Zap } from "lucide-react"
 import type { AnalysisSection, VocalDeliverySection, Severity } from "@/types/premium-report"
 

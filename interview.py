@@ -70,7 +70,7 @@ from knowledge_map import (
 from interview_profiles import get_profile_config, normalize_profile_type
 from security_utils import redact_text, stable_hash, collect_profile_identifiers, redact_pii_text
 from security_utils import decrypt_data, encrypt_data
-from interview_blueprint import compile_interview_blueprint, validate_blueprint
+from interview_blueprint import compile_interview_blueprint, validate_blueprint, weakness_label
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
 from learning_engine import ensure_mission_from_response_assessment
 from attempt_context import create_attempt_context_snapshot
@@ -91,6 +91,95 @@ REPORT_READY_STATUSES = {"completed", "report_ready", "partial", "failed"}
 ANALYSIS_ACTIVE_STATUSES = {"analysis_pending", "analysis_running"}
 LIVE_INTERVIEW_STATUSES = {"in_progress", "uploading", "recovering"}
 FINALIZED_INTERVIEW_STATUSES = REPORT_READY_STATUSES | ANALYSIS_ACTIVE_STATUSES | {"cancelled"}
+MIN_LIVE_ANSWER_WORDS = 2
+MIN_LIVE_ANSWER_CHARS = 6
+MIN_LIVE_AUDIO_DURATION_MS = 650
+MAX_LIVE_ANSWER_QUALITY_FAILURES = 3
+
+
+def _is_usable_live_answer(answer: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(answer or "")).strip()
+    words = re.findall(r"\b[\w']+\b", cleaned)
+    compact = re.sub(r"[^\w]", "", cleaned, flags=re.UNICODE)
+    return len(words) >= MIN_LIVE_ANSWER_WORDS and len(compact) >= MIN_LIVE_ANSWER_CHARS
+
+
+def _live_answer_quality(evaluation: Dict[str, Any]) -> tuple[bool, str]:
+    """Fail closed when an answer is clearly unrelated or nonsensical."""
+
+    signals = evaluation.get("signals") if isinstance(evaluation, dict) else {}
+    signals = signals if isinstance(signals, dict) else {}
+    lexical = signals.get("lexical_relevance") if isinstance(signals, dict) else {}
+    lexical = lexical if isinstance(lexical, dict) else {}
+    structure = signals.get("structure") if isinstance(signals, dict) else {}
+    structure = structure if isinstance(structure, dict) else {}
+    specificity = signals.get("specificity_evidence") if isinstance(signals, dict) else {}
+    specificity = specificity if isinstance(specificity, dict) else {}
+    ownership = signals.get("ownership") if isinstance(signals, dict) else {}
+    ownership = ownership if isinstance(ownership, dict) else {}
+    directness = signals.get("directness") if isinstance(signals, dict) else {}
+    directness = directness if isinstance(directness, dict) else {}
+    semantic = evaluation.get("semantic_status") if isinstance(evaluation, dict) else {}
+    semantic = semantic if isinstance(semantic, dict) else {}
+
+    if semantic.get("state") == "completed" and semantic.get("answer_relevant") is False:
+        return False, "answer_not_relevant"
+
+    word_count = int(signals.get("word_count") or 0)
+    if word_count < 8:
+        return False, "answer_too_brief"
+
+    relevance = float(lexical.get("score") or 0)
+    structure_score = float(structure.get("score") or 0)
+    evidence_score = float(specificity.get("score") or 0)
+    ownership_score = float(ownership.get("score") or 0)
+    directness_score = float(directness.get("score") or 0)
+    if relevance >= 25:
+        return True, "relevant"
+    if (
+        relevance < 18
+        and structure_score < 35
+        and evidence_score < 35
+        and ownership_score < 60
+    ):
+        return False, "answer_not_relevant"
+    if directness_score < 20 and structure_score < 35 and evidence_score < 35:
+        return False, "answer_not_direct"
+    return True, "relevant_without_keyword_overlap"
+
+
+def _live_answer_feedback(reason: str) -> str:
+    if reason == "answer_too_brief":
+        return "That answer was too brief to evaluate. Please answer the question directly and complete your thought."
+    if reason == "answer_not_direct":
+        return "That response was not direct enough for the question. Please answer the question first, then explain why."
+    return "That response did not answer the question. Please stay on the requested topic and give a concrete answer."
+
+
+def _live_retry_question(
+    question: str,
+    topic: str,
+    reason: str,
+    attempt: int,
+) -> str:
+    focus = str(topic or "the requested topic").strip()[:120]
+    original = re.sub(r"\s+", " ", str(question or "")).strip()[:420]
+    # Keep retries anchored to the original prompt instead of nesting the
+    # previous retry instruction inside the next question.
+    retry_prefixes = (
+        r"^Please answer the question directly about .+?:\s*",
+        r"^I still need a relevant answer about .+?\. Give one concrete example, then answer:\s*",
+    )
+    for _ in range(3):
+        unwrapped = original
+        for prefix in retry_prefixes:
+            unwrapped = re.sub(prefix, "", unwrapped, count=1, flags=re.IGNORECASE).strip()
+        if unwrapped == original:
+            break
+        original = unwrapped
+    if attempt <= 1:
+        return f"Please answer the question directly about {focus}: {original}"
+    return f"I still need a relevant answer about {focus}. Give one concrete example, then answer: {original}"
 
 
 def _can_voluntarily_cancel(status_value: object) -> bool:
@@ -610,18 +699,25 @@ def _load_previous_weaknesses(cursor: Any, user_id: str, limit: int = 5) -> List
         """,
         (user_id, limit),
     )
-    return [
-        {
+    normalized: List[Dict[str, Any]] = []
+    seen_labels = set()
+    for row in cursor.fetchall() or []:
+        label = weakness_label(row[0])
+        if not label or label.lower() in seen_labels:
+            continue
+        seen_labels.add(label.lower())
+        normalized.append({
             "skill_key": row[0],
-            "label": str(row[0] or "").replace(":", " ").replace("-", " ").title(),
+            "label": label,
             "mastery_score": float(row[1] or 0),
             "confidence_score": float(row[2] or 0),
             "evidence_count": int(row[3] or 0),
             "last_evidence_at": row[4].isoformat() if row[4] else None,
             "source": "learner_skill_state",
-        }
-        for row in (cursor.fetchall() or [])
-    ]
+        })
+        if len(normalized) >= limit:
+            break
+    return normalized
 
 
 def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
@@ -1136,8 +1232,12 @@ async def _legacy_create_interview_blueprint_unused(
             ))
             blueprint_id = str(uuid.uuid4())
             expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-            round_types = request.technical_round_types or (
-                ["coding", "debugging"] if is_technical_interview_type(request.interview_type) else []
+            round_types = (
+                ["coding"]
+                if is_technical_interview_type(request.interview_type) and settings.TECHNICAL_CODING_ONLY
+                else request.technical_round_types or (
+                    ["coding", "debugging"] if is_technical_interview_type(request.interview_type) else []
+                )
             )
             settings_json = {
                 "profile_type": profile_type,
@@ -1595,13 +1695,13 @@ def _commit_live_assessment(
 
 def _followup_template(action: str, topic: str) -> str:
     templates = {
-        "clarify": "What is the short answer, with one concrete example?",
-        "verify_contradiction": "Those two points conflict. Which one is true?",
-        "simplify_prerequisite": f"Let us step back. What is the core idea behind {topic}?",
-        "probe_evidence": "What did you personally do?",
-        "challenge_tradeoff": "What trade-off mattered most in that decision?",
+        "clarify": f"What is the main point about {topic}, and what example supports it?",
+        "verify_contradiction": f"Which claim about {topic} is correct, and what evidence supports it?",
+        "simplify_prerequisite": f"For {topic}, what is the core idea, and why is it needed?",
+        "probe_evidence": f"What did you personally do with {topic}, and what result did it produce?",
+        "challenge_tradeoff": f"What alternative did you consider for {topic}, and why did you choose this approach?",
     }
-    return templates.get(action, "What is one concrete example?")
+    return templates.get(action, f"What specific example supports your point about {topic}?")
 
 @router.post("/ws-ticket")
 async def create_ws_ticket(current_user: Dict = Depends(get_current_user)):
@@ -1807,7 +1907,11 @@ async def start_interview(
             preflight = cursor.fetchone()
             if not preflight:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preflight check not found")
-            required_ready = all(bool(value) for value in preflight[1:8]) and bool(preflight[9])
+            required_ready = (
+                all(bool(value) for value in preflight[1:4])
+                and (expected_flow != "technical" or bool(preflight[4]))
+                and all(bool(value) for value in (preflight[5], preflight[6], preflight[7], preflight[9]))
+            )
             if expected_flow == "technical":
                 required_ready = required_ready and bool(preflight[8])
             if str(preflight[0]) != expected_flow or preflight[11] is not None:
@@ -1976,9 +2080,9 @@ async def start_interview(
         }
         request.difficulty_level = "adaptive"
         request.focus = ["mixed"]
-        request.question_count = None
+        request.question_count = 2 if is_technical_mode and settings.TECHNICAL_CODING_ONLY else None
         request.technical_topics = []
-        request.technical_round_types = []
+        request.technical_round_types = ["coding"] if is_technical_mode and settings.TECHNICAL_CODING_ONLY else []
         request.camera_mode = "required"
         if not is_technical_mode:
             request.input_mode = "voice"
@@ -2036,7 +2140,7 @@ async def start_interview(
             "experience_level": request.experience_level,
             "programming_language": request.programming_language,
             "technical_topics": request.technical_topics,
-            "question_count": None,
+            "question_count": request.question_count,
             "input_mode": request.input_mode,
             "camera_mode": request.camera_mode,
             "recovery_grace_seconds": settings.SESSION_RECOVERY_GRACE_SECONDS,
@@ -2048,7 +2152,9 @@ async def start_interview(
             "nonverbal_analysis": "browser_mediapipe",
             "technical_mode": is_technical_mode,
             "technical_rounds": (
-                list(profile_config.get("technical_rounds") or ["coding", "technical_concept"])
+                ["coding"]
+                if is_technical_mode and settings.TECHNICAL_CODING_ONLY
+                else list(profile_config.get("technical_rounds") or ["coding", "technical_concept"])
             ) if is_technical_mode else [],
             "blueprint_id": request.blueprint_id,
             "blueprint_hash": knowledge_map.get("blueprint_hash"),
@@ -2272,11 +2378,13 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
         session_started_at: Optional[datetime] = None
         session_activated_at: Optional[datetime] = None
         session_deadline_at: Optional[datetime] = None
+        quality_failure_streak = 0
 
         msg_timestamps: deque[float] = deque()
         server_frame_counter: int = 0
         integrity_server_sequence: int = 0
         question_ack_state: Dict[str, Dict[str, Any]] = {}
+        answer_processing_lock = asyncio.Lock()
 
         def track_ws_task(coro):
             task = asyncio.create_task(coro)
@@ -2550,6 +2658,20 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 commit=True,
             )
 
+        async def persist_answer_quality_streak(value: int):
+            if not interview_id:
+                return
+            ws_settings["answer_quality_failure_streak"] = max(0, int(value))
+            await async_execute(
+                """
+                UPDATE Interviews
+                SET settings = COALESCE(settings, '{}'::jsonb)
+                    || jsonb_build_object('answer_quality_failure_streak', %s)
+                WHERE interview_id = %s AND user_id = %s
+                """,
+                (max(0, int(value)), interview_id, user_id),
+            )
+
         async def persist_asked_question(
             *,
             question_id: str,
@@ -2693,6 +2815,41 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
 
             await send_ws_message(payload)
 
+        async def register_live_quality_failure(
+            code: str,
+            message: str,
+            *,
+            finalize_on_threshold: bool = True,
+        ) -> bool:
+            nonlocal quality_failure_streak
+            quality_failure_streak += 1
+            await persist_answer_quality_streak(quality_failure_streak)
+            await send_ws_message({
+                "type": "answer_rejected",
+                "code": code,
+                "retryable": quality_failure_streak < MAX_LIVE_ANSWER_QUALITY_FAILURES,
+                "quality_failure_streak": quality_failure_streak,
+                "message": message,
+            })
+            await send_ws_message({
+                "type": "answer_quality_feedback",
+                "severity": "error" if quality_failure_streak >= MAX_LIVE_ANSWER_QUALITY_FAILURES else "warning",
+                "message": message,
+            })
+            should_finalize = quality_failure_streak >= MAX_LIVE_ANSWER_QUALITY_FAILURES
+            if should_finalize and finalize_on_threshold:
+                await send_ws_message({
+                    "type": "interview_ending",
+                    "message": "I could not get a relevant answer after three attempts, so this interview is ending.",
+                    "reason": "repeated_low_quality_answers",
+                })
+                await complete_interview(
+                    include_closing_audio=False,
+                    force=True,
+                    reason="repeated_low_quality_answers",
+                )
+            return should_finalize
+
         async def ask_minimum_duration_followup(
             *,
             active_bg: Dict[str, Any],
@@ -2781,7 +2938,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 "progress": "Continuing the conversation",
             })
 
-        async def process_candidate_response(
+        async def _process_candidate_response(
             response_text: str,
             *,
             idempotency_key: Optional[str] = None,
@@ -2797,6 +2954,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
             nonlocal current_question_type
             nonlocal current_parent_question_id
             nonlocal warmup_pending
+            nonlocal quality_failure_streak
 
             try:
                 cleaned_response = (response_text or "").strip()
@@ -2812,6 +2970,13 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "type": "error",
                         "message": "No active interview question"
                     })
+                    return
+
+                if not _is_usable_live_answer(cleaned_response):
+                    await register_live_quality_failure(
+                        "answer_too_short",
+                        "I need a complete answer. Please finish your thought and answer the question directly.",
+                    )
                     return
 
                 question_id = current_question_id or str(uuid.uuid4())
@@ -2989,6 +3154,23 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     question_id=question_id,
                 )
 
+                answer_is_relevant, quality_reason = _live_answer_quality(evaluation)
+                quality_retry = False
+                quality_end = False
+                quality_feedback = ""
+                if answer_is_relevant:
+                    if quality_failure_streak:
+                        quality_failure_streak = 0
+                        await persist_answer_quality_streak(0)
+                else:
+                    quality_feedback = _live_answer_feedback(quality_reason)
+                    quality_end = await register_live_quality_failure(
+                        quality_reason,
+                        quality_feedback,
+                        finalize_on_threshold=False,
+                    )
+                    quality_retry = not quality_end
+
                 active_bg = current_battleground
                 if isinstance(evaluation.get("overall_score"), (int, float)) and not warmup_pending:
                     recent_scores = active_bg.setdefault("recent_authoritative_scores", [])
@@ -3014,7 +3196,15 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 next_bg: Optional[Dict[str, Any]] = None
                 next_question: Optional[Dict[str, Any]] = None
                 next_ws_payload: Optional[Dict[str, Any]] = None
-                if warmup_pending:
+                if quality_end:
+                    next_bg = None
+                    decision_action = "end"
+                    decision_reason = "repeated_low_quality_answers"
+                elif quality_retry:
+                    next_bg = active_bg
+                    decision_action = "retry"
+                    decision_reason = quality_reason
+                elif warmup_pending:
                     warmup_pending = False
                     next_bg = current_battleground or get_next_battleground(knowledge_map)
                     decision_action = "advance"
@@ -3037,7 +3227,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     )
 
                 minimum_duration_depth = False
-                if next_bg is None and below_minimum_duration() and not reached_maximum_duration():
+                if next_bg is None and not quality_end and below_minimum_duration() and not reached_maximum_duration():
                     next_bg = active_bg
                     should_follow = True
                     minimum_duration_depth = True
@@ -3046,7 +3236,27 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
 
                 if next_bg and not reached_maximum_duration():
                     next_question_id = str(uuid.uuid4())
-                    if should_follow:
+                    if quality_retry:
+                        next_question_type = "warmup" if warmup_pending else "retry"
+                        next_parent_id = None if warmup_pending else question_id
+                        next_question_text = _live_retry_question(
+                            current_question_text,
+                            (
+                                "your background and interest in this role"
+                                if current_question_type == "warmup"
+                                else str(active_bg.get("label") or "the requested topic")
+                            ),
+                            quality_reason,
+                            quality_failure_streak,
+                        )
+                        reason_metadata = {
+                            "reason": decision_reason,
+                            "action": decision_action,
+                            "policy_version": EVALUATION_VERSION,
+                            "answered_question_id": question_id,
+                            "quality_failure_streak": quality_failure_streak,
+                        }
+                    elif should_follow:
                         next_question_type = "followup"
                         next_parent_id = question_id
                         if minimum_duration_depth:
@@ -3065,15 +3275,34 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                                 job_title=ws_settings.get("job_title", ""),
                                 resume_context=resume_context,
+                                followup_action=decision_action,
                                 question_id=next_question_id,
                                 parent_question_id=question_id,
                                 user_id=user_id,
                                 interview_id=interview_id,
                             )
                         else:
-                            next_question_text = _followup_template(
-                                decision_action,
-                                str(active_bg.get("label") or "this topic"),
+                            next_question_text = await generate_contextual_followup(
+                                battleground_label=str(active_bg.get("label") or "this topic"),
+                                main_question=current_question_text,
+                                candidate_response=cleaned_response,
+                                conversation_history=conversation_history,
+                                performance_score=float(evaluation.get("provisional_score") or 0),
+                                interview_mode=interview_mode or "mock",
+                                profile_instruction=(
+                                    f"{ws_settings.get('followup_instruction', '')} "
+                                    f"The deterministic follow-up action is {decision_action}. "
+                                    "Ask one new question that stays on this topic and refers to a concrete detail from the candidate's answer. "
+                                    "Do not switch topics, repeat the previous question, or give coaching."
+                                ).strip(),
+                                profile_type=ws_settings.get("profile_type", "mid_tier"),
+                                job_title=ws_settings.get("job_title", ""),
+                                resume_context=resume_context,
+                                followup_action=decision_action,
+                                question_id=next_question_id,
+                                parent_question_id=question_id,
+                                user_id=user_id,
+                                interview_id=interview_id,
                             )
                         active_bg["policy_followups_used"] = followups_used + 1
                         knowledge_map = mark_turn_used(knowledge_map, active_bg["id"])
@@ -3137,6 +3366,12 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     "maximum_followups": 2,
                     "finalize": next_question is None,
                 }
+                if quality_feedback:
+                    evaluation["quality_gate"] = {
+                        "status": "retry" if quality_retry else "ended",
+                        "reason": quality_reason,
+                        "failure_streak": quality_failure_streak,
+                    }
                 evaluation["response_id"] = response_id
                 evaluation["question_id"] = question_id
                 evaluation["idempotency_key"] = resolved_key
@@ -3196,6 +3431,32 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 await send_question_message(next_ws_payload)
             finally:
                 await send_processing_idle()
+
+        async def process_candidate_response(
+            response_text: str,
+            *,
+            idempotency_key: Optional[str] = None,
+            client_question_id: Optional[str] = None,
+            input_mode: str = "voice",
+            timing: Optional[Dict[str, Any]] = None,
+        ):
+            if answer_processing_lock.locked():
+                await send_ws_message({
+                    "type": "answer_rejected",
+                    "code": "answer_processing",
+                    "retryable": True,
+                    "message": "I am still processing your previous answer. Please wait for the next question.",
+                })
+                await send_processing_idle()
+                return
+            async with answer_processing_lock:
+                await _process_candidate_response(
+                    response_text,
+                    idempotency_key=idempotency_key,
+                    client_question_id=client_question_id,
+                    input_mode=input_mode,
+                    timing=timing,
+                )
 
         while True:
             try:
@@ -3445,6 +3706,13 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "interview_activated_at": session_activated_at.isoformat() if session_activated_at else None,
                         "deadline_at": session_deadline_at.isoformat() if session_deadline_at else None,
                     }
+                    try:
+                        quality_failure_streak = max(
+                            0,
+                            int(ws_settings.get("answer_quality_failure_streak") or 0),
+                        )
+                    except (TypeError, ValueError):
+                        quality_failure_streak = 0
                     persisted_question_ids.clear()
                     current_question_id = None
 
@@ -3727,13 +3995,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     })
 
                 elif msg_type == "init_pipeline":
-                    if message.get("screen_share_enabled") is not True:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "screen_share_required",
-                            "message": "Active full-screen sharing is required to begin this interview.",
-                        })
-                        continue
                     if ws_settings.get("camera_mode") == "required" and message.get("camera_enabled") is not True:
                         await send_ws_message({
                             "type": "error",
@@ -3742,7 +4003,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         })
                         continue
                     await persist_integrity_event("camera_started", {}, source="server")
-                    await persist_integrity_event("screen_share_started", {}, source="server")
                     if str(message.get("input_mode") or "voice") == "voice":
                         await persist_integrity_event("microphone_started", {}, source="server")
                     if session_activated_at is None:
@@ -3818,14 +4078,33 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         str(mime_type or "audio/webm")[:80],
                         message.get("duration_ms"),
                     )
+                    timing = message.get("timing") if isinstance(message.get("timing"), dict) else {}
+                    duration_values = []
+                    for raw_duration in (
+                        message.get("duration_ms"),
+                        float(timing.get("voiced_duration_seconds")) * 1000
+                        if isinstance(timing.get("voiced_duration_seconds"), (int, float))
+                        else None,
+                    ):
+                        try:
+                            parsed_duration = float(raw_duration)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(parsed_duration) and parsed_duration > 0:
+                            duration_values.append(parsed_duration)
+                    if any(duration < MIN_LIVE_AUDIO_DURATION_MS for duration in duration_values):
+                        await register_live_quality_failure(
+                            "audio_too_short",
+                            "I need a complete answer. Please finish your thought and answer the question directly.",
+                        )
+                        await send_processing_idle()
+                        continue
                     transcribed_text = await transcribe_audio(audio_data, mime_type=mime_type)
-                    if not transcribed_text:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "transcription_failed",
-                            "retryable": True,
-                            "message": "I couldn't hear enough speech. Keep the mic on, speak clearly for at least a second, then try again."
-                        })
+                    if not transcribed_text or not _is_usable_live_answer(transcribed_text):
+                        await register_live_quality_failure(
+                            "transcription_too_short",
+                            "I couldn't hear a complete answer. Please finish your thought and answer the question directly.",
+                        )
                         await send_processing_idle()
                         continue
 

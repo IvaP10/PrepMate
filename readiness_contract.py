@@ -32,6 +32,7 @@ def build_flow_readiness_payload(
         "workers": {"healthy": workers_ready, "required": worker_health},
     }
     if flow == "technical":
+        selected["technical_content"] = checks.get("technical_content") or {"healthy": False}
         selected["sandbox_executor"] = checks.get("sandbox_executor") or {"healthy": False}
     ready_value = all(bool(item.get("healthy")) for item in selected.values())
     server_time = datetime.now(timezone.utc).isoformat()
@@ -43,7 +44,7 @@ def build_flow_readiness_payload(
             "All required services are ready."
             if ready_value
             else (
-                "Technical round services are temporarily unavailable. Please try again shortly."
+                "Technical code execution is temporarily unavailable. Try again when the secure executor is online."
                 if flow == "technical"
                 else "Interview services are temporarily unavailable. Please try again shortly."
             )

@@ -452,11 +452,6 @@ export default function InterviewReportPage() {
   const technicalProblems = isTechnical
     ? (reportV2?.technical?.problems?.length ? reportV2.technical.problems : reportV2?.test_matrix || [])
     : []
-  const transcriptEntries = Array.isArray(reportV2?.transcript) && reportV2.transcript.length
-    ? reportV2.transcript
-    : detailTurns.map((turn) => ({ role: "candidate", speaker: "candidate", text: turn.response, content: turn.response }))
-
-  const integritySummary = reportV2?.integrity_summary || reportV2?.candidate_visible_integrity || {}
   const findings = Array.isArray(reportV2?.findings) ? reportV2.findings : []
   const nextRecommendedDate = reportV2?.next_recommended_session_date
   const questionSectionId = (turn: DetailedResponse) => `question-${turn.response_id || turn.question_id || turn.section_id || stableClientToken(`${turn.question}|${turn.response}`)}`
@@ -660,7 +655,6 @@ export default function InterviewReportPage() {
                   key={testRow.round_id || idx}
                   index={idx + 1}
                   sectionId={problemSectionId(testRow)}
-                  problemId={testRow.round_id || testRow.problem_id || stableClientToken(`${testRow.round_type || "technical"}|${testRow.prompt || testRow.title || "round"}`)}
                   title={testRow.title || `Problem ${idx + 1}`}
                   language={testRow.language || report.strictness_level}
                   score={testRow.final_pass_rate ?? testRow.score ?? null}
@@ -669,11 +663,6 @@ export default function InterviewReportPage() {
                   hiddenPassed={testRow.hidden_passed}
                   hiddenTotal={testRow.hidden_total}
                   approach={testRow.algorithm_pattern}
-                  idealSolution={
-                    testRow.ideal_solution ||
-                    (testRow.round_id && typeof reportV2?.ideal_solution === "object" && reportV2?.ideal_solution?.[testRow.round_id]) ||
-                    (technicalProblems.length === 1 ? reportV2?.ideal_solution : undefined)
-                  }
                   complexityDiff={
                     testRow.complexity_diff ||
                     (testRow.round_id && reportV2?.complexity_diff?.[testRow.round_id]) ||

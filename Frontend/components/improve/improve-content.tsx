@@ -1068,8 +1068,8 @@ function ActivityBody({
   if (node.activity_type === "compare_answers") return <CompareAnswersActivity node={node} draft={draft} setDraft={setDraft} />
   if (node.activity_type === "arrange_blocks") return <ArrangeBlocksActivity node={node} draft={draft} setDraft={setDraft} />
   if (node.activity_type === "rewrite_answer") return <RewriteAnswerActivity node={node} draft={draft} setDraft={setDraft} />
-  if (node.activity_type === "guided_spoken_response") return <SpokenResponseActivity node={node} draft={draft} setDraft={setDraft} />
-  return <CheckpointActivity node={node} draft={draft} setDraft={setDraft} />
+  if (node.activity_type === "guided_spoken_response") return <SpokenResponseActivity draft={draft} setDraft={setDraft} />
+  return <CheckpointActivity draft={draft} setDraft={setDraft} />
 }
 
 function CompareAnswersActivity({
@@ -1208,11 +1208,9 @@ function RewriteAnswerActivity({
 }
 
 function SpokenResponseActivity({
-  node,
   draft,
   setDraft,
 }: {
-  node: ImproveRoadmapNode
   draft: ActivityDraft
   setDraft: (draft: ActivityDraft) => void
 }) {
@@ -1227,11 +1225,9 @@ function SpokenResponseActivity({
 }
 
 function CheckpointActivity({
-  node,
   draft,
   setDraft,
 }: {
-  node: ImproveRoadmapNode
   draft: ActivityDraft
   setDraft: (draft: ActivityDraft) => void
 }) {

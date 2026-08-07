@@ -42,7 +42,7 @@ def _load_kokoro_pipeline_for_voice(voice: str):
             return _kokoro_pipelines[lang_code]
         try:
             from kokoro import KPipeline
-            pipeline = KPipeline(lang_code=lang_code)
+            pipeline = KPipeline(lang_code=lang_code, repo_id="hexgrad/Kokoro-82M")
             _kokoro_pipelines[lang_code] = pipeline
             _kokoro_synthesis_locks[lang_code] = threading.Lock()
             logger.info("Kokoro pipeline loaded for lang_code: %s", lang_code)

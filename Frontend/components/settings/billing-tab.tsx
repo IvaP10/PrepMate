@@ -2,7 +2,6 @@
 import { useState, useEffect } from "react"
 import { CreditCard, Download, Loader2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { toast } from "sonner"
 import { fetchPaymentSubscription, fetchPaymentTransactions } from "@/lib/api"
 import type { AuthUser } from "@/lib/auth"
 
@@ -52,7 +51,7 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
     ? "Premium includes higher weekly mock limits, technical rounds, custom JD-based rounds, code review, and priority support."
     : planType.includes("pro")
       ? "Pro includes weekly technical assessments, custom mock interviews, and higher mock interview limits."
-      : "Free includes 1 AI mock interview per week. Register by 30 July 2026 to get Premium free for 30 days."
+      : "Free includes 1 AI mock interview per week. Register by 31 August 2026 to get Premium free for 30 days."
 
   return (
     <div className="space-y-6">

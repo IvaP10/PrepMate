@@ -458,7 +458,9 @@ class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
             "question_count": 3,
             "duration_minutes": 45,
         }
-        with patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=[]), patch.object(
+        with patch.object(technical_mode.settings, "TECHNICAL_CODING_ONLY", False), patch.object(
+            technical_mode.settings, "TECHNICAL_ALLOW_AUTHORED_FALLBACK", True
+        ), patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=[]), patch.object(
             technical_mode, "_generate_ai_problem_set", new_callable=AsyncMock
         ) as generate:
             templates = await technical_mode._round_templates_for_profile(

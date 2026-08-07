@@ -242,7 +242,7 @@ class ReadinessContractTests(unittest.TestCase):
         self.assertFalse(payload["ready"])
         self.assertEqual(
             payload["message"],
-            "Technical round services are temporarily unavailable. Please try again shortly.",
+            "Technical code execution is temporarily unavailable. Try again when the secure executor is online.",
         )
         self.assertNotIn("sandbox_executor", payload["message"])
 

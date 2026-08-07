@@ -240,7 +240,7 @@ function CheckoutContent() {
           <p className="mt-2 text-sm leading-6 text-muted-foreground">{description}</p>
           {!isCreditsCheckout && selectedPlan?.plan_type?.includes("premium") && (
             <div className="mt-4 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium leading-5 text-primary">
-              New accounts registered by 30 July 2026 get 30 days of Premium free automatically at signup.
+              New accounts registered by 31 August 2026 get 30 days of Premium free automatically at signup.
             </div>
           )}
 

@@ -429,6 +429,47 @@ def validate_presented_question(
     return cleaned
 
 
+_FOLLOWUP_STOP_WORDS = {
+    "about", "after", "also", "answer", "because", "could", "did", "does", "from",
+    "give", "have", "into", "just", "like", "main", "make", "more", "most", "need",
+    "only", "really", "same", "some", "than", "that", "their", "then", "there", "this",
+    "what", "when", "where", "which", "while", "with", "would", "your", "you", "they",
+    "them", "were", "will", "used", "using", "use", "work", "worked", "working", "know",
+}
+
+
+def _grounding_terms(text: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9][a-z0-9+#./-]{2,}", str(text or "").lower())
+    return {token for token in tokens if token not in _FOLLOWUP_STOP_WORDS}
+
+
+def _candidate_anchor(candidate_response: str) -> str:
+    terms = []
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9+#./-]{2,}", str(candidate_response or "")):
+        if token.lower() in _FOLLOWUP_STOP_WORDS:
+            continue
+        if token.lower() not in {item.lower() for item in terms}:
+            terms.append(token)
+        if len(terms) == 3:
+            break
+    return " ".join(terms)
+
+
+def _followup_fallback(action: str, topic: str, candidate_response: str) -> str:
+    anchor = _candidate_anchor(candidate_response)
+    topic_text = re.sub(r"\s+", " ", str(topic or "this topic")).strip()
+    anchored = anchor or topic_text
+    templates = {
+        "clarify": f"You mentioned {anchored}; what is the main point, and what example supports it?",
+        "verify_contradiction": f"You mentioned {anchored}; which claim is correct, and what evidence supports it?",
+        "simplify_prerequisite": f"For {topic_text}, what is the core idea, and why is it needed?",
+        "probe_evidence": f"You mentioned {anchored}; what did you personally do, and what result did it produce?",
+        "challenge_tradeoff": f"You mentioned {anchored}; what alternative did you consider, and why did you choose this approach?",
+        "deepen": f"You mentioned {anchored}; what further detail would prove that approach works?",
+    }
+    return templates.get(action, f"What specific example from your answer best supports your point about {topic_text}?")
+
+
 def _metadata_resume_anchors(resume_context: str) -> Dict[str, Any]:
     redacted = redact_pii_text(resume_context or "")
     anchors = [line.strip() for line in redacted.splitlines() if line.strip()]
@@ -543,6 +584,7 @@ async def generate_contextual_followup(
     profile_type: str = "mid_tier",
     job_title: str = "",
     resume_context: str = "",
+    followup_action: str = "",
     question_id: Optional[str] = None,
     parent_question_id: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -582,6 +624,7 @@ async def generate_contextual_followup(
     response_truncated = data_block("candidate_response", candidate_response, 600)
 
     prompt = f"""You are a technical interviewer conducting a live interview. Topic: {battleground_label}
+Original question: {main_question}
 
 Recent conversation:
 {history_text}
@@ -595,14 +638,16 @@ Company profile follow-up instruction:
 {profile_instruction or "Keep the follow-up aligned with a balanced skills-focused interview."}
 Company profile type: {profile_type}
 Role target: {job_title or "General Interview"}
+Follow-up policy action: {followup_action or "adaptive_probe"}
 
 STRICT RULES:
 1. Your follow-up MUST be based on what the candidate ACTUALLY said (or didn't say). Do NOT ask a pre-written or generic question.
 2. If the candidate said something specific, reference it directly (e.g., "You mentioned X - can you explain how...")
 3. If the candidate gave a poor or off-topic answer, address that directly and re-probe the same topic area.
 4. Do NOT repeat a question that was already asked in the conversation history.
-5. Use natural spoken English and at most 28 words.
-6. Ask one focused question without a checklist, rubric language, or introductory commentary.
+5. Stay on the same topic as the original question; do not jump to another skill or a generic interview question.
+6. Use natural spoken English and at most 28 words.
+7. Ask one focused question without a checklist, rubric language, or introductory commentary.
 
 Return only the follow-up question as plain text."""
 
@@ -639,28 +684,38 @@ Return only the follow-up question as plain text."""
             },
         )
 
-        if performance_score <= 10:
-            fallback = f"What do you understand about {battleground_label} at a basic level?"
+        if followup_action:
+            action = followup_action
+        elif performance_score <= 10:
+            action = "simplify_prerequisite"
         elif performance_score < 50:
-            fallback = "What was the first step in your reasoning?"
+            action = "clarify"
         else:
-            fallback = "What specific example from your experience supports that answer?"
+            action = "probe_evidence"
+        fallback = _followup_fallback(action, battleground_label, candidate_response)
         followup = validate_presented_question(
             result.text,
             fallback=fallback,
             conversation_history=conversation_history,
         )
+        candidate_terms = _grounding_terms(candidate_response)
+        question_terms = _grounding_terms(followup)
+        if performance_score > 10 and candidate_terms and not candidate_terms.intersection(question_terms):
+            followup = fallback
         logger.info("Generated adaptive follow-up for score %.1f", performance_score)
         return followup
 
     except Exception as e:
         logger.error("Failed to generate contextual follow-up: %s", redact_text(e))
-        if performance_score <= 10:
-            return f"What do you understand about {battleground_label} at a basic level?"
+        if followup_action:
+            action = followup_action
+        elif performance_score <= 10:
+            action = "simplify_prerequisite"
         elif performance_score < 50:
-            return "What was the first step in your reasoning?"
+            action = "clarify"
         else:
-            return "What specific example from your experience supports that answer?"
+            action = "probe_evidence"
+        return _followup_fallback(action, battleground_label, candidate_response)
 
 def _fallback_knowledge_map(
     job_title: str,

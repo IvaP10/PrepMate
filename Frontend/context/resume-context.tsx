@@ -1,7 +1,7 @@
 'use client'
 
 import React, { createContext, useContext, useState, useCallback, useEffect } from 'react'
-import type { ResumeData, VerifyFormData } from '@/types/resume'
+import type { ResumeData } from '@/types/resume'
 import { getResume } from '@/lib/api'
 
 interface ResumeContextType {

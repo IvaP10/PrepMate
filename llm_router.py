@@ -118,6 +118,8 @@ def _model_for_event(event_type: Optional[str] = None) -> str:
         return settings.OPENAI_RESUME_MODEL or settings.OPENAI_CHAT_MODEL
     if event in {"question_generator_main", "question_generator_followup", "question_generator_knowledge_map"}:
         return settings.OPENAI_QUESTION_MODEL or settings.OPENAI_CHAT_MODEL
+    if event in {"technical_problem_generation", "technical_bank_authoring"}:
+        return settings.OPENAI_TECHNICAL_MODEL or settings.OPENAI_QUESTION_MODEL or settings.OPENAI_CHAT_MODEL
     if event in {
         "answer_semantic_evaluation",
         "response_semantic_evaluation",

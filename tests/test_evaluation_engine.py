@@ -13,6 +13,7 @@ def semantic_payload(**overrides):
         "contradictions": [],
         "evidence_quotes": [],
         "semantic_confidence": 0.85,
+        "answer_relevant": True,
         "suggested_followup": None,
     }
     payload.update(overrides)

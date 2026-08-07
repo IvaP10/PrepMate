@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { BriefcaseBusiness, Check, FileText, Loader2, Plus, Play, Trash2 } from "lucide-react"
+import { Check, FileText, Loader2, Plus, Play, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -129,26 +129,40 @@ export function InterviewSetupWizard({
   const [compileStage, setCompileStage] = useState<CompileStage>("idle")
   const [serviceReadiness, setServiceReadiness] = useState<"checking" | "ready" | "blocked">("checking")
   const [serviceReadinessMessage, setServiceReadinessMessage] = useState("")
+  const [readinessRetry, setReadinessRetry] = useState(0)
 
   useEffect(() => {
     let cancelled = false
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
     const flow = technical ? "technical" : "interview"
-    setServiceReadiness("checking")
-    setServiceReadinessMessage("")
-    void fetchFlowPreflight(flow)
-      .then((readiness) => {
+    const checkReadiness = async () => {
+      if (cancelled) return
+      setServiceReadiness("checking")
+      setServiceReadinessMessage("")
+      try {
+        const readiness = await fetchFlowPreflight(flow)
         if (cancelled) return
         setServiceReadiness(readiness.ready ? "ready" : "blocked")
         setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
-        if (readiness.ready) rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
-      })
-      .catch((error: any) => {
+        if (readiness.ready) {
+          rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
+          return
+        }
+      } catch (error: any) {
         if (cancelled) return
         setServiceReadiness("blocked")
         setServiceReadinessMessage(error?.message || "Service readiness could not be checked.")
-      })
-    return () => { cancelled = true }
-  }, [technical])
+      }
+      if (!cancelled) {
+        retryTimer = setTimeout(() => { void checkReadiness() }, 10_000)
+      }
+    }
+    void checkReadiness()
+    return () => {
+      cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
+    }
+  }, [readinessRetry, technical])
 
   useEffect(() => {
     let cancelled = false
@@ -330,12 +344,14 @@ export function InterviewSetupWizard({
         throw new Error(`A network connection is required before the ${technical ? "Technical Round" : "Interview Round"} can start.`)
       }
       const flow = technical ? "technical" : "interview"
+      if (technical) {
+        setCompileStage("screen")
+        const screen = await requestTechnicalScreenShare()
+        if (!screen.ok) throw new Error(screen.message)
+      }
       setCompileStage("camera")
       const media = await requestTechnicalMedia()
       if (!media.ok) throw new Error(media.message)
-      setCompileStage("screen")
-      const screen = await requestTechnicalScreenShare()
-      if (!screen.ok) throw new Error(screen.message)
 
       setCompileStage("blueprint")
       const payload: InterviewBlueprintRequest = {
@@ -419,7 +435,6 @@ export function InterviewSetupWizard({
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="text-sm font-semibold text-foreground">Saved roles and full job descriptions</p>
-                    <p className="mt-1 text-xs text-muted-foreground">Choose the company-specific environment for this round.</p>
                   </div>
                   {!showProfileForm && (
                     <Button type="button" variant="outline" size="sm" disabled={savingProfile || deletingProfileId !== null} onClick={startNewCustomTarget}>
@@ -443,12 +458,9 @@ export function InterviewSetupWizard({
                             onClick={() => void selectSavedTarget(job)}
                             className="min-w-0 flex-1 p-3 text-left disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            <span className="flex items-start justify-between gap-3">
-                              <span className="min-w-0">
-                                <span className="block truncate text-sm font-semibold text-foreground">{job.role}{job.company ? ` at ${job.company}` : ""}</span>
-                                <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{job.job_description || "No job description saved"}</span>
-                              </span>
-                              {selected ? <Check className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : <BriefcaseBusiness className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />}
+                            <span className="min-w-0">
+                              <span className="block truncate text-sm font-semibold text-foreground">{job.role}{job.company ? ` at ${job.company}` : ""}</span>
+                              <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{job.job_description || "No job description saved"}</span>
                             </span>
                           </button>
                           <Button
@@ -476,11 +488,11 @@ export function InterviewSetupWizard({
 
                 {showProfileForm && (
                   <div className="grid gap-4 md:grid-cols-2">
-                    <Field label="Role title"><Input value={role} onChange={(event) => setRole(event.target.value)} placeholder="Backend Engineer" /></Field>
-                    <Field label="Company"><Input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="Company name" /></Field>
+                    <Field label="Role title"><Input value={role} onChange={(event) => setRole(event.target.value)} placeholder="Backend Engineer" className="placeholder:text-muted-foreground/70" /></Field>
+                    <Field label="Company"><Input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="Company name" className="placeholder:text-muted-foreground/70" /></Field>
                     <div className="md:col-span-2">
                       <Field label="Job description">
-                        <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-28" />
+                        <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-28 placeholder:text-muted-foreground/70" />
                       </Field>
                     </div>
                     <div className="flex justify-end gap-2 md:col-span-2">
@@ -498,8 +510,13 @@ export function InterviewSetupWizard({
         </>
       )}
       {(assetError || compileError || profileError || serviceReadiness === "blocked") && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {compileError || profileError || serviceReadinessMessage || assetError}
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <span>{compileError || profileError || serviceReadinessMessage || assetError}</span>
+          {serviceReadiness === "blocked" && (
+            <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => setReadinessRetry((attempt) => attempt + 1)}>
+              Retry
+            </Button>
+          )}
         </div>
       )}
       {serviceReadiness === "checking" && (

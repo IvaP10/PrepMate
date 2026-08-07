@@ -1,7 +1,7 @@
 # ============================================================================
 # MODULE: technical_mode.py
-# PURPOSE: Technical interview rounds — AI-generated DSA prompts, code
-#          execution, whiteboard saves, anti-cheat event logging.
+# PURPOSE: Validated DSA problem-bank rounds, code execution, whiteboard
+#          saves, and anti-cheat event logging.
 # STRUCTURE:
 #   - Pydantic request models
 #   - AI problem generation and validation helpers
@@ -773,10 +773,14 @@ async def _load_technical_generation_context(
         "job_description": job_desc,
         "target_skills": target_skills,
         "programming_language": _selected_programming_language(settings_json),
-        "technical_round_types": _normalize_round_types(
-            settings_json.get("technical_rounds")
-            or settings_json.get("technical_round_types")
-            or ["coding", "debugging"]
+        "technical_round_types": (
+            ["coding"]
+            if settings.TECHNICAL_CODING_ONLY
+            else _normalize_round_types(
+                settings_json.get("technical_rounds")
+                or settings_json.get("technical_round_types")
+                or ["coding", "debugging"]
+            )
         ),
         "technical_topics": _string_list(
             [*(settings_json.get("technical_topics") or []), *requirement_topics, *blueprint_topics],
@@ -1979,7 +1983,11 @@ async def _round_templates_for_profile(
     context = {**(generation_context or {}), "profile_type": normalized}
     selected_language = _selected_programming_language(context)
     selected_starter = _starter_code_by_language()[selected_language]
-    round_types = _normalize_round_types(context.get("technical_round_types"))
+    round_types = (
+        ["coding"]
+        if settings.TECHNICAL_CODING_ONLY
+        else _normalize_round_types(context.get("technical_round_types"))
+    )
     question_count = max(1, min(12, int(context.get("question_count") or len(round_types))))
     requested_types = [round_types[index % len(round_types)] for index in range(question_count)]
     bank = await _load_active_problem_bank()
@@ -2012,16 +2020,38 @@ async def _round_templates_for_profile(
             )
             selected = next(
                 (item for item in supported if str(item.get("problem_id")) not in used_problem_ids),
-                supported[0],
+                None,
             )
+            if selected is None:
+                if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The validated technical problem bank has no unused problem for this round.",
+                    )
+                selected = supported[0]
             spec = dict(selected)
             used_problem_ids.add(str(spec.get("problem_id")))
         elif round_type == "coding":
+            if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Technical coding content is not ready. Please try again shortly.",
+                )
             spec = dict(authored_coding[authored_index % len(authored_coding)])
             authored_index += 1
         elif round_type == "debugging":
+            if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Technical debugging content is not ready. Please try again shortly.",
+                )
             spec = _authored_debugging_spec(context, selected_language)
         else:
+            if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Technical content is not ready. Please try again shortly.",
+                )
             spec = _noncoding_authored_spec(round_type, context)
 
         visible_tests = spec.get("visible_tests") if isinstance(spec.get("visible_tests"), list) else []
@@ -2213,7 +2243,7 @@ def _generation_summary(rows: List[Any]) -> Dict[str, Any]:
     return {
         "source": source,
         "generated_source": source,
-        "fallback": source == "fallback",
+        "fallback": source in {"fallback", "authored_fallback"},
         "error": metadata.get("generation_error") or "",
         **_executor_status_payload(),
     }

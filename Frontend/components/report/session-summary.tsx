@@ -1,5 +1,3 @@
-import React from "react"
-
 interface SessionSummaryProps {
   summary: string
   interviewerSignal?: string

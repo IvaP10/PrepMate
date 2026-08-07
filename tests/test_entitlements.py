@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 os.environ.setdefault("JWT_SECRET", "test-secret-for-plan-normalization-123456")
 
@@ -10,7 +11,13 @@ from entitlements import (
     normalize_technical_profile,
     public_exercise_modes,
 )
-from auth import normalize_effective_plan_type
+from auth import (
+    SIGNUP_PROMO_CUTOFF_UTC,
+    SIGNUP_PROMO_DURATION_DAYS,
+    SIGNUP_PROMO_PLAN_TYPE,
+    is_signup_promo_active,
+    normalize_effective_plan_type,
+)
 
 
 class FakeCursor:
@@ -66,3 +73,11 @@ def test_effective_plan_defaults_to_starter_without_active_subscription():
 def test_effective_plan_uses_active_paid_subscription():
     assert normalize_effective_plan_type("starter", "pro") == "pro"
     assert normalize_effective_plan_type("starter", "premium_annual") == "premium_annual"
+
+
+def test_signup_promo_grants_premium_through_august_31_2026():
+    assert SIGNUP_PROMO_PLAN_TYPE == "premium"
+    assert SIGNUP_PROMO_DURATION_DAYS == 30
+    assert SIGNUP_PROMO_CUTOFF_UTC == datetime(2026, 8, 31, 23, 59, 59, tzinfo=timezone.utc)
+    assert is_signup_promo_active(SIGNUP_PROMO_CUTOFF_UTC)
+    assert not is_signup_promo_active(SIGNUP_PROMO_CUTOFF_UTC + timedelta(seconds=1))

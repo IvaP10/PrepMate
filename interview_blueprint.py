@@ -68,6 +68,29 @@ def canonical_skill_key(value: str) -> str:
     return f"technical:{slug[:80]}"
 
 
+def weakness_label(skill_key: Any, fallback: Any = "") -> Optional[str]:
+    """Return a human interview topic from persisted learner-state keys."""
+
+    raw_key = _text(skill_key or fallback, 120)
+    namespace, _, tail = raw_key.partition(":")
+    label = tail if tail else raw_key
+    if namespace.lower() in {"technical", "algorithm", "debugging"}:
+        label = re.sub(r"^(?:technical|algorithm|debugging)[\s_-]+", "", label, flags=re.IGNORECASE)
+    else:
+        label = re.sub(r"^(?:technical\s+)+", "", label, flags=re.IGNORECASE)
+    label = re.sub(r"[_-]+", " ", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    if label.lower() in {"warm up", "warmup", "general", "general interview"}:
+        return None
+    if not label:
+        return None
+    words = []
+    aliases = {"api": "API", "apis": "APIs", "dsa": "DSA", "sql": "SQL", "fastapi": "FastAPI", "postgresql": "PostgreSQL", "redis": "Redis", "python": "Python"}
+    for word in label.split():
+        words.append(aliases.get(word.lower(), word[:1].upper() + word[1:]))
+    return " ".join(words)[:100]
+
+
 def _jd_skill_names(job_description: str) -> List[str]:
     lowered = _text(job_description, 12000).lower()
     found: List[str] = []
@@ -233,14 +256,20 @@ def compile_interview_blueprint(
             return
         sections.append(section)
 
-    for index, weakness in enumerate(weaknesses[:2], start=1):
-        label = _text(weakness.get("label") or weakness.get("skill_key") or "Priority weakness", 80)
+    weakness_index = 0
+    for weakness in weaknesses:
+        label = weakness_label(weakness.get("skill_key"), weakness.get("label"))
+        if not label:
+            continue
+        weakness_index += 1
+        if weakness_index > 2:
+            break
         add(_section(
-            section_id=f"weakness-{index}",
+            section_id=f"weakness-{weakness_index}",
             label=label,
             kind="technical",
             anchor=label,
-            question=f"Where did {label} matter most in a real project?",
+            question=f"What did you personally own when you used {label} in a real project?",
             importance="critical",
             difficulty="diagnostic",
             selection_reason="Repeated or low-confidence weakness from prior evidence",

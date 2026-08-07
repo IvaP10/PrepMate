@@ -57,6 +57,7 @@
       "contradictions": [],
       "evidence_quotes": ["The trade-off is storage and slower writes"],
       "semantic_confidence": 0.9,
+      "answer_relevant": true,
       "suggested_followup": null
     },
     "expected_followup": "challenge_tradeoff",
@@ -77,6 +78,7 @@
       "contradictions": ["The deployed policy is described as both write-through and write-back."],
       "evidence_quotes": ["I also called the same deployed policy write-back"],
       "semantic_confidence": 0.92,
+      "answer_relevant": true,
       "suggested_followup": "Verify the deployment setting."
     },
     "expected_followup": "verify_contradiction",
@@ -108,6 +110,7 @@
       "contradictions": [],
       "evidence_quotes": ["Requests entered the gateway"],
       "semantic_confidence": 0.9,
+      "answer_relevant": true,
       "suggested_followup": null
     },
     "expected_followup": "probe_evidence",
@@ -128,6 +131,7 @@
       "contradictions": [],
       "evidence_quotes": ["I store the first committed result", "I eliminated all failures forever"],
       "semantic_confidence": 0.88,
+      "answer_relevant": true,
       "suggested_followup": null
     },
     "expected_followup": "advance",

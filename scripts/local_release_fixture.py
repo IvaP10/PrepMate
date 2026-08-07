@@ -130,7 +130,27 @@ def seed(api_base_url: str, output: Path) -> dict:
                         ),
                     },
                 ).json()
-        resume_id = str(resume_upload["resume"]["resume_id"])
+        resume_record = resume_upload["resume"]
+        resume_id = str(resume_record["resume_id"])
+        if not resume_record.get("facts"):
+            versions_payload = _request(client, "GET", "/api/pre-interview/resumes").json()
+            resume_record = next(
+                (item for item in (versions_payload.get("resumes") or []) if str(item.get("resume_id")) == resume_id),
+                resume_record,
+            )
+        pending_facts = [
+            {"fact_id": str(fact["fact_id"]), "action": "confirm"}
+            for fact in (resume_record.get("facts") or [])
+            if str(fact.get("status") or "pending").lower() == "pending"
+        ]
+        if pending_facts:
+            _request(
+                client,
+                "PATCH",
+                f"/api/pre-interview/resumes/{resume_id}/facts",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"decisions": pending_facts},
+            )
         job_profile = _request(
             client,
             "POST",

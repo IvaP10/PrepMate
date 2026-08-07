@@ -17,7 +17,7 @@ services:
     env_file: [../../key.env]
     environment:
       SANDBOX_RUNTIME_IMAGE: interai-sandbox-runtime:2026-07-v1
-      SANDBOX_OCI_RUNTIME: runsc
+      SANDBOX_OCI_RUNTIME: ${SANDBOX_OCI_RUNTIME:-runsc}
       SANDBOX_TIMEOUT_MS: "2000"
       SANDBOX_ABSOLUTE_TIMEOUT_MS: "10000"
       SANDBOX_MAX_CONCURRENT_EXECUTIONS: "1"

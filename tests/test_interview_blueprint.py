@@ -55,6 +55,27 @@ def test_prior_weakness_is_prioritized_and_duration_is_bounded():
     assert len(result["battlegrounds"]) >= 4
 
 
+def test_prior_weakness_labels_are_normalized_into_interview_questions():
+    result = compile_interview_blueprint(
+        resume_data=_resume(),
+        job_title="Backend Engineer",
+        job_description="Python APIs",
+        interview_type="Mock Interview",
+        duration_minutes=30,
+        profile_type="mid_tier",
+        previous_weaknesses=[
+            {"skill_key": "technical:technical-python"},
+            {"skill_key": "technical:warm-up"},
+        ],
+    )
+
+    first = result["battlegrounds"][0]
+    assert first["label"] == "Python"
+    assert first["opening_question"] == "What did you personally own when you used Python in a real project?"
+    assert all("Technical Technical" not in item["label"] for item in result["battlegrounds"])
+    assert all("Warm Up" not in item["label"] for item in result["battlegrounds"])
+
+
 def test_blueprint_contains_no_placeholder_questions():
     result = compile_interview_blueprint(
         resume_data={"skills": [], "projects": []},

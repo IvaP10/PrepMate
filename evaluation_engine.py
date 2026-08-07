@@ -46,6 +46,7 @@ SEMANTIC_RESPONSE_SCHEMA: Dict[str, Any] = {
         "contradictions",
         "evidence_quotes",
         "semantic_confidence",
+        "answer_relevant",
         "suggested_followup",
     ],
     "properties": {
@@ -78,6 +79,9 @@ SEMANTIC_RESPONSE_SCHEMA: Dict[str, Any] = {
             "type": "number",
             "minimum": 0,
             "maximum": 1,
+        },
+        "answer_relevant": {
+            "type": "boolean",
         },
         "suggested_followup": {
             "anyOf": [
@@ -633,6 +637,8 @@ def _semantic_policy(
     word_count = int(signals.get("word_count") or 0)
     if word_count < 12:
         return False, "insufficient_answer"
+    if float(signals["lexical_relevance"]["score"]) < 25:
+        return True, "low_lexical_relevance_requires_relevance_check"
     if prior_evaluations:
         return True, "prior_answers_require_consistency_check"
     if _rubric_requires_semantics(rubric):
@@ -693,7 +699,10 @@ def _semantic_messages(
 ) -> List[Dict[str, str]]:
     system_message = (
         "You are a semantic evidence analyst for an interview evaluator. "
-        "Extract coverage and contradictions; do not assign scores or choose an interview action. "
+        "Extract coverage, relevance, and contradictions; do not assign scores or choose an interview action. "
+        "Set answer_relevant to true only when the candidate directly answers the original question; "
+        "set it to false for nonsense, unrelated content, refusal without an answer, or an answer that "
+        "does not address the requested subject. "
         "Return only server-supplied expected-point IDs and claim IDs, never labels you invent. "
         "Use the rubric as the source of expected points. Mark a claim incorrect only when the supplied "
         "rubric/context supports that judgment; otherwise leave it unclassified. Every evidence quote must "
@@ -751,6 +760,7 @@ def _validate_semantic_payload(
     contradictions = _clean_string_list(payload.get("contradictions"), max_items=8)
     raw_quotes = _clean_string_list(payload.get("evidence_quotes"), max_items=8)
     confidence = payload.get("semantic_confidence")
+    answer_relevant = payload.get("answer_relevant")
     suggested = payload.get("suggested_followup")
     if any(item is None for item in (covered, missed, incorrect, contradictions, raw_quotes)):
         return None, "invalid_response_types", 0
@@ -760,6 +770,8 @@ def _validate_semantic_payload(
         or not math.isfinite(float(confidence))
     ):
         return None, "invalid_semantic_confidence", 0
+    if not isinstance(answer_relevant, bool):
+        return None, "invalid_answer_relevance", 0
     if suggested is not None and not isinstance(suggested, str):
         return None, "invalid_suggested_followup", 0
 
@@ -789,6 +801,7 @@ def _validate_semantic_payload(
         "contradictions": contradictions or [],
         "evidence_quotes": validated_quotes,
         "semantic_confidence": round(max(0.0, min(1.0, float(confidence))), 3),
+        "answer_relevant": answer_relevant,
         "suggested_followup": suggested.strip()[:400] if isinstance(suggested, str) and suggested.strip() else None,
         "discarded_reference_count": discarded_references,
     }
@@ -988,7 +1001,11 @@ def _follow_up_decision(
     contradictions = list(semantic.get("contradictions") or []) if semantic else []
     semantic_confidence = float(semantic.get("semantic_confidence") or 0.0) if semantic else 0.0
 
-    if word_count < 8 or ((relevance < 15 or directness < 25) and not covered):
+    if semantic and semantic.get("answer_relevant") is False:
+        action = "clarify"
+        reason = "answer_not_relevant"
+        prompt = "That answer did not address the question. Please answer it directly and stay on the requested topic."
+    elif word_count < 8 or ((relevance < 15 or directness < 25) and not covered):
         action = "clarify"
         reason = "answer_too_brief_or_unclear"
         prompt = "Could you answer the question directly, then explain your reasoning in one or two steps?"
@@ -1266,6 +1283,7 @@ async def evaluate_answer(
             "reason": semantic_reason,
             "policy_reason": policy_reason,
             "semantic_confidence": semantic.get("semantic_confidence") if semantic else None,
+            "answer_relevant": semantic.get("answer_relevant") if semantic else None,
             "discarded_evidence_quote_count": discarded_quote_count,
             "discarded_reference_count": (
                 int(semantic.get("discarded_reference_count") or 0)

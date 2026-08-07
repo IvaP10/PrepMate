@@ -1,6 +1,5 @@
 "use client"
 
-import React from "react"
 import { ShieldCheck, ShieldAlert, ShieldX, AlertTriangle } from "lucide-react"
 import type { ProctoringAuditSection, Severity } from "@/types/premium-report"
 

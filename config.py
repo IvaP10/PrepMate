@@ -75,6 +75,7 @@ class Settings:
     OPENAI_REPORT_MODEL: str = os.getenv("OPENAI_REPORT_MODEL", "gpt-5-mini")
     OPENAI_RESUME_MODEL: str = os.getenv("OPENAI_RESUME_MODEL", "gpt-4o-mini")
     OPENAI_QUESTION_MODEL: str = os.getenv("OPENAI_QUESTION_MODEL", "gpt-5-mini")
+    OPENAI_TECHNICAL_MODEL: str = os.getenv("OPENAI_TECHNICAL_MODEL", "gpt-5.2")
     OPENAI_EVALUATION_MODEL: str = os.getenv("OPENAI_EVALUATION_MODEL", "gpt-5-nano")
     OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
     MODEL_DEFAULT_POLICY: str = os.getenv("MODEL_DEFAULT_POLICY", "openai_required")
@@ -138,6 +139,19 @@ class Settings:
     JUDGE0_API_KEY: str = os.getenv("JUDGE0_API_KEY", "")
     JUDGE0_TIMEOUT_SECONDS: int = int(os.getenv("JUDGE0_TIMEOUT_SECONDS", "15"))
     TECHNICAL_FAST_FALLBACK_FIRST: bool = os.getenv("TECHNICAL_FAST_FALLBACK_FIRST", "false").lower() == "true"
+    TECHNICAL_CODING_ONLY: bool = os.getenv("TECHNICAL_CODING_ONLY", "true").lower() == "true"
+    TECHNICAL_ALLOW_AUTHORED_FALLBACK: bool = os.getenv(
+        "TECHNICAL_ALLOW_AUTHORED_FALLBACK", "false"
+    ).lower() == "true"
+    TECHNICAL_MIN_ACTIVE_PROBLEMS: int = int(os.getenv("TECHNICAL_MIN_ACTIVE_PROBLEMS", "48"))
+    TECHNICAL_MIN_CODING_PROBLEMS: int = int(os.getenv("TECHNICAL_MIN_CODING_PROBLEMS", "48"))
+    TECHNICAL_BANK_VERSION: str = os.getenv("TECHNICAL_BANK_VERSION", "technical-bank-v1")
+    TECHNICAL_REQUIRED_TAXONOMIES: str = os.getenv(
+        "TECHNICAL_REQUIRED_TAXONOMIES",
+        "arrays,hashing,prefix-sum,sliding-window,two-pointers,intervals,greedy,binary-search,"
+        "stack,queue,linked-list,trees,heaps,graphs,backtracking,strings,tries,dynamic-programming,"
+        "bit-manipulation",
+    )
     E2B_API_KEY: str = os.getenv("E2B_API_KEY", "")
     GPTZERO_API_KEY: str = os.getenv("GPTZERO_API_KEY", "")
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")

@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState } from "react"
+import { useState } from "react"
 import { Code2, CheckCircle2, XCircle, AlertCircle, ChevronDown, ChevronUp } from "lucide-react"
 
 interface Annotation {
@@ -16,7 +16,6 @@ interface Annotation {
 interface ProblemDeepDiveProps {
   index: number
   sectionId?: string
-  problemId: string
   title: string
   language?: string
   score?: number | null
@@ -25,7 +24,6 @@ interface ProblemDeepDiveProps {
   hiddenPassed?: number
   hiddenTotal?: number
   approach?: string
-  idealSolution?: string | { approach?: string; complexity?: string }
   complexityDiff?: Record<string, any>
   annotations?: Annotation[]
   rawCode?: string
@@ -36,7 +34,6 @@ interface ProblemDeepDiveProps {
 export function ProblemDeepDive({
   index,
   sectionId,
-  problemId,
   title,
   language,
   score = null,
@@ -45,7 +42,6 @@ export function ProblemDeepDive({
   hiddenPassed,
   hiddenTotal,
   approach,
-  idealSolution,
   complexityDiff,
   annotations = [],
   rawCode,

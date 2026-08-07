@@ -30,7 +30,7 @@ export function AnnouncementBar({ onDismiss }: AnnouncementBarProps) {
       <p className="relative text-[11px] sm:text-xs font-semibold text-foreground/80 tracking-wide">
         <span className="font-bold">Early Bird Offer</span>
         <span className="mx-1.5 text-foreground/30">·</span>
-        <span className="text-foreground/60">Register by 30 July 2026 to get Premium free for 30 days</span>
+        <span className="text-foreground/60">Register by 31 August 2026 to get Premium free for 30 days</span>
       </p>
 
       <button

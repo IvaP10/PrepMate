@@ -64,13 +64,29 @@ def test_openai_readiness_probes_and_caches_model_availability(monkeypatch):
             return None
 
         def json(self):
-            return {"id": "configured-model"}
+            return {
+                "data": [
+                    {"id": model}
+                    for model in (
+                        "configured-model",
+                        "question-model",
+                        "technical-model",
+                        "evaluation-model",
+                        "report-model",
+                        "resume-model",
+                        "transcribe-model",
+                    )
+                ]
+            }
 
     calls = []
     monkeypatch.setattr(app.settings, "OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(app.settings, "OPENAI_CHAT_MODEL", "configured-model")
+    monkeypatch.setattr(app.settings, "OPENAI_QUESTION_MODEL", "question-model")
+    monkeypatch.setattr(app.settings, "OPENAI_TECHNICAL_MODEL", "technical-model")
     monkeypatch.setattr(app.settings, "OPENAI_EVALUATION_MODEL", "evaluation-model")
     monkeypatch.setattr(app.settings, "OPENAI_REPORT_MODEL", "report-model")
+    monkeypatch.setattr(app.settings, "OPENAI_RESUME_MODEL", "resume-model")
     monkeypatch.setattr(app.settings, "OPENAI_TRANSCRIBE_MODEL", "transcribe-model")
     monkeypatch.setattr(app.httpx, "get", lambda *args, **kwargs: calls.append((args, kwargs)) or Response())
     app._openai_probe_cache.update({"checked_at": 0.0, "result": None})
@@ -83,7 +99,7 @@ def test_openai_readiness_probes_and_caches_model_availability(monkeypatch):
     assert second["healthy"] is True
     assert second["cached"] is True
     assert len(calls) == 1
-    assert calls[0][1]["timeout"] == 2.5
+    assert calls[0][1]["timeout"] == 5.0
 
 
 def test_openai_readiness_fails_closed_without_sending_error_details(monkeypatch):
@@ -107,7 +123,20 @@ def test_failed_openai_probe_is_retried_quickly(monkeypatch):
             return None
 
         def json(self):
-            return {"id": "configured-model"}
+            return {
+                "data": [
+                    {"id": model}
+                    for model in (
+                        "configured-model",
+                        "question-model",
+                        "technical-model",
+                        "evaluation-model",
+                        "report-model",
+                        "resume-model",
+                        "transcribe-model",
+                    )
+                ]
+            }
 
     clock = {"now": 100.0}
     calls = {"count": 0}
@@ -120,8 +149,11 @@ def test_failed_openai_probe_is_retried_quickly(monkeypatch):
 
     monkeypatch.setattr(app.settings, "OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(app.settings, "OPENAI_CHAT_MODEL", "configured-model")
+    monkeypatch.setattr(app.settings, "OPENAI_QUESTION_MODEL", "question-model")
+    monkeypatch.setattr(app.settings, "OPENAI_TECHNICAL_MODEL", "technical-model")
     monkeypatch.setattr(app.settings, "OPENAI_EVALUATION_MODEL", "evaluation-model")
     monkeypatch.setattr(app.settings, "OPENAI_REPORT_MODEL", "report-model")
+    monkeypatch.setattr(app.settings, "OPENAI_RESUME_MODEL", "resume-model")
     monkeypatch.setattr(app.settings, "OPENAI_TRANSCRIBE_MODEL", "transcribe-model")
     monkeypatch.setattr(app.httpx, "get", get)
     monkeypatch.setattr(app.time, "monotonic", lambda: clock["now"])

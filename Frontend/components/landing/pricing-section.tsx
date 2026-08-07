@@ -75,7 +75,6 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
         <div className={`pricing-window-set mt-7 grid gap-3 lg:grid-cols-3 ${isVisible ? "animate-fade-in-up delay-200" : "opacity-0"}`}>
           {plans.map((plan, planIndex) => {
             const price = plan.name === "Pro" ? prices.pro : plan.name === "Premium" ? prices.premium : null
-            const displayedPrice = price ? formatPrice(price[annual ? "annual" : "monthly"]) : plan.price
             const windowShape = planIndex === 0
               ? "lg:[border-radius:1.75rem_1.15rem_1.35rem_2rem] lg:[transform:rotateY(3.5deg)_translateX(5px)] lg:[transform-origin:right_center]"
               : planIndex === 1
@@ -99,7 +98,21 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
                     {plan.highlighted && <span className="rounded-full bg-primary px-2.5 py-1 text-[10px] font-semibold text-primary-foreground">Recommended</span>}
                   </div>
                   <p className="mt-3 min-h-10 text-sm leading-5 text-muted-foreground">{plan.description}</p>
-                  <div className="mt-4 flex items-baseline gap-2" aria-live="polite"><span key={`${plan.name}-${billing}`} className="animate-blur-in text-4xl font-semibold tracking-tight text-foreground">{displayedPrice}</span>{price && <span className="text-sm text-muted-foreground">/ month</span>}</div>
+                  <div className="mt-4 flex items-baseline gap-2" aria-live="polite">
+                    {price ? (
+                      <>
+                        <span className={`font-semibold tracking-tight transition-all duration-500 ease-out ${annual ? "text-lg text-muted-foreground line-through opacity-60" : "text-4xl text-foreground"}`}>
+                          {formatPrice(price.monthly)}
+                        </span>
+                        <span className={`origin-left overflow-hidden whitespace-nowrap font-semibold tracking-tight transition-all duration-500 ease-out ${annual ? "text-4xl text-foreground opacity-100 translate-x-0 max-w-[150px] scale-100" : "text-lg text-transparent opacity-0 -translate-x-2 max-w-0 scale-75 pointer-events-none"}`}>
+                          {formatPrice(price.annual)}
+                        </span>
+                        <span className="text-sm text-muted-foreground">/ month</span>
+                      </>
+                    ) : (
+                      <span className="text-4xl font-semibold tracking-tight text-foreground">{plan.price}</span>
+                    )}
+                  </div>
                   <p className="mt-1 min-h-4 text-xs text-muted-foreground">{annual && price ? `Billed ${formatPrice(price.annualBilled)} yearly` : price ? "Billed monthly" : "No payment required"}</p>
 
                   <ul className="mt-6 space-y-2">
@@ -111,7 +124,7 @@ export function PricingSection({ onGetStarted }: PricingSectionProps) {
             )
           })}
         </div>
-        <p className="mx-auto mt-7 max-w-2xl text-center text-xs leading-5 text-muted-foreground">Early Bird: new registrations before 30 July 2026 receive Premium free for 30 days. Cancel any time.</p>
+        <p className="mx-auto mt-7 max-w-2xl text-center text-xs leading-5 text-muted-foreground">Early Bird: new registrations by 31 August 2026 receive Premium free for 30 days. Cancel any time.</p>
       </div>
     </section>
   )

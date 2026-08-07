@@ -572,14 +572,17 @@ def _openai_probe_cache_fresh(cached: Optional[dict], checked_at: Any, now: floa
 def _openai_configuration_check() -> dict:
     models = {
         "chat": settings.OPENAI_CHAT_MODEL,
+        "question": settings.OPENAI_QUESTION_MODEL,
+        "technical": settings.OPENAI_TECHNICAL_MODEL,
         "evaluation": settings.OPENAI_EVALUATION_MODEL,
         "report": settings.OPENAI_REPORT_MODEL,
+        "resume": settings.OPENAI_RESUME_MODEL,
         "transcription": settings.OPENAI_TRANSCRIBE_MODEL,
     }
     configured = bool(str(settings.OPENAI_API_KEY).strip()) and all(
         bool(str(model).strip()) for model in models.values()
     )
-    base = {"configured": configured, "models": models, "probe": "model_availability"}
+    base = {"configured": configured, "models": models, "probe": "model_catalog"}
     if not configured:
         return {**base, "healthy": False, "error": "openai_not_configured"}
 
@@ -595,21 +598,114 @@ def _openai_configuration_check() -> dict:
             return {**base, **cached, "cached": True}
         try:
             response = httpx.get(
-                f"https://api.openai.com/v1/models/{settings.OPENAI_CHAT_MODEL}",
+                "https://api.openai.com/v1/models",
                 headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
-                timeout=2.5,
+                timeout=5.0,
             )
             response.raise_for_status()
             payload = response.json()
-            healthy = isinstance(payload, dict) and bool(payload.get("id"))
-            result = {"healthy": healthy}
+            if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+                available = {
+                    str(item.get("id"))
+                    for item in payload["data"]
+                    if isinstance(item, dict) and item.get("id")
+                }
+            elif isinstance(payload, dict) and payload.get("id"):
+                available = {str(payload["id"])}
+            else:
+                available = set()
+
+            def model_available(model: str) -> bool:
+                return any(model == item or item.startswith(f"{model}-") for item in available)
+
+            missing_models = [
+                role for role, model in models.items()
+                if not model_available(str(model))
+            ]
+            healthy = bool(available) and not missing_models
+            result = {
+                "healthy": healthy,
+                "available_model_count": len(available),
+                "missing_models": missing_models,
+            }
             if not healthy:
-                result["error"] = "openai_probe_invalid_response"
+                result["error"] = "openai_models_unavailable" if missing_models else "openai_probe_invalid_response"
         except Exception:
             result = {"healthy": False, "error": "openai_unavailable"}
         _openai_probe_cache["checked_at"] = time.monotonic()
         _openai_probe_cache["result"] = result
         return {**base, **result, "cached": False}
+
+
+def _technical_content_check() -> dict:
+    required_taxonomies = {
+        item.strip().lower()
+        for item in str(settings.TECHNICAL_REQUIRED_TAXONOMIES or "").split(",")
+        if item.strip()
+    }
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT round_type, taxonomy_keys, spec_json, validation_result
+                FROM TechnicalProblemBank
+                WHERE status = 'active'
+                """
+            )
+            rows = cursor.fetchall() or []
+        finally:
+            cursor.close()
+            return_db_connection(connection)
+    except Exception:
+        return {
+            "healthy": False,
+            "error": "technical_problem_bank_unavailable",
+            "active_count": 0,
+            "coding_count": 0,
+            "missing_taxonomies": sorted(required_taxonomies),
+            "bank_version": settings.TECHNICAL_BANK_VERSION,
+        }
+
+    active_count = 0
+    coding_count = 0
+    covered: set[str] = set()
+    for row in rows:
+        validation = row[3] if isinstance(row[3], dict) else {}
+        if not (
+            validation.get("passed")
+            or validation.get("valid")
+            or str(validation.get("status") or "").lower() in {"passed", "validated", "active"}
+        ):
+            continue
+        active_count += 1
+        if str(row[0] or "").lower() == "coding":
+            coding_count += 1
+        taxonomy_values = row[1] if isinstance(row[1], list) else []
+        spec_json = row[2] if isinstance(row[2], dict) else {}
+        taxonomy_values = [*taxonomy_values, spec_json.get("algorithm_pattern") or ""]
+        for value in taxonomy_values:
+            normalized = str(value or "").lower().replace("_", "-").replace(" ", "-")
+            covered.update(
+                taxonomy for taxonomy in required_taxonomies
+                if taxonomy in normalized
+            )
+
+    missing_taxonomies = sorted(required_taxonomies - covered)
+    healthy = (
+        active_count >= max(1, int(settings.TECHNICAL_MIN_ACTIVE_PROBLEMS))
+        and coding_count >= max(1, int(settings.TECHNICAL_MIN_CODING_PROBLEMS))
+        and not missing_taxonomies
+    )
+    return {
+        "healthy": healthy,
+        "error": None if healthy else "technical_content_incomplete",
+        "active_count": active_count,
+        "coding_count": coding_count,
+        "missing_taxonomies": missing_taxonomies,
+        "bank_version": settings.TECHNICAL_BANK_VERSION,
+    }
 
 
 def _is_private_service_url(value: str) -> bool:
@@ -765,6 +861,7 @@ async def collect_readiness() -> dict:
         _safe_readiness_check("redis", asyncio.to_thread(_redis_check)),
         _safe_readiness_check("workers_jobs", asyncio.to_thread(_worker_and_job_check)),
         _safe_readiness_check("openai", asyncio.to_thread(_openai_configuration_check)),
+        _safe_readiness_check("technical_content", asyncio.to_thread(_technical_content_check)),
         _safe_readiness_check("sandbox_executor", _sandbox_executor_check()),
         _safe_readiness_check("payments", asyncio.to_thread(_payment_configuration_check)),
     ))
@@ -861,7 +958,7 @@ async def persist_flow_preflight(
         request.camera_ready
         and request.microphone_ready
         and request.microphone_level_detected
-        and request.screen_share_ready
+        and (request.flow == "interview" or request.screen_share_ready)
         and request.network_ready
     )
     if not required_browser_ready:

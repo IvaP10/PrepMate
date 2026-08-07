@@ -2,15 +2,8 @@
 import { useState, useEffect, useRef, useCallback } from "react"
 import { useParams, useRouter, useSearchParams } from "next/navigation"
 import { toast } from "sonner"
-import { ArrowLeft, Brain, Eye, Clock, MicOff, X, AlertTriangle } from "lucide-react"
-import { InterviewHeader } from "@/components/interview/interview-header"
+import { Clock, MicOff, AlertTriangle } from "lucide-react"
 import { InterviewControls } from "@/components/interview/interview-controls"
-import { WaveformVisualizer } from "@/components/interview/waveform-visualizer"
-import { LiveTranscription } from "@/components/interview/live-transcription"
-import { PerformanceMetrics } from "@/components/interview/performance-metrics"
-import { SelfView } from "@/components/interview/self-view"
-import { HintPanel } from "@/components/interview/hint-panel"
-import { AvatarView } from "@/components/interview/avatar-view"
 import { AnalyzingOverlay } from "@/components/interview/analyzing-overlay"
 import { useVAD } from "@/hooks/use-vad"
 import { useFaceCheck } from "@/hooks/use-face-check"
@@ -22,13 +15,9 @@ import { API_CONFIG } from "@/lib/config"
 import { abandonInterviewSession, cancelInterviewSession, endInterviewSession } from "@/lib/api"
 import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
 import {
-  getTechnicalPermissionState,
   getTechnicalCameraStream,
   getTechnicalMicrophoneStream,
   releaseTechnicalPermissions,
-  requestTechnicalScreenShare,
-  subscribeTechnicalPermissionState,
-  type TechnicalPermissionState,
 } from "@/lib/technical-permissions"
 type SessionMode = "mock-ai" | "mock-voice"
 type InterviewState = "connecting" | "ready" | "active" | "recovering" | "ending" | "analyzing" | "complete"
@@ -46,6 +35,35 @@ interface TranscriptMessage {
   text: string
   isPartial?: boolean
   questionId?: string
+}
+type BrowserSpeechRecognitionResult = {
+  isFinal: boolean
+  0: { transcript: string }
+}
+type BrowserSpeechRecognitionResults = {
+  length: number
+  [index: number]: BrowserSpeechRecognitionResult
+}
+type BrowserSpeechRecognition = {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  maxAlternatives: number
+  onresult: ((event: { resultIndex: number; results: BrowserSpeechRecognitionResults }) => void) | null
+  onend: (() => void) | null
+  onerror: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition
+
+function getBrowserSpeechRecognition(): BrowserSpeechRecognitionConstructor | null {
+  if (typeof window === "undefined") return null
+  const browserWindow = window as Window & {
+    SpeechRecognition?: BrowserSpeechRecognitionConstructor
+    webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor
+  }
+  return browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition || null
 }
 function buildInterviewWsUrl(apiBase: string, ticket: string) {
   const hostBase = /^https?:\/\//i.test(apiBase)
@@ -80,7 +98,6 @@ export default function InterviewRoom() {
   const [hints, setHints] = useState<string[]>([])
   const [isConnected, setIsConnected] = useState(false)
   const [interviewState, setInterviewState] = useState<InterviewState>("connecting")
-  const [isMobile, setIsMobile] = useState(false)
   const [currentQuestion, setCurrentQuestion] = useState("")
   const [currentTopic, setCurrentTopic] = useState("")
   const [progress, setProgress] = useState("")
@@ -96,9 +113,6 @@ export default function InterviewRoom() {
   const [interviewerName, setInterviewerName] = useState("Interviewer")
   const [interviewerTitle, setInterviewerTitle] = useState("Interview Round")
   const [jobContext, setJobContext] = useState<JobContext | null>(null)
-  const [permissionState, setPermissionState] = useState<TechnicalPermissionState>(() => getTechnicalPermissionState())
-  const [permissionError, setPermissionError] = useState("")
-  const [requestingPermissions, setRequestingPermissions] = useState(false)
   const [textAnswer, setTextAnswer] = useState("")
   const [textSubmitting, setTextSubmitting] = useState(false)
   const activeAudioRef = useRef<HTMLAudioElement[]>([])
@@ -119,7 +133,6 @@ export default function InterviewRoom() {
   const lastQuestionIdRef = useRef<string | null>(null)
   const lastFaceMetricSentRef = useRef(0)
   const pageLoadTimeRef = useRef(Date.now())
-  const lastPermissionStateRef = useRef<TechnicalPermissionState>(getTechnicalPermissionState())
   const mediaCleanupDoneRef = useRef(false)
   const interviewEndSentRef = useRef(false)
   const interviewStartedRef = useRef(false)
@@ -130,6 +143,13 @@ export default function InterviewRoom() {
   const cameraLossTimerRef = useRef<number | null>(null)
   const questionStartedAtRef = useRef(Date.now())
   const speechRecordingStartedAtRef = useRef<number | null>(null)
+  const speechQuestionIdRef = useRef<string | null>(null)
+  const speechIdempotencyKeyRef = useRef<string | null>(null)
+  const answerInFlightRef = useRef(false)
+  const aiSpeakingRef = useRef(false)
+  const isProcessingRef = useRef(false)
+  const liveSubtitleRecognitionRef = useRef<BrowserSpeechRecognition | null>(null)
+  const liveSubtitleQuestionIdRef = useRef<string | null>(null)
   const pendingTextAnswerRef = useRef<{ idempotencyKey: string; text: string } | null>(null)
   const cleanupInterviewEnvironmentRef = useRef<(options?: { complete?: boolean; keepalive?: boolean }) => void>(() => {})
   const deferredUnmountCleanupRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -240,13 +260,13 @@ export default function InterviewRoom() {
     recorder.stop()
   }, [])
   const startSpeechRecording = useCallback(() => {
-    if (typeof MediaRecorder === "undefined") return
+    if (typeof MediaRecorder === "undefined") return false
     const stream = localStreamRef.current
-    if (!stream) return
+    if (!stream) return false
 
     const enabledAudioTracks = stream.getAudioTracks().filter((track) => track.enabled)
-    if (enabledAudioTracks.length === 0) return
-    if (mediaRecorderRef.current?.state === "recording") return
+    if (enabledAudioTracks.length === 0) return false
+    if (mediaRecorderRef.current?.state === "recording") return false
 
     const mimeType = getSupportedAudioMimeType()
     const recordingStream = new MediaStream(enabledAudioTracks)
@@ -274,15 +294,21 @@ export default function InterviewRoom() {
 
       mediaRecorderRef.current = null
       speechRecordingStartedAtRef.current = null
+      const questionId = speechQuestionIdRef.current
+      const idempotencyKey = speechIdempotencyKeyRef.current
+      speechQuestionIdRef.current = null
+      speechIdempotencyKeyRef.current = null
       recordedChunksRef.current = []
       discardRecordingRef.current = false
 
       if (shouldDiscard || chunks.length === 0) {
+        answerInFlightRef.current = false
         setIsProcessing(false)
         return
       }
 
       if (!socket || socket.readyState !== WebSocket.OPEN) {
+        answerInFlightRef.current = false
         setIsProcessing(false)
         return
       }
@@ -294,13 +320,15 @@ export default function InterviewRoom() {
           audio: audioBase64,
           mime_type: blobType,
           duration_ms: durationMs,
-          question_id: lastQuestionIdRef.current,
+          question_id: questionId,
+          idempotency_key: idempotencyKey,
           timing: {
             response_seconds: Math.max(0, (Date.now() - questionStartedAtRef.current) / 1000),
             voiced_duration_seconds: durationMs / 1000,
           },
         }, socket)
       } catch {
+        answerInFlightRef.current = false
         setIsProcessing(false)
         toast.error("Failed to send audio. Please try again.")
       }
@@ -308,8 +336,69 @@ export default function InterviewRoom() {
 
     recorder.start()
     speechRecordingStartedAtRef.current = Date.now()
+    speechQuestionIdRef.current = lastQuestionIdRef.current
+    speechIdempotencyKeyRef.current = createEnvelopeId()
     mediaRecorderRef.current = recorder
+    return true
   }, [blobToBase64, getSupportedAudioMimeType, sendClientEvent])
+  const stopLiveSubtitleRecognition = useCallback(() => {
+    const recognition = liveSubtitleRecognitionRef.current
+    liveSubtitleRecognitionRef.current = null
+    liveSubtitleQuestionIdRef.current = null
+    if (!recognition) return
+    recognition.onresult = null
+    recognition.onend = null
+    recognition.onerror = null
+    try {
+      recognition.stop()
+    } catch {
+    }
+  }, [])
+  const startLiveSubtitleRecognition = useCallback(() => {
+    const Recognition = getBrowserSpeechRecognition()
+    if (!Recognition || liveSubtitleRecognitionRef.current) return
+    let recognition: BrowserSpeechRecognition
+    try {
+      recognition = new Recognition()
+    } catch {
+      return
+    }
+    recognition.lang = "en-US"
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.maxAlternatives = 1
+    liveSubtitleQuestionIdRef.current = lastQuestionIdRef.current
+    recognition.onresult = (event) => {
+      const transcript = Array.from({ length: event.results.length }, (_, index) => {
+        const result = event.results[index]
+        return result?.[0]?.transcript || ""
+      }).join(" ").replace(/\s+/g, " ").trim()
+      if (!transcript) return
+      const questionId = liveSubtitleQuestionIdRef.current || lastQuestionIdRef.current || undefined
+      setMessages((prev) => [
+        ...prev.filter((message) => !message.isPartial),
+        { role: "user", text: transcript, isPartial: true, ...(questionId ? { questionId } : {}) },
+      ])
+    }
+    recognition.onerror = () => {
+      if (liveSubtitleRecognitionRef.current === recognition) {
+        liveSubtitleRecognitionRef.current = null
+      }
+    }
+    recognition.onend = () => {
+      if (liveSubtitleRecognitionRef.current === recognition) {
+        liveSubtitleRecognitionRef.current = null
+      }
+    }
+    liveSubtitleRecognitionRef.current = recognition
+    try {
+      recognition.start()
+    } catch {
+      if (liveSubtitleRecognitionRef.current === recognition) {
+        liveSubtitleRecognitionRef.current = null
+      }
+    }
+  }, [])
   const {
     metrics: streamingMetrics,
     updateEngagement,
@@ -339,6 +428,12 @@ export default function InterviewRoom() {
     interviewStateRef.current = interviewState
   }, [interviewState])
   useEffect(() => {
+    aiSpeakingRef.current = aiSpeaking
+  }, [aiSpeaking])
+  useEffect(() => {
+    isProcessingRef.current = isProcessing
+  }, [isProcessing])
+  useEffect(() => {
     if (requestedMode && requestedMode !== "mock-voice") {
       toast.info("Opening your Interview Round.")
       router.replace(`/interview/${sessionId}?mode=mock-voice`)
@@ -346,78 +441,33 @@ export default function InterviewRoom() {
   }, [requestedMode, router, sessionId])
   const vad = useVAD({
     onSpeechStart: () => {
-      if (aiSpeaking) return
+      if (
+        interviewStateRef.current !== "active"
+        || aiSpeakingRef.current
+        || isProcessingRef.current
+        || answerInFlightRef.current
+      ) return
+      if (!startSpeechRecording()) return
       setIsCapturing(true)
       setIsProcessing(false)
-      startSpeechRecording()
+      startLiveSubtitleRecognition()
     },
     onSpeechEnd: (duration) => {
+      if (answerInFlightRef.current || !mediaRecorderRef.current) return
+      answerInFlightRef.current = true
       setIsCapturing(false)
       setIsProcessing(true)
+      stopLiveSubtitleRecognition()
       stopSpeechRecording()
       updateEngagement(duration)
     },
     onVADMisfire: () => {
       setIsCapturing(false)
       setIsProcessing(false)
+      stopLiveSubtitleRecognition()
       stopSpeechRecording(true)
     },
   })
-  useEffect(() => {
-    const unsubscribe = subscribeTechnicalPermissionState((state) => {
-      const previous = lastPermissionStateRef.current
-      setPermissionState(state)
-      lastPermissionStateRef.current = state
-      if (previous.screenShareReady && !state.screenShareReady && wsRef.current?.readyState === WebSocket.OPEN) {
-        sendClientEvent("anti_cheat_event", {
-          event_type: state.screenShareReady ? "fullscreen_exit" : "screen_share_stopped",
-          payload: {},
-        })
-      }
-    })
-    return unsubscribe
-  }, [requiresStrictPermissions, sendClientEvent])
-  const requestInterviewPermissions = useCallback(async () => {
-    if (interviewEndSentRef.current) return
-    setPermissionError("")
-    setRequestingPermissions(true)
-    const result = await requestTechnicalScreenShare()
-    const nextState = result.ok ? result.state : getTechnicalPermissionState()
-    setPermissionState(nextState)
-    setRequestingPermissions(false)
-    if (!result.ok || !nextState.screenShareReady) {
-      await releaseTechnicalPermissions()
-      const message = result.ok ? "Fullscreen and screen sharing are required to continue." : result.message
-      setPermissionError(message)
-      toast.error(message)
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        sendClientEvent("anti_cheat_event", {
-          event_type: "interview_permission_failed",
-          payload: { reason: result.ok ? "incomplete" : result.reason },
-        })
-      }
-    }
-  }, [sendClientEvent])
-  useEffect(() => {
-    if (interviewState !== "active" || permissionState.screenShareReady || interviewEndSentRef.current) return
-    toast.warning(`Screen sharing stopped. Restore it within ${recoveryGraceSeconds} seconds or this attempt will end incomplete.`)
-    const timeout = window.setTimeout(() => {
-      if (getTechnicalPermissionState().screenShareReady || interviewEndSentRef.current) return
-      interviewEndSentRef.current = true
-      void cancelInterviewSession(sessionId).finally(() => {
-        cleanupInterviewEnvironmentRef.current()
-        toast.error("The restoration window expired. This attempt was marked incomplete.")
-        router.replace("/")
-      })
-    }, recoveryGraceSeconds * 1000)
-    return () => window.clearTimeout(timeout)
-  }, [interviewState, permissionState.screenShareReady, recoveryGraceSeconds, router, sessionId])
-  useEffect(() => {
-    const check = () => setIsMobile(window.innerWidth < 768)
-    check()
-    window.addEventListener("resize", check)
-    return () => window.removeEventListener("resize", check)
-  }, [])
   useEffect(() => {
     if (faceMetrics) {
       updateCameraContact(
@@ -502,6 +552,7 @@ export default function InterviewRoom() {
     }
     setupMedia()
     return () => {
+      stopLiveSubtitleRecognition()
       stopSpeechRecording(true)
       stopSessionRecording()
       localStreamRef.current?.getTracks().forEach((t) => t.stop())
@@ -509,7 +560,7 @@ export default function InterviewRoom() {
       setLocalStream(null)
       stopFaceCheck()
     }
-  }, [cameraEnabled, startSessionRecording, stopFaceCheck, stopSessionRecording, stopSpeechRecording, voiceMode])
+  }, [cameraEnabled, startSessionRecording, stopFaceCheck, stopLiveSubtitleRecognition, stopSessionRecording, stopSpeechRecording, voiceMode])
   const handleWSMessage = useCallback(
     (event: MessageEvent) => {
       try {
@@ -580,10 +631,13 @@ export default function InterviewRoom() {
               })
             }
             if (data.question_id && lastQuestionIdRef.current === data.question_id) {
-              setIsProcessing(false)
-              setTextSubmitting(false)
+              if (!answerInFlightRef.current) {
+                setIsProcessing(false)
+                setTextSubmitting(false)
+              }
               break
             }
+            answerInFlightRef.current = false
             lastQuestionIdRef.current = data.question_id || null
             questionStartedAtRef.current = Date.now()
             pendingTextAnswerRef.current = null
@@ -611,13 +665,14 @@ export default function InterviewRoom() {
             break
           case "transcription_final":
             if (data.role === "user") {
+              stopLiveSubtitleRecognition()
               partialTranscriptRef.current = ""
               setMessages((prev) => {
                 const filtered = prev.filter((m) => !m.isPartial)
                 if (pendingTextAnswerRef.current?.text.trim() === String(data.text || "").trim()) {
                   return filtered
                 }
-                return [...filtered, { role: "user", text: data.text }]
+                return [...filtered, { role: "user", text: data.text, questionId: lastQuestionIdRef.current || undefined }]
               })
               addTranscriptWords(data.text)
               resetSpeechTracking()
@@ -661,7 +716,7 @@ export default function InterviewRoom() {
             })
             aiTokenBufferRef.current = ""
             setAiSpeaking(true)
-            setIsProcessing(false)
+            if (!answerInFlightRef.current) setIsProcessing(false)
             break
           case "ai_interrupted":
             setAiSpeaking(false)
@@ -672,8 +727,27 @@ export default function InterviewRoom() {
             setAiSpeaking(true)
             break
           case "speech_unavailable":
+            answerInFlightRef.current = false
+            stopLiveSubtitleRecognition()
             setAiSpeaking(false)
+            setIsProcessing(false)
             if (data.message) toast.info(data.message)
+            break
+          case "answer_quality_feedback":
+            if (data.message) {
+              setMessages((prev) => [
+                ...prev,
+                { role: "interviewer", text: data.message },
+              ])
+              if (data.severity === "error") toast.error(data.message)
+              else toast.warning(data.message)
+            }
+            break
+          case "answer_rejected":
+            answerInFlightRef.current = false
+            stopLiveSubtitleRecognition()
+            setIsProcessing(false)
+            if (data.message && !data.quality_failure_streak) toast.info(data.message)
             break
           case "evaluation":
             setIsProcessing(false)
@@ -720,6 +794,8 @@ export default function InterviewRoom() {
             router.replace(data.redirect_to || `/interview/${sessionId}/report`)
             break
           case "error":
+            answerInFlightRef.current = false
+            stopLiveSubtitleRecognition()
             setIsProcessing(false)
             setTextSubmitting(false)
             pendingTextAnswerRef.current = null
@@ -730,7 +806,7 @@ export default function InterviewRoom() {
         toast.error("Received an invalid interview message.")
       }
     },
-    [mode, router, sessionId, addTranscriptWords, resetSpeechTracking, sendClientEvent, updateEngagement, updateCameraContact, setDynamicTip]
+    [mode, router, sessionId, addTranscriptWords, resetSpeechTracking, sendClientEvent, stopLiveSubtitleRecognition, updateEngagement, updateCameraContact, setDynamicTip]
   )
   useEffect(() => {
     if (sessionControlLock !== "owned") return
@@ -837,10 +913,11 @@ export default function InterviewRoom() {
     if (audioStream.getAudioTracks().length === 0) return
     vad.startListening(audioStream)
     return () => {
+      stopLiveSubtitleRecognition()
       stopSpeechRecording(true)
       vad.stopListening()
     }
-  }, [aiSpeaking, interviewState, isMicOn, stopSpeechRecording, voiceMode])
+  }, [aiSpeaking, interviewState, isMicOn, stopLiveSubtitleRecognition, stopSpeechRecording, voiceMode])
   useEffect(() => {
     if (!requiresStrictPermissions) return
     const lastPermissionDialogRef = { current: 0 }
@@ -981,11 +1058,6 @@ export default function InterviewRoom() {
         toast.error("Camera access is required for the Interview Round. Allow camera access, then retry.")
         return
       }
-      const livePermissionState = getTechnicalPermissionState()
-      if (!livePermissionState.screenShareReady) {
-        setPermissionError("Share your entire screen before the Interview Round can begin.")
-        return
-      }
       interviewStartedRef.current = true
       if (requiresStrictPermissions && document.fullscreenEnabled && !document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch(() => {
@@ -998,7 +1070,6 @@ export default function InterviewRoom() {
       sendClientEvent("init_pipeline", {
         input_mode: inputMode,
         camera_enabled: cameraEnabled,
-        screen_share_enabled: livePermissionState.screenShareReady,
       })
       setIsMicOn(voiceMode)
     }
@@ -1006,9 +1077,8 @@ export default function InterviewRoom() {
   useEffect(() => {
     if (interviewState !== "ready" || !isConnected) return
     if (voiceMode && !localStream?.getAudioTracks().length) return
-    if (!permissionState.screenShareReady) return
     initPipeline()
-  }, [initPipeline, interviewState, isConnected, localStream, permissionState.screenShareReady, voiceMode])
+  }, [initPipeline, interviewState, isConnected, localStream, voiceMode])
   const toggleMic = useCallback(() => {
     setIsMicOn((prev) => {
       const next = !prev
@@ -1180,20 +1250,6 @@ export default function InterviewRoom() {
     return <MeetConnectingOverlay state="connecting" />
   }
 
-  if (!permissionState.screenShareReady && !interviewEndSentRef.current && interviewState !== "complete" && interviewState !== "ending") {
-    return (
-      <>
-        <InterviewPermissionGate
-          permissionState={permissionState}
-          error={permissionError}
-          requesting={requestingPermissions}
-          onBack={requestEndCall}
-          onRequest={requestInterviewPermissions}
-        />
-        <EndConfirmDialog show={showEndConfirm} onConfirm={confirmEndCall} onCancel={cancelEndCall} />
-      </>
-    )
-  }
   return <MockVoiceLayout {...layoutProps} />
 }
 interface LayoutProps {
@@ -1308,199 +1364,12 @@ function MeetConnectingOverlay({ state }: { state: string }) {
   )
 }
 
-function InterviewPermissionGate({
-  permissionState,
-  error,
-  requesting,
-  onBack,
-  onRequest,
-}: {
-  permissionState: TechnicalPermissionState
-  error: string
-  requesting: boolean
-  onBack: () => void
-  onRequest: () => void
-}) {
-  return (
-    <div className="min-h-screen bg-background text-foreground flex items-center justify-center px-4">
-      <div className="w-full max-w-md rounded-2xl border border-border bg-card shadow-2xl overflow-hidden">
-        <div className="p-6 border-b border-border">
-          <div className="flex items-start gap-3">
-            <div className="w-11 h-11 rounded-xl bg-primary/15 flex items-center justify-center text-primary">
-              <Eye className="w-5 h-5" />
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold">Share your screen</h1>
-              <p className="mt-1 text-sm text-muted-foreground">Choose Entire screen.</p>
-            </div>
-          </div>
-        </div>
-        <div className="p-6 space-y-3">
-          <PermissionStatus label="Screen share" active={permissionState.screenShareReady} />
-          {error && <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
-        </div>
-        <div className="flex gap-2 border-t border-border p-4">
-          <button onClick={onBack} className="flex-1 rounded-full border border-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-border transition-colors">
-            Back
-          </button>
-          <button onClick={onRequest} disabled={requesting} className="flex-1 rounded-full bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60 transition-colors">
-            {requesting ? "Requesting..." : "Share screen"}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function PermissionStatus({ label, active }: { label: string; active: boolean }) {
-  return (
-    <div className="flex items-center justify-between rounded-lg border border-border bg-background px-3 py-2">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${active ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300" : "bg-amber-500/15 text-amber-700 dark:text-amber-300"}`}>
-        {active ? "Ready" : "Required"}
-      </span>
-    </div>
-  )
-}
-
-function MeetSidePanel({
-  show, onClose, hints, dynamicTip, metrics,
-}: {
-  show: boolean
-  onClose: () => void
-  hints: string[]
-  dynamicTip: string | null
-  metrics: { eyeContact: string; confidence: number; emotion: string; cameraValue: number; engagementValue: number; pace: number; paceLabel: string }
-}) {
-  if (!show) return null
-  return (
-    <aside className="w-80 border-l border-border flex flex-col bg-background shrink-0 animate-in slide-in-from-right duration-200">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <h3 className="text-sm font-medium text-foreground">AI Assistant</h3>
-        <button onClick={onClose} className="w-8 h-8 rounded-full hover:bg-border flex items-center justify-center text-muted-foreground transition-colors">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-      <div className="flex-1 overflow-y-auto p-4 space-y-5">
-        <div>
-          <p className="text-xs text-muted-foreground font-medium mb-2">Real-Time Suggestion</p>
-          <div className="p-3 rounded-lg bg-secondary border border-border">
-            <p className="text-sm text-muted-foreground leading-relaxed italic">
-              {dynamicTip ? `\u201C${dynamicTip}\u201D` : "Suggestions will appear as you speak..."}
-            </p>
-          </div>
-        </div>
-        <div>
-          <p className="text-xs text-muted-foreground font-medium mb-2">Stuck? Try this</p>
-          <ul className="space-y-2">
-            {hints.length > 0 ? hints.slice(-3).map((hint, i) => (
-              <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground leading-relaxed">
-                <span className="text-primary mt-0.5 shrink-0">•</span>
-                {hint}
-              </li>
-            )) : (
-              <li className="text-sm text-muted-foreground/70 italic">Hints will appear based on the current question...</li>
-            )}
-          </ul>
-        </div>
-        <div>
-          <p className="text-xs text-muted-foreground font-medium mb-3">Performance</p>
-          <div className="space-y-3">
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-muted-foreground">Eye Contact</span>
-                <span className="text-xs text-foreground font-medium">{metrics.eyeContact}</span>
-              </div>
-              <div className="h-1 bg-border rounded-full overflow-hidden">
-                <div className="h-full bg-primary rounded-full transition-all duration-700" style={{ width: `${metrics.cameraValue}%` }} />
-              </div>
-            </div>
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-muted-foreground">Confidence</span>
-                <span className="text-xs text-foreground font-medium tabular-nums">{metrics.confidence}%</span>
-              </div>
-              <div className="h-1 bg-border rounded-full overflow-hidden">
-                <div className="h-full bg-primary rounded-full transition-all duration-700" style={{ width: `${metrics.confidence}%` }} />
-              </div>
-            </div>
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <span className="text-xs text-muted-foreground">Composure</span>
-                <span className="text-xs text-foreground font-medium">{metrics.emotion}</span>
-              </div>
-              <div className="flex gap-1">
-                {[...Array(5)].map((_, i) => (
-                  <div key={i} className={`flex-1 h-1 rounded-full transition-all duration-500 ${i < Math.ceil(metrics.engagementValue / 20) ? "bg-[var(--accent-amber)]" : "bg-border"}`} />
-                ))}
-              </div>
-            </div>
-            {metrics.pace > 0 && (
-              <div className="pt-2 border-t border-border">
-                <div className="flex justify-between items-center">
-                  <span className="text-xs text-muted-foreground">Pace</span>
-                  <span className="text-xs text-foreground font-medium tabular-nums">{metrics.pace} <span className="text-muted-foreground">wpm</span></span>
-                </div>
-                <p className="text-xs text-muted-foreground/70 mt-0.5">{metrics.paceLabel} · optimal 120–160 wpm</p>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </aside>
-  )
-}
-
-function MeetBottomBar({
-  timer, formatTimer, modeLabel, isMicOn, isVideoOn, onToggleMic, onToggleVideo, onEndCall,
-  showCaptions, onToggleCaptions, showSidePanel, onToggleSidePanel,
-}: {
-  timer: number; formatTimer: (s: number) => string; modeLabel: string
-  isMicOn: boolean; isVideoOn: boolean; onToggleMic: () => void; onToggleVideo: () => void; onEndCall: () => void
-  showCaptions: boolean; onToggleCaptions: () => void; showSidePanel: boolean; onToggleSidePanel: () => void
-}) {
-  return (
-    <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-background">
-      <div className="flex items-center gap-3 min-w-[180px]">
-        <span className="text-sm font-mono tabular-nums text-foreground">{formatTimer(timer)}</span>
-        <span className="text-muted-foreground/70">|</span>
-        <span className="text-xs text-muted-foreground">{modeLabel}</span>
-      </div>
-      <InterviewControls
-        variant="meet"
-        isMicOn={isMicOn}
-        isVideoOn={isVideoOn}
-        onToggleMic={onToggleMic}
-        onToggleVideo={onToggleVideo}
-        onEndCall={onEndCall}
-        captionsEnabled={showCaptions}
-        onToggleCaptions={onToggleCaptions}
-      />
-      <div className="flex items-center gap-1 min-w-[180px] justify-end">
-        <button
-          onClick={onToggleCaptions}
-          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showCaptions ? "bg-primary text-primary-foreground" : "hover:bg-border text-foreground"}`}
-          title="Captions"
-        >
-          <Eye className="w-5 h-5" />
-        </button>
-        <button
-          onClick={onToggleSidePanel}
-          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${showSidePanel ? "bg-primary text-primary-foreground" : "hover:bg-border text-foreground"}`}
-          title="AI Assistant"
-        >
-          <Brain className="w-5 h-5" />
-        </button>
-      </div>
-    </div>
-  )
-}
-
 function MeetCaptions({ show, lastUserMsg, isCapturing }: { show: boolean; lastUserMsg?: TranscriptMessage; isCapturing: boolean }) {
   if (!show || !lastUserMsg) return null
   return (
     <div className="absolute bottom-24 left-1/2 -translate-x-1/2 z-30 w-full max-w-2xl px-4">
       <div className="bg-background/95 backdrop-blur-md rounded-lg px-5 py-3 text-center shadow-xl">
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary">You said</p>
         <p className="text-sm text-foreground leading-relaxed">
           {lastUserMsg.isPartial ? (
             <>
@@ -1513,48 +1382,6 @@ function MeetCaptions({ show, lastUserMsg, isCapturing }: { show: boolean; lastU
           {isCapturing && <span className="inline-block w-[2px] h-[14px] bg-primary ml-1 align-middle animate-pulse" />}
         </p>
       </div>
-    </div>
-  )
-}
-
-function MeetAITile({
-  isConnected, aiSpeaking, currentQuestion, currentTopic, localStream, showQuestionText = true, compact = false,
-  interviewerName = "Dr. Aris", interviewerTitle = "AI Lead Interviewer",
-}: {
-  isConnected: boolean; aiSpeaking: boolean; currentQuestion: string; currentTopic: string; localStream: MediaStream | null; showQuestionText?: boolean; compact?: boolean
-  interviewerName?: string; interviewerTitle?: string
-}) {
-  return (
-    <div className="relative h-full w-full overflow-hidden rounded-lg bg-secondary">
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <div className={`${compact ? "h-12 w-12 text-lg" : "h-24 w-24 text-3xl"} rounded-full bg-primary flex items-center justify-center font-medium text-primary-foreground shadow-sm transition-colors`}>
-          {interviewerName ? interviewerName.charAt(0) : "A"}
-        </div>
-        <p className={`${compact ? "mt-2 text-xs" : "mt-3 text-base"} text-foreground font-medium`}>{interviewerName}</p>
-        {!compact && <p className="text-muted-foreground text-xs">{interviewerTitle}</p>}
-        {aiSpeaking && !compact && (
-          <div className="mt-4 w-48 opacity-40">
-            <WaveformVisualizer stream={localStream} isActive variant="primary" size="sm" />
-          </div>
-        )}
-      </div>
-      {!compact && <div className="absolute top-3 left-3 z-10">
-        <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${isConnected ? "bg-primary/15 text-primary" : "bg-border text-muted-foreground"}`}>
-          <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? "bg-primary animate-pulse" : "bg-muted-foreground"}`} />
-          {isConnected ? "Connected" : "Connecting..."}
-        </div>
-      </div>}
-      <div className="absolute bottom-3 left-3 z-10">
-        <span className="text-foreground text-xs font-medium bg-background/70 backdrop-blur-sm px-2.5 py-1 rounded">{interviewerName}</span>
-      </div>
-      {showQuestionText && currentQuestion && !compact && (
-        <div className="absolute bottom-14 left-0 right-0 text-center px-6 z-10">
-          <div className="inline-block bg-background/85 backdrop-blur-md rounded-lg px-5 py-3 max-w-xl">
-            <p className="text-xs text-muted-foreground mb-1">{currentTopic || "Question"}</p>
-            <p className="text-foreground text-sm leading-relaxed font-medium">{currentQuestion}</p>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -1600,39 +1427,8 @@ function MeetSelfTile({
   )
 }
 
-function MockAILayout(props: LayoutProps) {
-  const [showCaptions, setShowCaptions] = useState(false)
-  const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
-  return (
-    <div className="h-screen flex flex-col bg-background text-foreground overflow-hidden relative">
-      {(props.interviewState === "connecting") && <MeetConnectingOverlay state={props.interviewState} />}
-      {(props.interviewState === "ready" || props.interviewState === "recovering") && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-background">
-          <div className="w-24 h-24 rounded-full bg-primary flex items-center justify-center text-3xl font-medium text-primary-foreground shadow-sm mb-6">A</div>
-          <p className="text-foreground text-lg font-medium mb-2">{props.interviewState === "recovering" ? "Restoring your session…" : "Starting interview…"}</p>
-          <p className="text-muted-foreground text-sm">Your continuous attempt will begin automatically.</p>
-        </div>
-      )}
-      <div className="flex-1 min-h-0 p-3">
-        <CleanInterviewStage props={props} />
-      </div>
-      <MeetCaptions show={showCaptions} lastUserMsg={lastUserMsg} isCapturing={props.isCapturing} />
-      <div className="h-20 shrink-0 flex items-center justify-between px-6 z-30 bg-background">
-        <div className="flex items-center gap-3 min-w-[180px]">
-          <Clock className="w-3.5 h-3.5 text-muted-foreground" />
-          <span className="text-sm font-mono tabular-nums text-foreground">{props.formatTimer(props.sessionTimer)}</span>
-          <span className="text-muted-foreground/70">|</span>
-          <span className="text-xs text-muted-foreground">Mock Interview</span>
-        </div>
-        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} captionsEnabled={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)} endLabel="End Interview" cameraLocked />
-        <div className="min-w-[180px]" />
-      </div>
-      <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
-    </div>
-  )
-}
 function MockVoiceLayout(props: LayoutProps) {
-  const [showCaptions, setShowCaptions] = useState(false)
+  const [showCaptions, setShowCaptions] = useState(true)
   const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
   return (
     <div className="relative flex h-screen flex-col overflow-hidden bg-secondary/20 text-foreground">
@@ -1720,144 +1516,6 @@ function CleanInterviewStage({ props }: { props: LayoutProps }) {
           </div>
         </div>
       </aside>
-    </div>
-  )
-}
-
-function MockVideoStage({
-  props,
-  featuredTile,
-  onSwap,
-}: {
-  props: LayoutProps
-  featuredTile: "ai" | "user"
-  onSwap: () => void
-}) {
-  const aiTile = (
-    <MeetAITile
-      isConnected={props.isConnected}
-      aiSpeaking={props.aiSpeaking}
-      currentQuestion={props.currentQuestion}
-      currentTopic={props.currentTopic}
-      localStream={props.localStream}
-      showQuestionText={props.showQuestionText}
-      compact={featuredTile !== "ai"}
-      interviewerName={props.interviewerName}
-      interviewerTitle={props.interviewerTitle}
-    />
-  )
-  const userTile = (
-    <MeetSelfTile
-      stream={props.localStream}
-      videoRef={props.videoRef}
-      isVideoOn={props.isVideoOn}
-      isMicOn={props.isMicOn}
-      compact={featuredTile !== "user"}
-    />
-  )
-
-  return (
-    <div className="relative h-full min-h-[360px] w-full overflow-hidden rounded-lg bg-background">
-      <div className="h-full w-full overflow-hidden rounded-lg border border-border bg-secondary">
-        {featuredTile === "ai" ? aiTile : userTile}
-      </div>
-      <button
-        type="button"
-        onClick={onSwap}
-        className="absolute right-5 top-5 z-20 h-[28%] min-h-[128px] w-[28%] min-w-[180px] max-w-[340px] overflow-hidden rounded-lg border border-border bg-card shadow-2xl transition-transform hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-primary"
-        title={featuredTile === "ai" ? "Show yourself large" : "Show AI large"}
-      >
-        {featuredTile === "ai" ? userTile : aiTile}
-      </button>
-    </div>
-  )
-}
-
-function MobileLayout(props: LayoutProps) {
-  return (
-    <div className="h-screen flex flex-col bg-[var(--iv-surface)] text-[var(--iv-on-surface)] overflow-hidden relative">
-      <header className="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-[var(--iv-surface)]">
-        <div className="flex items-center gap-4">
-          <ArrowLeft className="h-5 w-5 text-[var(--iv-primary)] cursor-pointer" onClick={props.onEndCall} />
-          <h1 className="text-xl font-semibold text-[var(--iv-primary)]">Interview Room</h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="bg-[var(--iv-surface-container-high)] px-3 py-1.5 rounded-full flex items-center gap-2 border border-[var(--iv-outline-variant)]/10">
-            <span className={`w-2 h-2 rounded-full ${props.isCapturing ? "bg-emerald-400 animate-pulse" : "bg-[var(--iv-secondary)]"}`} />
-            <span className="text-xs font-medium text-[var(--iv-primary)]">
-              {props.isCapturing ? "Capturing" : "Live"}
-            </span>
-          </div>
-        </div>
-      </header>
-      <main className="relative pt-16 h-screen flex flex-col justify-between overflow-hidden">
-        <SelfView variant="mobile" videoRef={props.videoRef} isVideoOn={props.isVideoOn} stream={props.localStream} />
-        <div className="flex-1 flex flex-col justify-center px-8 text-center max-w-lg mx-auto">
-          <span className="text-xs text-[var(--iv-outline)] mb-6 font-medium">
-            {props.currentTopic || "Current Prompt"}
-          </span>
-          <h2 className="font-serif text-3xl italic text-[var(--iv-on-surface)] leading-snug">
-            {props.currentQuestion
-              ? `\u201C${props.currentQuestion}\u201D`
-              : "\u201CWaiting for question...\u201D"}
-          </h2>
-          <div className="mt-12">
-            <WaveformVisualizer
-              stream={props.localStream}
-              isActive={props.isCapturing}
-              variant="primary"
-              size="sm"
-            />
-          </div>
-        </div>
-        <div className="px-6 pb-32">
-          {props.messages.length > 0 && (
-            <div className="bg-[var(--iv-surface-container-low)] rounded-2xl p-5 border border-[var(--iv-outline-variant)]/10 min-h-[80px]">
-              <div className="flex justify-between items-center mb-3">
-                <span className="text-xs text-[var(--iv-outline)] font-medium">Transcription</span>
-              </div>
-              <p className="text-sm text-[var(--iv-on-surface-variant)] leading-relaxed">
-                {props.messages[props.messages.length - 1]?.text}
-                {props.isCapturing && (
-                  <span className="inline-block w-1 h-4 bg-[var(--iv-secondary)]/50 animate-pulse ml-1 align-middle" />
-                )}
-              </p>
-            </div>
-          )}
-          <div className="mt-6 grid grid-cols-2 gap-4">
-            <div className="bg-[var(--iv-surface-container)] p-3 rounded-xl flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-[var(--iv-surface-container-highest)] flex items-center justify-center">
-                <Eye className="h-3.5 w-3.5 text-[var(--iv-tertiary)]" />
-              </div>
-              <div>
-                <p className="text-xs text-[var(--iv-outline)] font-medium">Eye Contact</p>
-                <p className="text-xs text-[var(--iv-on-surface)]">{props.streamingMetrics.cameraContact.label}</p>
-              </div>
-            </div>
-            <div className="bg-[var(--iv-surface-container)] p-3 rounded-xl flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-[var(--iv-surface-container-highest)] flex items-center justify-center">
-                <Clock className="h-3.5 w-3.5 text-[var(--iv-secondary)]" />
-              </div>
-              <div>
-                <p className="text-xs text-[var(--iv-outline)] font-medium">Pace</p>
-                <p className="text-xs text-[var(--iv-on-surface)]">{props.streamingMetrics.pace.label}</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </main>
-      <InterviewControls
-        variant="mobile"
-        isMicOn={props.isMicOn}
-        isVideoOn={props.isVideoOn}
-        onToggleMic={props.onToggleMic}
-        onToggleVideo={props.onToggleVideo}
-        onEndCall={props.onEndCall}
-      />
-      <div className="fixed inset-0 pointer-events-none z-0 opacity-20">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,_var(--iv-primary-container)_0%,_transparent_60%)]" />
-      </div>
-      <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
     </div>
   )
 }

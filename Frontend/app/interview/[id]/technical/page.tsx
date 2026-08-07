@@ -355,7 +355,6 @@ export default function TechnicalInterviewPage() {
     microphoneReady: false,
     ready: false,
   })
-  const autoPermissionRequestedRef = useRef(false)
   const proctoringStartedRef = useRef(false)
   const cameraVideoRef = useRef<HTMLVideoElement>(null)
   const faceMissingSinceRef = useRef<number | null>(null)
@@ -598,16 +597,11 @@ export default function TechnicalInterviewPage() {
   }, [recordAntiCheat, recordTechnicalEvent, warnStrictMode])
 
   useEffect(() => {
-    if (!statusChecked || reviewMode || autoPermissionRequestedRef.current || permissionState.ready || endSentRef.current) return
-    autoPermissionRequestedRef.current = true
-
+    if (!statusChecked || reviewMode || permissionState.ready || endSentRef.current) return
     if (preflightDone) {
       setPermissionState(getTechnicalPermissionState())
-      return
     }
-
-    void requestPermissions()
-  }, [reviewMode, statusChecked, permissionState.ready, requestPermissions, preflightDone])
+  }, [reviewMode, statusChecked, permissionState.ready, preflightDone])
 
   useEffect(() => {
     const unsubscribe = subscribeTechnicalPermissionState((state) => {
@@ -1458,7 +1452,6 @@ export default function TechnicalInterviewPage() {
     return (
       <>
         <PermissionGate
-          interviewId={interviewId}
           permissionState={permissionState}
           permissionError={permissionError}
           requestingPermission={requestingPermission}
@@ -1655,7 +1648,6 @@ export default function TechnicalInterviewPage() {
             onCommitFinalEvidence={() => void commitActiveFinalEvidence()}
           />
           <TestcasePanel
-            round={activeRound}
             tests={activeTests}
             selectedCaseIndex={selectedCaseIndex}
             customInput={customInput}
@@ -1684,7 +1676,6 @@ export default function TechnicalInterviewPage() {
           <ResultPanel
             output={output}
             running={running}
-            round={activeRound}
             executorName={executorName}
             actionLocked={roundActionLocked || sessionFlagged}
             lockMessage={sessionFlagged ? "This technical round is locked after repeated integrity warnings." : roundLockMessage}
@@ -1723,7 +1714,6 @@ export default function TechnicalInterviewPage() {
 }
 
 function PermissionGate({
-  interviewId,
   permissionState,
   permissionError,
   requestingPermission,
@@ -1732,7 +1722,6 @@ function PermissionGate({
   onBack,
   onRequestPermissions,
 }: {
-  interviewId: string
   permissionState: TechnicalPermissionState
   permissionError: string
   requestingPermission: boolean
@@ -2272,14 +2261,12 @@ function ProblemSpecBlock({ title, value, muted = false }: { title: string; valu
 }
 
 function TestcasePanel({
-  round,
   tests,
   selectedCaseIndex,
   customInput,
   onSelectCase,
   onCustomInputChange,
 }: {
-  round?: Round
   tests: TestCase[]
   selectedCaseIndex: number
   customInput: string
@@ -2452,7 +2439,6 @@ function CodePanel({
 function ResultPanel({
   output,
   running,
-  round,
   executorName,
   actionLocked,
   lockMessage,
@@ -2467,7 +2453,6 @@ function ResultPanel({
 }: {
   output: RunResult | null
   running: boolean
-  round?: Round
   executorName: string
   actionLocked: boolean
   lockMessage: string
