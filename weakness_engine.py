@@ -289,3 +289,54 @@ async def persist_weakness_states(
     observations: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_persist_sync, user_id, analysis_id, interview_id, observations)
+
+
+async def retire_superseded_analysis_evidence(interview_id: str, current_analysis_id: str) -> None:
+    """Remove weakness links from older revisions of one rebuilt interview."""
+    def _retire() -> None:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                DELETE FROM WeaknessEvidenceLinks link
+                USING SessionPerformanceAnalyses analysis
+                WHERE link.analysis_id = analysis.analysis_id
+                  AND analysis.interview_id = %s
+                  AND analysis.is_current = FALSE
+                  AND link.analysis_id <> %s
+                RETURNING link.weakness_state_id
+                """,
+                (interview_id, current_analysis_id),
+            )
+            affected_state_ids = list({row[0] for row in cursor.fetchall() or [] if row and row[0]})
+            if affected_state_ids:
+                cursor.execute(
+                    """
+                    UPDATE WeaknessStates state
+                    SET lifecycle_state = 'resolved',
+                        observation_count = 0,
+                        session_count = 0,
+                        baseline_score = NULL,
+                        latest_score = NULL,
+                        confidence = 0,
+                        resolved_at = NOW(),
+                        updated_at = NOW()
+                    WHERE state.weakness_state_id = ANY(%s)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM WeaknessEvidenceLinks remaining
+                          WHERE remaining.weakness_state_id = state.weakness_state_id
+                      )
+                    """,
+                    (affected_state_ids,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            return_db_connection(conn)
+
+    await asyncio.to_thread(_retire)

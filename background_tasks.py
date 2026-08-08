@@ -306,6 +306,7 @@ async def _recover_orphaned_analysis_attempts() -> None:
               WHERE analysis.interview_id = i.interview_id
                 AND analysis.user_id = i.user_id
                 AND analysis.schema_version = %s
+                AND analysis.producer_version = %s
                 AND analysis.is_current = TRUE
                 AND analysis.status = 'ready'
                 AND analysis.analysis_json_encrypted IS NOT NULL
@@ -321,7 +322,7 @@ async def _recover_orphaned_analysis_attempts() -> None:
         ORDER BY COALESCE(i.completed_at, i.created_at)
         LIMIT 20
         """,
-        (SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION),
+        (SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION, ANALYSIS_STAGE_VERSION),
         fetchall=True,
     )
     for interview_id, user_id in rows or []:

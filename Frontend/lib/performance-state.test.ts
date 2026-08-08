@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest"
 import {
   chooseInitialPerformanceTab,
+  hasPerformanceModeData,
   performanceStateNotice,
 } from "./performance-state"
 
 describe("performance state", () => {
+  it("distinguishes an empty mode from a mode with saved data", () => {
+    expect(hasPerformanceModeData(
+      { has_data: false, score_state: "missing" },
+    )).toBe(false)
+    expect(hasPerformanceModeData(
+      { has_data: true, has_evidence: true, score_state: "run_only" },
+    )).toBe(true)
+  })
+
   it("opens Technical Round when it is the only mode with an official score", () => {
     expect(chooseInitialPerformanceTab(
       { score_state: "insufficient", has_evidence: true },

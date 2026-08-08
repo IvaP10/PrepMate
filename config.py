@@ -75,7 +75,7 @@ class Settings:
     OPENAI_REPORT_MODEL: str = os.getenv("OPENAI_REPORT_MODEL", "gpt-5-mini")
     OPENAI_RESUME_MODEL: str = os.getenv("OPENAI_RESUME_MODEL", "gpt-4o-mini")
     OPENAI_QUESTION_MODEL: str = os.getenv("OPENAI_QUESTION_MODEL", "gpt-5-mini")
-    OPENAI_TECHNICAL_MODEL: str = os.getenv("OPENAI_TECHNICAL_MODEL", "gpt-5.2")
+    OPENAI_TECHNICAL_MODEL: str = os.getenv("OPENAI_TECHNICAL_MODEL", "gpt-5-mini")
     OPENAI_EVALUATION_MODEL: str = os.getenv("OPENAI_EVALUATION_MODEL", "gpt-5-nano")
     OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
     MODEL_DEFAULT_POLICY: str = os.getenv("MODEL_DEFAULT_POLICY", "openai_required")

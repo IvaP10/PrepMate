@@ -260,7 +260,7 @@ class TechnicalModePureTests(unittest.TestCase):
             def __init__(self):
                 self.fetchone_values = [
                     None,
-                    ("active", "mock", 1, None),
+                    ("active", "mock", 1, None, {}, None),
                     (0,),
                     ("job-1", "round-1", "submit", "full", "python", "queued", {"status": "queued"}, None, 0),
                 ]
@@ -401,7 +401,9 @@ class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "source": "problem_bank",
             })
 
-        with patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=bank):
+        with patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=bank), patch.object(
+            technical_mode, "async_execute", new_callable=AsyncMock, return_value=[]
+        ):
             templates = await technical_mode._round_templates_for_profile(
                 "top_tier",
                 "interview-1",
@@ -413,6 +415,51 @@ class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([template["metadata"]["tier_expected_difficulty"] for template in templates], ["hard", "hard"])
         self.assertEqual([template["metadata"]["tier_target_rating"] for template in templates], [1800, 2000])
         self.assertTrue(all(template["metadata"]["difficulty"] == "hard" for template in templates))
+
+    async def test_round_templates_rotate_away_from_prior_problem_families(self):
+        bank = []
+        for index in range(1, 5):
+            problem = _valid_problem(f"Hard Problem {index}")
+            problem["difficulty"] = "hard"
+            bank.append({
+                "problem_id": f"bank-{index}",
+                "problem_family_id": f"family-{index}",
+                "version": 1,
+                "round_type": "coding",
+                "taxonomy_keys": ["technical:arrays"],
+                "prerequisite_keys": [],
+                "difficulty": "hard",
+                "title": problem["title"],
+                "statement": problem["statement"],
+                "spec_json": {"profile_types": ["top_tier"]},
+                "visible_tests": problem["visible_tests"],
+                "hidden_tests": problem["hidden_tests"],
+                "expected_time_complexity": problem["expected_time_complexity"],
+                "expected_space_complexity": problem["expected_space_complexity"],
+                "supported_languages": ["python"],
+                "validator_version": "test",
+                "validation_result": {"passed": True},
+                "source": "problem_bank",
+            })
+
+        with patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=bank), patch.object(
+            technical_mode,
+            "async_execute",
+            new_callable=AsyncMock,
+            return_value=[("bank-1", "family-1"), ("bank-2", "family-2")],
+        ):
+            templates = await technical_mode._round_templates_for_profile(
+                "top_tier",
+                "interview-2",
+                "user-1",
+                {"programming_language": "python", "question_count": 2, "duration_minutes": 80},
+            )
+
+        selected_ids = [template["problem_id"] for template in templates]
+        self.assertEqual(len(selected_ids), 2)
+        self.assertNotIn("bank-1", selected_ids)
+        self.assertNotIn("bank-2", selected_ids)
+        self.assertEqual(len(set(selected_ids)), 2)
 
     async def test_duplicate_pending_noncoding_response_resumes_and_commits(self):
         round_row = (

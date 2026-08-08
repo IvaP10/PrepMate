@@ -1708,6 +1708,61 @@ export interface PerformanceDirection {
   session_count?: number
 }
 
+export interface PerformanceRoundHistoryItem {
+  interview_id?: string | null
+  mode: 'interview' | 'technical' | string
+  role?: string | null
+  company?: string | null
+  completed_at?: string | null
+  date?: string | null
+  score?: number | null
+  duration_seconds?: number | null
+  score_state?: string | null
+  source_kind?: string | null
+  included_in_trend?: boolean
+  round_id?: string | null
+  change?: number | null
+  key_result?: string | null
+  questions_completed?: number | null
+  questions_total?: number | null
+  problems_attempted?: number | null
+  problems_total?: number | null
+  problems_solved?: number | null
+}
+
+export interface PerformanceAnalytics {
+  summary?: {
+    total_rounds?: number
+    average_score?: number | null
+    latest_score?: number | null
+    best_score?: number | null
+    recent_change?: number | null
+    average_duration_seconds?: number | null
+    trend?: string | null
+    problems_attempted?: number
+    problems_total?: number
+    problems_solved?: number
+    submission_rate?: number | null
+  }
+  skills?: Record<string, any>[]
+  topics?: Record<string, any>[]
+  question_types?: Record<string, any>[]
+  patterns?: Record<string, any>[]
+  test_patterns?: Record<string, any>[]
+  behavior?: Record<string, any>[]
+  tests?: Record<string, any>[]
+  submission?: Record<string, any>
+  time?: Record<string, any>[]
+  time_patterns?: Record<string, any>[]
+  complexity?: Record<string, any>[]
+  follow_up?: Record<string, any>
+  improvement?: {
+    improving?: Record<string, any>[]
+    declining?: Record<string, any>[]
+    stable?: Record<string, any>[]
+  }
+}
+
 export interface PerformanceScoreDetail {
   score?: number | null
   detail?: string | null
@@ -1833,6 +1888,8 @@ export interface DynamicPerformancePayload {
   score_state?: "ready" | "processing" | "blocked" | "failed" | "insufficient" | "run_only" | "legacy" | "missing" | string
   source_kind?: "canonical_v4" | "recorded_evidence" | "legacy_report" | "unavailable" | string
   included_in_trend?: boolean
+  round_history?: PerformanceRoundHistoryItem[]
+  analytics?: PerformanceAnalytics
 }
 
 export interface PerformanceData {
@@ -1843,6 +1900,7 @@ export interface PerformanceData {
     official: PerformanceTrendPoint[]
     legacy: PerformanceTrendPoint[]
   }
+  round_history?: PerformanceRoundHistoryItem[]
   availability?: {
     completed_count: number
     missing_canonical_count: number

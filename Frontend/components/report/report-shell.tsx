@@ -1,13 +1,14 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
+import { useEffect, useState, type ReactNode } from "react"
 import Link from "next/link"
 import { ArrowLeft, Printer } from "lucide-react"
+
 import { ThemeLogo } from "@/components/theme-logo"
 
-export interface ReportSectionMeta {
-  id: string
-  title: string
+interface ReportStat {
+  label: string
+  value: string
 }
 
 interface ReportShellProps {
@@ -15,77 +16,70 @@ interface ReportShellProps {
   title: string
   metadata: {
     date: string
-    duration?: string
+    durationUsed?: string
+    durationAllowed?: string
+    profileType?: string | null
+    isCustom?: boolean
     role?: string
-    itemCountLabel: string // e.g. "3 Problems Attempted" or "5 Questions Asked"
+    company?: string | null
+    jobDescription?: string | null
     overallScore?: number | null
+    stats?: ReportStat[]
   }
-  sections: ReportSectionMeta[]
-  children: React.ReactNode
+  sections: Array<{ id: string; title: string }>
+  children: ReactNode
 }
 
-export function ReportShell({
-  reportType,
-  title,
-  metadata,
-  sections,
-  children,
-}: ReportShellProps) {
-  const [activeSection, setActiveSection] = useState<string>("")
+const profileLabels: Record<string, string> = {
+  top_tier: "Top Tier",
+  mid_tier: "Mid Tier",
+  startup: "Startup",
+}
+
+export function ReportShell({ reportType, title, metadata, sections, children }: ReportShellProps) {
+  const [activeSection, setActiveSection] = useState(sections[0]?.id || "")
   const backHref = reportType === "technical" ? "/?tab=technical" : "/?tab=interview"
-  const backLabel = reportType === "technical" ? "Back to Coding" : "Back to Interview"
+  const backLabel = reportType === "technical" ? "Technical" : "Interview"
 
   useEffect(() => {
-    if (sections.length === 0) return
-
-    const observerOptions = {
-      root: null,
-      rootMargin: "-20% 0px -60% 0px",
-      threshold: 0,
-    }
-
-    const handleIntersection = (entries: IntersectionObserverEntry[]) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          setActiveSection(entry.target.id)
-        }
-      })
-    }
-
-    const observer = new IntersectionObserver(handleIntersection, observerOptions)
-
-    sections.forEach((sec) => {
-      const el = document.getElementById(sec.id)
-      if (el) observer.observe(el)
-    })
-
-    return () => {
-      sections.forEach((sec) => {
-        const el = document.getElementById(sec.id)
-        if (el) observer.unobserve(el)
-      })
-    }
+    const nodes = sections
+      .map((section) => document.getElementById(section.id))
+      .filter((node): node is HTMLElement => Boolean(node))
+    if (!nodes.length) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((entry) => entry.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0]
+        if (visible?.target.id) setActiveSection(visible.target.id)
+      },
+      { rootMargin: "-20% 0px -65% 0px", threshold: [0.1, 0.4, 0.8] },
+    )
+    nodes.forEach((node) => observer.observe(node))
+    return () => observer.disconnect()
   }, [sections])
 
-  const handlePrint = () => {
-    window.print()
-  }
+  const scoreLabel = metadata.overallScore == null
+    ? "Unable to Evaluate"
+    : `${Math.round(metadata.overallScore)}/100`
+  const normalizedProfileType = metadata.profileType?.trim().toLowerCase()
+  const isCustom = metadata.isCustom ?? normalizedProfileType === "custom"
+  const profileLabel = !isCustom && normalizedProfileType ? profileLabels[normalizedProfileType] : undefined
+  const customTargetDetails = isCustom && Boolean(metadata.role || metadata.company || metadata.jobDescription)
 
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      {/* Sticky Top Header */}
-      <header data-report-header className="sticky top-0 z-50 border-b border-border/70 bg-background/95 px-6 py-4 backdrop-blur-md">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4">
-          <Link href="/" className="flex items-center gap-1.5 transition-opacity hover:opacity-80">
-            <ThemeLogo size={36} />
-            <span className="text-base font-semibold text-foreground">InterAI</span>
+    <main className="min-h-screen bg-background text-foreground" data-report-type={reportType}>
+      <header className="border-b border-border bg-background/95" data-report-header>
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
+          <Link href="/" className="flex items-center gap-2" aria-label="InterAI home">
+            <ThemeLogo size={34} />
+            <span className="text-base font-semibold">InterAI</span>
           </Link>
-          
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <button
-              onClick={handlePrint}
+              onClick={() => window.print()}
               data-report-export
-              className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium hover:bg-secondary"
             >
               <Printer className="h-4 w-4" />
               Print / Save PDF
@@ -93,7 +87,7 @@ export function ReportShell({
             <Link
               href={backHref}
               data-report-back
-              className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium text-foreground transition-colors hover:bg-secondary"
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium hover:bg-secondary"
             >
               <ArrowLeft className="h-4 w-4" />
               {backLabel}
@@ -102,71 +96,85 @@ export function ReportShell({
         </div>
       </header>
 
-      {/* Main Grid Layout */}
-      <div className="mx-auto grid max-w-6xl gap-10 px-6 py-12 lg:grid-cols-[220px_minmax(0,1fr)] lg:py-16" data-report-grid>
-        {/* Sticky Sidebar ToC */}
+      <div className="mx-auto grid max-w-7xl gap-8 px-6 py-10 lg:grid-cols-[220px_minmax(0,1fr)] lg:py-14">
         <aside className="hidden lg:block" data-report-sidebar>
-          {sections.length > 0 && (
-            <nav className="sticky top-24 flex flex-col gap-1 text-sm" aria-label="Report sections">
-              <span className="mb-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-                Contents
-              </span>
-              {sections.map((sec) => (
-                <a
-                  key={sec.id}
-                  href={`#${sec.id}`}
-                  data-active={activeSection === sec.id}
-                  className="report-toc-link"
-                >
-                  {sec.title}
-                </a>
-              ))}
-            </nav>
-          )}
+          <nav className="sticky top-8 flex flex-col gap-1 text-sm" aria-label="Report sections">
+            <span className="mb-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+              Contents
+            </span>
+            {sections.map((section) => (
+              <a
+                key={section.id}
+                href={`#${section.id}`}
+                data-active={activeSection === section.id}
+                className="rounded-md px-3 py-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground data-[active=true]:bg-secondary data-[active=true]:font-medium data-[active=true]:text-foreground"
+              >
+                {section.title}
+              </a>
+            ))}
+          </nav>
         </aside>
 
-        {/* Content Column */}
-        <article className="max-w-3xl report-prose space-y-12">
-          {/* Metadata Block */}
-          <div className="pb-8 border-b border-border">
-            <h1 className="text-4xl font-semibold tracking-tight text-foreground sm:text-5xl leading-none">
-              {title}
-            </h1>
-
-            <div className="report-metadata mt-6 flex flex-wrap items-center gap-y-2 gap-x-4 text-sm text-muted-foreground">
-              <span>{metadata.date}</span>
-              {metadata.duration && (
-                <>
-                  <span className="sep" />
-                  <span>{metadata.duration}</span>
-                </>
-              )}
-              {metadata.role && (
-                <>
-                  <span className="sep" />
-                  <span>{metadata.role}</span>
-                </>
-              )}
-              <>
-                <span className="sep" />
-                <span>{metadata.itemCountLabel}</span>
-              </>
-            </div>
-
-            {metadata.overallScore !== undefined && metadata.overallScore !== null && (
-              <div className="mt-6 flex items-center gap-3">
-                <div className="report-score-badge">
-                  <span className="score">{Math.round(metadata.overallScore)}%</span>
-                  <span className="label ml-2">Overall Score</span>
-                </div>
+        <article className="min-w-0 max-w-5xl space-y-8">
+          <section className="border-b border-border pb-8" data-report-section>
+            {profileLabel && (
+              <div className="flex justify-end">
+                <p className="text-base font-bold text-primary">
+                  {profileLabel}
+                </p>
               </div>
             )}
-          </div>
+            <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">{title}</h1>
 
-          {/* Report Content */}
-          <div className="space-y-12">
-            {children}
-          </div>
+            <div className="mt-6 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-md border border-border bg-card px-4 py-3">
+                <p className="text-xs font-bold text-muted-foreground">Date</p>
+                <p className="mt-1 text-sm font-medium">{metadata.date}</p>
+              </div>
+              <div className="rounded-md border border-border bg-card px-4 py-3">
+                <p className="text-xs font-bold text-muted-foreground">Time used / allowed</p>
+                <p className="mt-1 text-sm font-medium">
+                  {metadata.durationUsed || "—"} {metadata.durationAllowed ? `/ ${metadata.durationAllowed}` : ""}
+                </p>
+              </div>
+              <div className="rounded-md border border-primary/30 bg-primary/5 px-4 py-3">
+                <p className="text-xs font-bold text-muted-foreground">Overall score</p>
+                <p className="mt-1 text-xl font-medium tabular-nums">{scoreLabel}</p>
+              </div>
+            </div>
+
+            {customTargetDetails && (
+              <details className="mt-4 rounded-md border border-border bg-card px-4 py-3">
+                <summary className="cursor-pointer text-sm font-bold">View job description</summary>
+                <div className="mt-3 border-t border-border pt-3 text-sm leading-6 text-muted-foreground">
+                  {(metadata.role || metadata.company) && (
+                    <p className="font-medium text-foreground">
+                      {metadata.role || "Role not specified"}{metadata.company ? ` · ${metadata.company}` : ""}
+                    </p>
+                  )}
+                  {metadata.jobDescription && (
+                    <p className="mt-3 whitespace-pre-wrap">{metadata.jobDescription}</p>
+                  )}
+                </div>
+              </details>
+            )}
+          </section>
+
+          {!!metadata.stats?.length && (
+            <section id="overall-result" data-report-section className="rounded-lg border border-border bg-card p-5">
+              <h2 className="text-base font-bold">Overall result</h2>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                {metadata.stats.map((stat) => (
+                  <div key={stat.label} className="rounded-md border border-border/70 bg-background px-4 py-3">
+                    <p className="text-xs font-bold text-muted-foreground">{stat.label}</p>
+                    <p className="mt-1 text-lg font-medium tabular-nums">{stat.value}</p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <div className="space-y-10" data-report-content>{children}</div>
         </article>
       </div>
     </main>

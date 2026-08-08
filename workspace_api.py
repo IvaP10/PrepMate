@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field, field_validator
 from auth import get_current_admin, get_current_user
 
 from database import async_execute, get_db_connection, return_db_connection
+from analysis_pipeline import ANALYSIS_STAGE_VERSION
 from interview_profiles import DEFAULT_PROFILE_TYPE, PROFILE_CONFIGS, normalize_profile_type
 from learning_engine import (
     _active_mission_payload,
@@ -423,6 +424,23 @@ def _encrypted_json_object(value: Any) -> Dict[str, Any]:
     return _json_object(decrypt_data(str(value)))
 
 
+def _decrypt_text_blob(encrypted: Any, legacy: Any = None) -> str:
+    if encrypted is not None:
+        try:
+            value = encrypted
+            if isinstance(value, memoryview):
+                value = value.tobytes()
+            if isinstance(value, (bytes, bytearray)):
+                value = bytes(value).decode("utf-8", errors="strict")
+            decrypted = decrypt_data(str(value))
+            if decrypted and decrypted != "[encrypted]":
+                return str(decrypted)
+        except Exception:
+            logger.warning("Technical source payload could not be decrypted", exc_info=True)
+    value = str(legacy or "")
+    return "" if value == "[encrypted]" else value
+
+
 def _encrypt_json_bytes(value: Any) -> bytes:
     return encrypt_data(json.dumps(value or {}, default=str)).encode("utf-8")
 
@@ -741,7 +759,7 @@ def _recent_interviews(cursor, user_id: str, limit: int = 20) -> List[Dict[str, 
         f"""
         SELECT i.interview_id, i.interview_type, i.job_title,
                i.overall_score, i.created_at, i.interview_mode,
-               i.status, i.attempt_status
+               i.status, i.attempt_status, i.duration_seconds
         FROM Interviews i
         WHERE i.user_id = %s
           AND i.status IN ('completed', 'report_ready', 'partial', 'failed')
@@ -768,6 +786,7 @@ def _recent_interviews(cursor, user_id: str, limit: int = 20) -> List[Dict[str, 
             "mode": row[5],
             "status": row[6],
             "attempt_status": row[7],
+            "duration_seconds": int(row[8]) if row[8] is not None else None,
         })
     items.reverse()
     return items
@@ -1436,6 +1455,657 @@ def _canonical_strengths(comparable: List[Dict[str, Any]]) -> List[str]:
     return unique
 
 
+PERFORMANCE_ANALYTICS_DIMENSION_LABELS = {
+    "communication_clarity": "Communication",
+    "communication": "Communication",
+    "technical_competency": "Technical Knowledge",
+    "technical_accuracy": "Technical Knowledge",
+    "correctness": "Technical Knowledge",
+    "problem_solving": "Problem Solving",
+    "depth": "Depth",
+    "relevance": "Answer Relevance",
+    "star_structure": "Behavioral / STAR",
+    "behavioral": "Behavioral / STAR",
+    "tradeoffs": "System Design",
+    "architecture": "System Design",
+    "ownership": "Project / Resume Knowledge",
+    "specificity_evidence": "Project / Resume Knowledge",
+    "code_quality": "Code Quality",
+}
+
+
+def _performance_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
+def _analytics_question_type(item: Dict[str, Any]) -> str:
+    question = str(item.get("question") or "").lower()
+    raw_type = str(item.get("question_type") or "").lower()
+    if item.get("is_followup"):
+        return "Follow-up Questions"
+    if any(token in f"{raw_type} {question}" for token in ("system design", "architecture", "trade-off", "tradeoff")):
+        return "System Design"
+    if any(token in f"{raw_type} {question}" for token in ("project", "resume", "portfolio")):
+        return "Project / Resume Questions"
+    if any(token in f"{raw_type} {question}" for token in ("behavior", "star", "leadership", "conflict", "failure")):
+        return "Behavioral"
+    if any(token in f"{raw_type} {question}" for token in ("situational", "what would you", "how would you")):
+        return "Situational"
+    if any(token in f"{raw_type} {question}" for token in ("coding", "algorithm", "implement", "code")):
+        return "Coding Discussion"
+    return "Technical Concept Questions"
+
+
+def _analytics_topic_labels(item: Dict[str, Any], mode: str) -> List[str]:
+    raw_values: List[Any] = []
+    if mode == "technical":
+        for key in ("taxonomy_keys", "topics"):
+            raw = item.get(key)
+            raw_values.extend(raw if isinstance(raw, list) else [raw] if raw else [])
+        raw_values.extend([item.get("algorithm_pattern"), item.get("topic"), item.get("round_type")])
+    else:
+        raw = item.get("taxonomy_keys")
+        raw_values.extend(raw if isinstance(raw, list) else [raw] if raw else [])
+        raw_values.extend([item.get("skill"), item.get("topic"), item.get("topic_label")])
+    labels: List[str] = []
+    for value in raw_values:
+        label = _human_label(value)
+        if not label or label.lower() in {"general", "main", "question", "technical"}:
+            continue
+        if label not in labels:
+            labels.append(label)
+    return labels[:4]
+
+
+def _analytics_bucket() -> Dict[str, Any]:
+    return {
+        "scores": [],
+        "session_scores": defaultdict(list),
+        "session_ids": [],
+        "evidence": [],
+        "issues": Counter(),
+        "successes": 0,
+    }
+
+
+def _analytics_add(
+    bucket: Dict[str, Any],
+    score: Any,
+    session: Dict[str, Any],
+    evidence: Optional[Dict[str, Any]] = None,
+    *,
+    issue: Optional[str] = None,
+    success: bool = False,
+) -> None:
+    numeric = _performance_number(score)
+    if numeric is None:
+        return
+    session_id = str(session.get("interview_id") or "")
+    bucket["scores"].append(numeric)
+    bucket["session_scores"][session_id].append(numeric)
+    if session_id and session_id not in bucket["session_ids"]:
+        bucket["session_ids"].append(session_id)
+    if evidence:
+        key = json.dumps(evidence, sort_keys=True, default=str)
+        if not any(json.dumps(item, sort_keys=True, default=str) == key for item in bucket["evidence"]):
+            bucket["evidence"].append(evidence)
+    if issue:
+        bucket["issues"].update([_short_text(issue, 120)])
+    if success:
+        bucket["successes"] += 1
+
+
+def _analytics_bucket_row(
+    label: str,
+    bucket: Dict[str, Any],
+    *,
+    count_key: str,
+    count: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    scores = [float(value) for value in bucket.get("scores") or []]
+    session_scores = bucket.get("session_scores") or {}
+    ordered_session_ids = [item for item in bucket.get("session_ids") or [] if item in session_scores]
+    session_averages = [
+        _nullable_avg([float(value) for value in session_scores[session_id]])
+        for session_id in ordered_session_ids
+    ]
+    session_averages = [value for value in session_averages if value is not None]
+    recent_count = min(3, len(session_averages))
+    recent_average = _nullable_avg(session_averages[-recent_count:]) if recent_count else None
+    baseline_average = None
+    delta = None
+    direction = None
+    if len(session_averages) >= 2:
+        split = max(1, len(session_averages) // 2)
+        baseline_average = _nullable_avg(session_averages[:split])
+        delta = round(float(recent_average or 0) - float(baseline_average or 0), 1)
+        direction = "up" if delta >= 4 else "down" if delta <= -4 else "stable"
+    issues = bucket.get("issues") or Counter()
+    issue_counts = [
+        {"label": label, "count": count}
+        for label, count in issues.most_common(3)
+    ] if hasattr(issues, "most_common") else []
+    row: Dict[str, Any] = {
+        "label": label,
+        "average_score": _nullable_avg(scores),
+        "recent_average": recent_average,
+        "delta": delta,
+        "trend": direction,
+        count_key: count,
+        "evidence_count": count,
+        "round_count": len(session_scores),
+        "success_count": int(bucket.get("successes") or 0),
+        "common_issue": issue_counts[0]["label"] if issue_counts else None,
+        "issue_counts": issue_counts,
+        "evidence": (bucket.get("evidence") or [])[:24],
+    }
+    if extra:
+        row.update(extra)
+    return row
+
+
+def _analytics_summary(comparable: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scores = [
+        float(item["overall_score"])
+        for item in comparable
+        if item.get("evidence_status") == "sufficient" and item.get("overall_score") is not None
+    ]
+    durations = [
+        float(item["duration_seconds"])
+        for item in comparable
+        if item.get("duration_seconds") is not None
+    ]
+    recent_change = None
+    trend = None
+    if len(scores) >= 2:
+        recent_change = round(scores[-1] - scores[max(0, len(scores) - 5)], 1)
+        trend = "Improving" if recent_change >= 4 else "Declining" if recent_change <= -4 else "Stable"
+    return {
+        "total_rounds": len(comparable),
+        "average_score": _nullable_avg(scores),
+        "latest_score": scores[-1] if scores else None,
+        "best_score": round(max(scores), 1) if scores else None,
+        "recent_change": recent_change,
+        "average_duration_seconds": _nullable_avg(durations),
+        "trend": trend,
+    }
+
+
+def _canonical_round_history_item(session: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    analysis = session.get("analysis") or {}
+    report = _analysis_report(analysis)
+    score = (
+        _performance_number(session.get("overall_score"))
+        if session.get("evidence_status") == "sufficient"
+        else None
+    )
+    result: Dict[str, Any] = {
+        "interview_id": session.get("interview_id"),
+        "analysis_id": session.get("analysis_id"),
+        "mode": "technical" if mode == "technical" else "interview",
+        "role": session.get("role") or report.get("job_title") or None,
+        "company": (session.get("settings") or {}).get("company"),
+        "completed_at": _performance_iso(session.get("created_at")),
+        "score": score,
+        "duration_seconds": session.get("duration_seconds"),
+        "score_state": (
+            "ready"
+            if score is not None
+            else "run_only"
+            if session.get("evidence_status") == "draft_or_run_only"
+            else "insufficient"
+        ),
+        "source_kind": "canonical_v4",
+        "round_id": None,
+        "change": None,
+    }
+    if mode == "technical":
+        technical = analysis.get("technical") if isinstance(analysis.get("technical"), dict) else {}
+        matrix = [item for item in technical.get("test_matrix") or [] if isinstance(item, dict)]
+        attempted = [item for item in matrix if item.get("evidence_state") not in {None, "no_evidence", "no_candidate_evidence"}]
+        submitted = [item for item in attempted if item.get("evidence_state") == "final_submission" or item.get("submission_id")]
+        solved = [
+            item for item in submitted
+            if str(item.get("final_verdict") or "").lower() in {"accepted", "correct", "solved", "meets_bar"}
+            or (_performance_number(item.get("final_pass_rate")) or 0) >= 100
+        ]
+        result.update({
+            "problems_attempted": len(attempted),
+            "problems_total": len(matrix) or int(technical.get("round_count") or 0),
+            "problems_solved": len(solved),
+            "questions_completed": None,
+            "questions_total": None,
+            "key_result": (
+                f"{len(solved)}/{len(matrix)} solved" if matrix else None
+            ),
+            "round_id": next((item.get("round_id") for item in matrix if item.get("round_id")), None),
+        })
+    else:
+        questions = [item for item in analysis.get("question_analyses") or analysis.get("questions") or [] if isinstance(item, dict)]
+        counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+        total = int(counts.get("questions_asked") or len(questions))
+        answered = int(counts.get("questions_answered") or sum(
+            1 for item in questions
+            if _question_score(item) is not None and "no_response" not in {str(flag).lower() for flag in item.get("answer_quality_flags") or []}
+        ))
+        fully = int(counts.get("questions_fully_answered") or 0)
+        result.update({
+            "questions_completed": answered,
+            "questions_total": total,
+            "problems_attempted": None,
+            "problems_total": None,
+            "problems_solved": None,
+            "key_result": f"{fully}/{total} fully answered" if total else None,
+        })
+    return result
+
+
+def _cumulative_performance_analytics(
+    comparable: List[Dict[str, Any]],
+    mode: str,
+) -> Dict[str, Any]:
+    analytics: Dict[str, Any] = {
+        "summary": _analytics_summary(comparable),
+        "skills": [],
+        "topics": [],
+        "question_types": [],
+        "patterns": [],
+        "behavior": [],
+        "improvement": {"improving": [], "declining": [], "stable": []},
+    }
+    if not comparable:
+        return analytics
+
+    if mode != "technical":
+        skill_buckets: Dict[str, Dict[str, Any]] = defaultdict(_analytics_bucket)
+        topic_buckets: Dict[str, Dict[str, Any]] = defaultdict(_analytics_bucket)
+        type_buckets: Dict[str, Dict[str, Any]] = defaultdict(_analytics_bucket)
+        pattern_buckets: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "sessions": set(), "evidence": []})
+        followup_scores: List[float] = []
+        initial_scores: List[float] = []
+        successful_followups = 0
+        shallow_followups: List[Dict[str, Any]] = []
+        behavior_values: Dict[str, List[float]] = defaultdict(list)
+        answer_counts = Counter()
+
+        for session in comparable:
+            analysis = session.get("analysis") or {}
+            report = _analysis_report(analysis)
+            questions = [item for item in analysis.get("question_analyses") or analysis.get("questions") or [] if isinstance(item, dict)]
+            if not questions:
+                continue
+            main_by_id = {
+                str(item.get("question_id") or item.get("response_id")): _question_score(item)
+                for item in questions
+                if not item.get("is_followup") and _question_score(item) is not None
+            }
+            for question in questions:
+                score = _question_score(question)
+                if score is None:
+                    continue
+                flags = [
+                    _flag_label(raw_flag)
+                    for raw_flag in question.get("answer_quality_flags") or []
+                    if str(raw_flag).strip()
+                ]
+                primary_issue = flags[0] if flags else ("Low-scoring answer" if score < 70 else None)
+                evidence = {
+                    "interview_id": session.get("interview_id"),
+                    "date": _performance_iso(session.get("created_at")),
+                    "question": _short_text(question.get("question"), 120),
+                    "question_type": _analytics_question_type(question),
+                    "score": score,
+                    "response_id": question.get("response_id"),
+                }
+                if primary_issue:
+                    evidence["issue"] = primary_issue
+                dimensions = question.get("dimension_scores") if isinstance(question.get("dimension_scores"), dict) else {}
+                for raw_key, value in dimensions.items():
+                    label = PERFORMANCE_ANALYTICS_DIMENSION_LABELS.get(str(raw_key).lower())
+                    if label:
+                        dimension_score = _performance_number(value)
+                        _analytics_add(
+                            skill_buckets[label],
+                            dimension_score,
+                            session,
+                            evidence,
+                            issue=primary_issue,
+                            success=dimension_score is not None and dimension_score >= 80,
+                        )
+                for topic in _analytics_topic_labels(question, "interview"):
+                    _analytics_add(
+                        topic_buckets[topic],
+                        score,
+                        session,
+                        evidence,
+                        issue=primary_issue,
+                        success=score >= 80,
+                    )
+                _analytics_add(
+                    type_buckets[_analytics_question_type(question)],
+                    score,
+                    session,
+                    evidence,
+                    issue=primary_issue,
+                    success=score >= 80,
+                )
+                if question.get("is_followup"):
+                    followup_scores.append(score)
+                    if score >= 70:
+                        successful_followups += 1
+                    parent_score = main_by_id.get(str((question.get("follow_up_chain") or {}).get("parent_question_id") or ""))
+                    if parent_score is None and main_by_id:
+                        parent_score = max(main_by_id.values())
+                    if parent_score is not None and parent_score >= 70 and score < 70:
+                        shallow_followups.append(evidence)
+                else:
+                    initial_scores.append(score)
+                for raw_flag in question.get("answer_quality_flags") or []:
+                    flag = str(raw_flag).strip().lower()
+                    label = {
+                        "too_short": "Answers stop before the reasoning or result is complete",
+                        "no_response": "Questions are left unanswered",
+                        "vague": "Explanations lack specific evidence",
+                        "off_topic": "Answers drift away from the question",
+                        "low_lexical_relevance": "Answers do not directly address the question",
+                        "no_evidence": "Claims are not backed by an example or result",
+                        "missing_tradeoffs": "System-design answers omit trade-offs",
+                        "unsupported_or_unspecific": "Claims are not supported with concrete detail",
+                        "ownership_unclear": "Project answers do not make ownership clear",
+                    }.get(flag)
+                    if label:
+                        bucket = pattern_buckets[label]
+                        bucket["count"] += 1
+                        bucket["sessions"].add(str(session.get("interview_id") or ""))
+                        bucket["evidence"].append(evidence)
+            behavioral = report.get("behavioral_metrics") if isinstance(report.get("behavioral_metrics"), dict) else {}
+            measured = analysis.get("measured_communication") if isinstance(analysis.get("measured_communication"), dict) else {}
+            audio = measured.get("audio") if isinstance(measured.get("audio"), dict) else {}
+            for key, values in {
+                "average_answer_seconds": [behavioral.get("average_response_time_seconds")],
+                "response_latency_seconds": [behavioral.get("response_latency_seconds_avg"), audio.get("response_latency_seconds_avg")],
+                "words_per_minute": [behavioral.get("words_per_minute"), audio.get("words_per_minute")],
+            }.items():
+                numeric_values = [_performance_raw_number(value) for value in values]
+                numeric_values = [value for value in numeric_values if value is not None]
+                if numeric_values:
+                    behavior_values[key].append(numeric_values[0])
+            counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+            answer_counts.update({
+                "asked": int(counts.get("questions_asked") or len(questions)),
+                "answered": int(counts.get("questions_answered") or 0),
+                "fully": int(counts.get("questions_fully_answered") or 0),
+                "partial": int(counts.get("questions_partially_answered") or 0),
+                "not_answered": int(counts.get("questions_not_answered") or 0),
+            })
+
+        def build_rows(buckets: Dict[str, Dict[str, Any]], count_key: str) -> List[Dict[str, Any]]:
+            return [
+                _analytics_bucket_row(label, bucket, count_key=count_key, count=len(bucket.get("scores") or []))
+                for label, bucket in sorted(
+                    buckets.items(),
+                    key=lambda item: (-len(item[1].get("scores") or []), item[0]),
+                )
+                if bucket.get("scores")
+            ]
+
+        analytics["skills"] = build_rows(skill_buckets, "evaluated_questions")
+        analytics["topics"] = build_rows(topic_buckets, "question_count")
+        analytics["question_types"] = build_rows(type_buckets, "question_count")
+        if initial_scores or followup_scores:
+            analytics["follow_up"] = {
+                "initial_average": _nullable_avg(initial_scores),
+                "followup_average": _nullable_avg(followup_scores),
+                "followups_answered_successfully": successful_followups,
+                "followups_evaluated": len(followup_scores),
+                "shallow_followups": shallow_followups[:12],
+            }
+        recurring = []
+        for label, bucket in pattern_buckets.items():
+            session_count = len({item for item in bucket["sessions"] if item})
+            if bucket["count"] >= 2 and session_count >= 2:
+                recurring.append({
+                    "label": label,
+                    "count": bucket["count"],
+                    "round_count": session_count,
+                    "evidence": bucket["evidence"][:12],
+                })
+        if len(shallow_followups) >= 2 and len({item.get("interview_id") for item in shallow_followups}) >= 2:
+            recurring.append({
+                "label": "Basic answers hold up, but deeper follow-ups lose technical depth",
+                "count": len(shallow_followups),
+                "round_count": len({item.get("interview_id") for item in shallow_followups}),
+                "evidence": shallow_followups[:12],
+            })
+        analytics["patterns"] = sorted(recurring, key=lambda item: (-item["count"], item["label"]))
+        behavior_metrics = []
+        for label, key, suffix in (
+            ("Average answer duration", "average_answer_seconds", " sec"),
+            ("Average time before answering", "response_latency_seconds", " sec"),
+            ("Average speaking pace", "words_per_minute", " wpm"),
+        ):
+            values = behavior_values.get(key) or []
+            if values:
+                behavior_metrics.append({"label": label, "value": _nullable_avg(values), "display": _format_number_value(_nullable_avg(values), suffix)})
+        for label, key in (
+            ("Questions asked", "asked"),
+            ("Questions answered", "answered"),
+            ("Fully answered", "fully"),
+            ("Partial answers", "partial"),
+            ("Not answered", "not_answered"),
+        ):
+            if answer_counts.get(key):
+                behavior_metrics.append({"label": label, "value": int(answer_counts[key]), "display": str(int(answer_counts[key]))})
+        asked = answer_counts.get("asked")
+        if asked:
+            for label, key in (("Fully answered", "fully"), ("Partial answers", "partial"), ("Not answered", "not_answered")):
+                if answer_counts.get(key):
+                    percentage = round(answer_counts[key] / asked * 100, 1)
+                    behavior_metrics.append({"label": f"{label} %", "value": percentage, "display": _format_percent_value(percentage)})
+        analytics["behavior"] = behavior_metrics
+    else:
+        topic_buckets: Dict[str, Dict[str, Any]] = defaultdict(_analytics_bucket)
+        failure_buckets: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "sessions": set(), "evidence": []})
+        test_failure_buckets: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"count": 0, "sessions": set(), "evidence": []})
+        total_problems = attempted = submitted = solved = 0
+        visible_passed = visible_total = hidden_passed = hidden_total = 0
+        coded_not_submitted = never_attempted = 0
+        run_counts: List[float] = []
+        solved_times: List[float] = []
+        unsolved_times: List[float] = []
+        complexity_rows: List[Dict[str, Any]] = []
+        submission_issues: List[Dict[str, Any]] = []
+        for session in comparable:
+            analysis = session.get("analysis") or {}
+            technical = analysis.get("technical") if isinstance(analysis.get("technical"), dict) else {}
+            matrix = [item for item in technical.get("test_matrix") or [] if isinstance(item, dict)]
+            total_problems += len(matrix) or int(technical.get("round_count") or 0)
+            for item in matrix:
+                state = str(item.get("evidence_state") or "no_evidence")
+                attempted_item = state not in {"no_evidence", "no_candidate_evidence"}
+                submitted_item = state == "final_submission" or bool(item.get("submission_id"))
+                verdict = str(item.get("final_verdict") or "").lower()
+                score = _performance_number(item.get("final_pass_rate"), item.get("score"))
+                evidence = {
+                    "interview_id": session.get("interview_id"),
+                    "date": _performance_iso(session.get("created_at")),
+                    "problem": _short_text(item.get("title") or item.get("problem") or item.get("round_type"), 110),
+                    "score": score,
+                    "round_id": item.get("round_id"),
+                }
+                if attempted_item:
+                    attempted += 1
+                    if submitted_item:
+                        submitted += 1
+                    else:
+                        coded_not_submitted += 1
+                    solved_item = submitted_item and (
+                        verdict in {"accepted", "correct", "solved", "meets_bar"}
+                        or (score is not None and score >= 100)
+                    )
+                    if solved_item:
+                        solved += 1
+                    if score is not None:
+                        for topic in _analytics_topic_labels(item, "technical"):
+                            _analytics_add(
+                                topic_buckets[topic],
+                                score,
+                                session,
+                                evidence,
+                                issue=str(item.get("failure_reason") or item.get("main_issue") or "").strip() or None,
+                                success=solved_item,
+                            )
+                    if item.get("run_count") is not None:
+                        run_counts.append(float(item.get("run_count") or 0))
+                    elapsed = _performance_raw_number(item.get("time_used_seconds"))
+                    if elapsed is not None:
+                        (solved_times if submitted_item and (score or 0) >= 100 else unsolved_times).append(elapsed / 60)
+                    visible_passed += int(item.get("visible_passed") or 0)
+                    visible_total += int(item.get("visible_total") or 0)
+                    hidden_passed += int(item.get("hidden_passed") or 0)
+                    hidden_total += int(item.get("hidden_total") or 0)
+                    raw_issue = item.get("failure_reason") or item.get("main_issue")
+                    issue = str(raw_issue or "").strip()
+                    issue_lower = issue.lower()
+                    if any(token in issue_lower for token in ("platform", "service unavailable", "execution service", "infrastructure")):
+                        issue = ""
+                    if not issue and submitted_item and verdict not in {"accepted", "correct", "solved", "meets_bar", ""}:
+                        issue = _human_label(verdict)
+                    if not issue and not submitted_item:
+                        issue = "No final submission"
+                    if issue:
+                        issue = _short_text(issue, 120)
+                        bucket = failure_buckets[issue]
+                        bucket["count"] += 1
+                        bucket["sessions"].add(str(session.get("interview_id") or ""))
+                        bucket["evidence"].append(evidence)
+                    if not submitted_item:
+                        submission_issues.append({
+                            **evidence,
+                            "issue": "No final submission",
+                            "time_used_seconds": item.get("time_used_seconds"),
+                            "run_count": item.get("run_count"),
+                        })
+                    visible_total_for_pattern = int(item.get("visible_total") or 0)
+                    hidden_total_for_pattern = int(item.get("hidden_total") or 0)
+                    visible_passed_for_pattern = int(item.get("visible_passed") or 0)
+                    hidden_passed_for_pattern = int(item.get("hidden_passed") or 0)
+                    test_pattern = None
+                    if hidden_total_for_pattern and hidden_passed_for_pattern < hidden_total_for_pattern:
+                        test_pattern = (
+                            "Visible tests pass, hidden tests fail"
+                            if visible_total_for_pattern and visible_passed_for_pattern == visible_total_for_pattern
+                            else "Hidden tests fail"
+                        )
+                    elif visible_total_for_pattern and visible_passed_for_pattern < visible_total_for_pattern:
+                        test_pattern = "Visible tests fail"
+                    if str(issue).lower() == "runtime error":
+                        test_pattern = "Runtime failures"
+                    if test_pattern:
+                        test_bucket = test_failure_buckets[test_pattern]
+                        test_bucket["count"] += 1
+                        test_bucket["sessions"].add(str(session.get("interview_id") or ""))
+                        test_bucket["evidence"].append({**evidence, "issue": test_pattern})
+                    expected = item.get("expected_time_complexity")
+                    actual = item.get("user_time_complexity") or item.get("complexity")
+                    if expected or actual:
+                        complexity_rows.append({
+                            "problem": evidence.get("problem"),
+                            "expected": expected,
+                            "actual": actual,
+                            "round_id": item.get("round_id"),
+                        })
+                else:
+                    never_attempted += 1
+        analytics["topics"] = [
+            _analytics_bucket_row(label, bucket, count_key="problems_attempted", count=len(bucket.get("scores") or []), extra={
+                "problems_solved": int(bucket.get("successes") or 0),
+                "average_test_pass": _nullable_avg([float(item) for item in bucket.get("scores") or []]),
+            })
+            for label, bucket in sorted(topic_buckets.items(), key=lambda item: (-len(item[1].get("scores") or []), item[0]))
+            if bucket.get("scores")
+        ]
+        analytics["submission"] = {
+            "problems_attempted": attempted,
+            "problems_total": total_problems,
+            "problems_submitted": submitted,
+            "problems_solved": solved,
+            "submission_rate": round(submitted / attempted * 100, 1) if attempted else None,
+            "coded_not_submitted": coded_not_submitted,
+            "never_attempted": never_attempted,
+            "problems": submission_issues[:24],
+        }
+        test_metrics = []
+        if visible_total:
+            test_metrics.append({"label": "Visible tests passed", "value": round(visible_passed / visible_total * 100, 1), "display": _format_percent_value(round(visible_passed / visible_total * 100, 1))})
+        if hidden_total:
+            test_metrics.append({"label": "Hidden tests passed", "value": round(hidden_passed / hidden_total * 100, 1), "display": _format_percent_value(round(hidden_passed / hidden_total * 100, 1))})
+        analytics["tests"] = test_metrics
+        analytics["test_patterns"] = [
+            {
+                "label": label,
+                "count": bucket["count"],
+                "round_count": len({item for item in bucket["sessions"] if item}),
+                "evidence": bucket["evidence"][:12],
+            }
+            for label, bucket in sorted(test_failure_buckets.items(), key=lambda item: (-item[1]["count"], item[0]))
+            if bucket["count"] >= 2 and len({item for item in bucket["sessions"] if item}) >= 2
+        ]
+        time_metrics = []
+        if run_counts and _nullable_avg(run_counts) is not None and _nullable_avg(run_counts) < 2:
+            time_metrics.append({
+                "label": "Runs code too few times before submitting",
+                "value": _nullable_avg(run_counts),
+                "display": _format_number_value(_nullable_avg(run_counts), " runs/problem"),
+                "count": len(run_counts),
+            })
+        if unsolved_times:
+            unsolved_average = _nullable_avg(unsolved_times)
+            solved_average = _nullable_avg(solved_times)
+            time_metrics.append({
+                "label": "Unsolved problems consume time without a final result",
+                "value": unsolved_average,
+                "display": (
+                    f"{_format_number_value(unsolved_average, ' min')} average"
+                    + (f" vs {_format_number_value(solved_average, ' min')} for solved problems" if solved_average is not None else "")
+                ),
+                "count": len(unsolved_times),
+            })
+        analytics["time"] = time_metrics
+        analytics["patterns"] = [
+            {"label": label, "count": bucket["count"], "round_count": len({item for item in bucket["sessions"] if item}), "evidence": bucket["evidence"][:12]}
+            for label, bucket in sorted(failure_buckets.items(), key=lambda item: (-item[1]["count"], item[0]))
+            if bucket["count"] >= 2 and len({item for item in bucket["sessions"] if item}) >= 2
+        ]
+        if complexity_rows:
+            analytics["complexity"] = complexity_rows[:24]
+        analytics["summary"].update({
+            "problems_attempted": attempted,
+            "problems_total": total_problems,
+            "problems_solved": solved,
+            "submission_rate": round(submitted / attempted * 100, 1) if attempted else None,
+        })
+
+    for key in ("skills", "topics", "question_types"):
+        for row in analytics.get(key) or []:
+            direction = row.get("trend")
+            if direction in {"up", "down", "stable"}:
+                analytics["improvement"][{"up": "improving", "down": "declining", "stable": "stable"}[direction]].append({
+                    "label": row.get("label"),
+                    "baseline": row.get("average_score") if row.get("delta") is None else round(float(row.get("recent_average") or 0) - float(row.get("delta") or 0), 1),
+                    "recent": row.get("recent_average"),
+                    "delta": row.get("delta"),
+                    "round_count": row.get("round_count"),
+                })
+    return analytics
+
+
 def _canonical_performance_cohort(
     rows: List[Dict[str, Any]],
 ) -> tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
@@ -1472,7 +2142,9 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                analysis.taxonomy_version, analysis.rubric_version,
                analysis.duration_seconds, analysis.evidence_status,
                COALESCE(interview.completed_at, interview.created_at) AS session_at,
-               analysis.created_at AS analyzed_at
+               analysis.created_at AS analyzed_at,
+               interview.job_title,
+               interview.settings
         FROM SessionPerformanceAnalyses analysis
         JOIN Interviews interview
           ON interview.interview_id = analysis.interview_id
@@ -1480,6 +2152,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
         WHERE analysis.user_id = %s
           AND analysis.status = 'ready'
           AND analysis.schema_version = 'session-performance-v4'
+          AND analysis.producer_version = %s
           AND analysis.is_current = TRUE
           AND analysis.analysis_json_encrypted IS NOT NULL
           AND analysis.evidence_index_encrypted IS NOT NULL
@@ -1487,7 +2160,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                  analysis.created_at DESC
         LIMIT %s
         """,
-        (user_id, min(max(int(limit or 100), 1), 200)),
+        (user_id, ANALYSIS_STAGE_VERSION, min(max(int(limit or 100), 1), 200)),
     )
     grouped: Dict[str, List[Dict[str, Any]]] = {"interview": [], "technical": []}
     for row in cursor.fetchall() or []:
@@ -1519,6 +2192,8 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             "evidence_status": row[13 + offset],
             "created_at": row[14 + offset],
             "analyzed_at": row[15 + offset] if len(row) > 15 + offset else row[14 + offset],
+            "role": row[18] if encrypted_shape and len(row) > 18 else None,
+            "settings": _json_object(row[19]) if encrypted_shape and len(row) > 19 else {},
             "profile_family": (
                 analysis.get("profile_type")
                 or ((analysis.get("report") or {}).get("profile_type") if isinstance(analysis.get("report"), dict) else None)
@@ -1543,7 +2218,9 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             round_ids = [
                 str(entry.get("submission_id") or entry.get("round_id"))
                 for entry in index.get("technical_rounds", [])
-                if isinstance(entry, dict) and (entry.get("submission_id") or entry.get("round_id"))
+                if isinstance(entry, dict)
+                and entry.get("has_candidate_evidence", True)
+                and (entry.get("submission_id") or entry.get("round_id"))
             ]
             round_ids.extend(str(value) for value in index.get("submission_ids", []) if value)
             round_ids.extend(str(value) for value in index.get("round_ids", []) if value)
@@ -1581,6 +2258,13 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             return ids[0] if ids else None
 
         comparable.reverse()
+        comparable_ids = {str(item.get("analysis_id")) for item in comparable}
+        round_history = []
+        for item in rows:
+            history_item = _canonical_round_history_item(item, mode)
+            history_item["included_in_trend"] = str(item.get("analysis_id")) in comparable_ids
+            round_history.append(history_item)
+        round_history.sort(key=lambda item: item.get("completed_at") or "", reverse=True)
         trend = [
             {
                 "analysis_id": item["analysis_id"],
@@ -1761,8 +2445,10 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                     "raw_value": float(technical["correctness_score"]),
                 })
             for label, key in (
+                ("Prepared rounds", "round_count"),
                 ("Final submissions", "submission_count"),
                 ("Recorded runs", "run_event_count"),
+                ("Saved drafts", "draft_count"),
                 ("Assessed written responses", "typed_assessed_count"),
             ):
                 if technical.get(key) is not None:
@@ -1781,6 +2467,8 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                     continue
                 problem_rows.append({
                     "round_id": item.get("round_id"),
+                    "evidence_state": item.get("evidence_state") or "unknown",
+                    "evidence_id": item.get("submission_id") or item.get("response_id") or item.get("latest_run_id") or item.get("snapshot_id"),
                     "problem": item.get("title") or _human_label(item.get("round_type") or "Technical response"),
                     "language": item.get("language"),
                     "result": _human_label(item.get("final_verdict") or "unknown"),
@@ -1793,7 +2481,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             if problem_rows:
                 sections.append({
                     "id": "technical_problem_evidence",
-                    "title": "Attempted problems",
+                    "title": "Technical round evidence",
                     "kind": "table",
                     "columns": [
                         {"key": "problem", "label": "Problem"},
@@ -1850,6 +2538,7 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             comparable,
             trend if mode == "technical" else [],
         )
+        cumulative_analytics = _cumulative_performance_analytics(comparable, mode)
         if mode != "technical":
             interview_dimensions = _analysis_dimensions(latest.get("analysis") or {})
             technical_summary["latest_score"] = _performance_number(
@@ -1930,6 +2619,8 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                 "excluded_incompatible_count": excluded_count,
             },
             "trend": trend,
+            "round_history": round_history,
+            "analytics": cumulative_analytics,
             "page_summary": {
                 "communication": communication_summary,
                 "technical": technical_summary,
@@ -2256,6 +2947,30 @@ def _interview_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         for item in interviews
         if scores_by_interview.get(str(item.get("interview_id")))
     ][-5:]
+    responses_by_interview: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for response in responses:
+        responses_by_interview[str(response.get("interview_id") or "")].append(response)
+    round_history = [
+        {
+            "interview_id": item.get("interview_id"),
+            "mode": "interview",
+            "role": item.get("job_title"),
+            "completed_at": item.get("date"),
+            "score": _nullable_avg(scores_by_interview.get(str(item.get("interview_id")), [])),
+            "duration_seconds": item.get("duration_seconds"),
+            "score_state": "ready" if scores_by_interview.get(str(item.get("interview_id"))) else "insufficient",
+            "source_kind": "recorded_evidence",
+            "included_in_trend": bool(scores_by_interview.get(str(item.get("interview_id")))),
+            "questions_completed": sum(1 for response in responses_by_interview.get(str(item.get("interview_id")), []) if response.get("response")),
+            "questions_total": len(responses_by_interview.get(str(item.get("interview_id")), [])),
+            "problems_attempted": None,
+            "problems_total": None,
+            "problems_solved": None,
+            "change": None,
+            "key_result": None,
+        }
+        for item in interviews
+    ]
     response_scores = [float(item["score"]) for item in scored_responses]
     latest_score = float(score_trend[-1]["score"]) if score_trend and score_trend[-1].get("score") is not None else None
     overview: List[Dict[str, Any]] = []
@@ -2495,6 +3210,7 @@ def _interview_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
     ][:4]
     payload = _dynamic_payload("interview", bool(responses), overview, sections, next_focus)
     payload["trend"] = score_trend
+    payload["round_history"] = round_history
     payload["overall_score"] = latest_score
     payload["has_evidence"] = bool(responses)
     payload["has_official_score"] = latest_score is not None
@@ -2752,10 +3468,14 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
                COUNT(DISTINCT tcs.snapshot_id) AS snapshot_count,
                COUNT(DISTINCT ts.submission_id) AS submission_count
         FROM TechnicalInterviewRounds tir
+        JOIN Interviews interview
+          ON interview.interview_id = tir.interview_id
+         AND interview.user_id = tir.user_id
         LEFT JOIN TechnicalRunEvents tre ON tre.round_id = tir.round_id
         LEFT JOIN TechnicalCodeSnapshots tcs ON tcs.round_id = tir.round_id
         LEFT JOIN TechnicalSubmissions ts ON ts.round_id = tir.round_id
         WHERE tir.user_id = %s
+          AND interview.attempt_status = 'completed'
         GROUP BY tir.round_id, tir.interview_id, tir.round_type, tir.prompt,
                  tir.metadata, tir.status, tir.created_at, tir.completed_at
         ORDER BY tir.created_at ASC
@@ -2775,7 +3495,8 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         """
         SELECT DISTINCT ON (round_id)
                round_id, visible_passed, visible_total, hidden_passed, hidden_total,
-               source_code, result_json, runtime_ms, memory_kb, created_at
+               source_code, result_json, runtime_ms, memory_kb, created_at,
+               source_code_encrypted
         FROM TechnicalSubmissions
         WHERE user_id = %s AND round_id = ANY(%s)
         ORDER BY round_id, created_at DESC
@@ -2788,7 +3509,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
             "visible_total": int(row[2] or 0),
             "hidden_passed": int(row[3] or 0),
             "hidden_total": int(row[4] or 0),
-            "source_code": row[5] or "",
+            "source_code": _decrypt_text_blob(row[10], row[5]),
             "result_json": _json_object(row[6]),
             "runtime_ms": row[7],
             "memory_kb": row[8],
@@ -2799,7 +3520,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         """
         SELECT DISTINCT ON (round_id)
                round_id, exit_code, error_signature, stderr, source_code,
-               hidden_validation_result, created_at
+               hidden_validation_result, created_at, source_code_encrypted
         FROM TechnicalRunEvents
         WHERE user_id = %s AND round_id = ANY(%s)
         ORDER BY round_id, created_at DESC
@@ -2811,7 +3532,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
             "exit_code": row[1],
             "error_signature": row[2],
             "stderr": row[3],
-            "source_code": row[4] or "",
+            "source_code": _decrypt_text_blob(row[7], row[4]),
             "hidden_validation_result": _json_object(row[5]),
             "created_at": row[6],
         }
@@ -2847,18 +3568,37 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
 
     problem_rows: List[Dict[str, Any]] = []
     scores: List[Dict[str, Any]] = []
-    topic_totals: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"attempts": 0, "solved": 0, "scores": [], "issues": Counter()})
+    topic_totals: Dict[str, Dict[str, Any]] = defaultdict(lambda: {"attempts": 0, "solved": 0, "scores": [], "issues": Counter(), "sessions": set()})
     failure_counts: Counter[str] = Counter()
     approach_counts: Counter[str] = Counter()
     hidden_failure_tags: Counter[str] = Counter()
     run_counts: List[float] = []
     time_per_problem: List[float] = []
+    session_rounds: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+        "total": 0,
+        "attempted": 0,
+        "submitted": 0,
+        "solved": 0,
+        "created_at": None,
+        "completed_at": None,
+    })
+    session_scores: Dict[str, List[float]] = defaultdict(list)
     attempted_count = 0
     submitted_count = 0
     solved_count = 0
 
     for row in rounds:
         round_id, interview_id, round_type, prompt, raw_metadata, status_value, created_at, completed_at, run_count, snapshot_count, submission_count = row
+        session = session_rounds[str(interview_id)]
+        session["total"] += 1
+        session["created_at"] = min(
+            [value for value in (session.get("created_at"), created_at) if value is not None],
+            default=None,
+        )
+        session["completed_at"] = max(
+            [value for value in (session.get("completed_at"), completed_at) if value is not None],
+            default=None,
+        )
         metadata = _json_object(raw_metadata)
         submission = latest_submissions.get(round_id, {})
         latest_run = latest_runs.get(round_id, {})
@@ -2868,8 +3608,10 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         if not attempted:
             continue
         attempted_count += 1
+        session["attempted"] += 1
         if submitted:
             submitted_count += 1
+            session["submitted"] += 1
         if run_count:
             run_counts.append(float(run_count))
         if created_at and completed_at:
@@ -2892,8 +3634,10 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         correctness_evidence = "Final submit" if submission_correctness else "Latest run" if run_correctness else ""
         if submission_correctness:
             scores.append({"label": created_at.isoformat() if created_at else None, "score": correctness["score"], "round_id": round_id, "interview_id": interview_id})
+            session_scores[str(interview_id)].append(float(correctness["score"]))
             if submitted and correctness["status"] == "Correct":
                 solved_count += 1
+                session["solved"] += 1
 
         user_approach = _detect_code_approach(code)
         better_approach = _expected_approach(metadata)
@@ -2911,9 +3655,10 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         topics = _attempted_topics(str(prompt or ""), metadata)
         for topic in topics:
             topic_totals[topic]["attempts"] += 1
+            topic_totals[topic]["sessions"].add(str(interview_id))
             if correctness:
                 topic_totals[topic]["scores"].append(correctness["score"])
-                if correctness["status"] == "Correct":
+                if submitted and correctness["status"] == "Correct":
                     topic_totals[topic]["solved"] += 1
             if failure_reason:
                 topic_totals[topic]["issues"].update([failure_reason])
@@ -2932,6 +3677,9 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
                 understanding = "Needed hint support before approach evidence was clear"
 
         problem_rows.append({
+            "interview_id": interview_id,
+            "date": _performance_iso(completed_at or created_at),
+            "round_id": round_id,
             "problem": _short_text(metadata.get("title") or prompt or round_type, 90),
             "topics": ", ".join(topics),
             "user_approach": user_approach or "",
@@ -2946,10 +3694,32 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
             "concept_application": concept_label or "",
             "problem_understanding": understanding or "",
             "evidence_id": round_id,
+            "run_count": int(run_count or 0),
         })
 
     if attempted_count == 0:
         return _dynamic_payload("technical", False, [], [])
+
+    round_history = [
+        {
+            "interview_id": interview_id,
+            "mode": "technical",
+            "completed_at": _performance_iso(session.get("completed_at") or session.get("created_at")),
+            "score": _nullable_avg(session_scores.get(interview_id) or []),
+            "duration_seconds": None,
+            "score_state": "ready" if session_scores.get(interview_id) else "run_only" if session.get("attempted") else "insufficient",
+            "source_kind": "recorded_evidence",
+            "included_in_trend": bool(session_scores.get(interview_id)),
+            "questions_completed": None,
+            "questions_total": None,
+            "problems_attempted": session.get("attempted"),
+            "problems_total": session.get("total"),
+            "problems_solved": session.get("solved"),
+            "change": None,
+            "key_result": f"{session.get('solved', 0)}/{session.get('total', 0)} solved",
+        }
+        for interview_id, session in session_rounds.items()
+    ]
 
     overview: List[Dict[str, Any]] = [
         {"label": "Problems attempted", "value": str(attempted_count), "raw_value": attempted_count},
@@ -2982,6 +3752,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         topic_rows.append({
             "topic": topic,
             "attempts": attempts,
+            "round_count": len(values["sessions"]),
             "solved": values["solved"],
             "score": _format_percent_value(avg_score),
             "current_level": current_level,
@@ -3120,6 +3891,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
 
     payload = _dynamic_payload("technical", True, overview, sections, next_focus)
     payload["trend"] = scores[-5:]
+    payload["round_history"] = sorted(round_history, key=lambda item: item.get("completed_at") or "", reverse=True)
     payload["overall_score"] = scores[-1]["score"] if scores else None
     payload["has_evidence"] = True
     payload["has_official_score"] = bool(scores)
@@ -3152,7 +3924,197 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         },
         "strengths": [],
     }
+    payload["analytics"] = _recorded_technical_analytics(
+        problem_rows=problem_rows,
+        topic_rows=topic_rows,
+        round_history=round_history,
+        attempted_count=attempted_count,
+        total_problems=sum(session.get("total", 0) for session in session_rounds.values()),
+        submitted_count=submitted_count,
+        solved_count=solved_count,
+        run_counts=run_counts,
+    )
     return payload
+
+
+def _recorded_technical_analytics(
+    *,
+    problem_rows: List[Dict[str, Any]],
+    topic_rows: List[Dict[str, Any]],
+    round_history: List[Dict[str, Any]],
+    attempted_count: int,
+    total_problems: int,
+    submitted_count: int,
+    solved_count: int,
+    run_counts: List[float],
+) -> Dict[str, Any]:
+    """Expose saved coding evidence without treating drafts as scored work."""
+    submission_problems: List[Dict[str, Any]] = []
+    failure_buckets: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"count": 0, "sessions": set(), "evidence": []}
+    )
+    for row in problem_rows:
+        interview_id = row.get("interview_id")
+        evidence = {
+            "interview_id": interview_id,
+            "date": row.get("date"),
+            "problem": row.get("problem"),
+            "round_id": row.get("round_id"),
+            "issue": row.get("failure_reason") or "No final submission",
+        }
+        if row.get("failure_reason"):
+            bucket = failure_buckets[str(row["failure_reason"])]
+            bucket["count"] += 1
+            bucket["sessions"].add(str(interview_id or ""))
+            bucket["evidence"].append(evidence)
+        if row.get("evidence") == "Final submit":
+            continue
+        submission_problems.append({
+            "problem": row.get("problem"),
+            "interview_id": interview_id,
+            "date": row.get("date"),
+            "round_id": row.get("round_id"),
+            "count": 1,
+            "round_count": 1,
+            "issue": "No final submission",
+            "run_count": row.get("run_count"),
+            "evidence": [evidence],
+        })
+
+    time_metrics: List[Dict[str, Any]] = []
+    average_runs = _nullable_avg(run_counts)
+    if average_runs is not None and average_runs < 2:
+        time_metrics.append({
+            "label": "Runs code too few times before submitting",
+            "value": average_runs,
+            "display": _format_number_value(average_runs, " runs/problem"),
+            "count": len(run_counts),
+            "explanation": "Saved coding evidence shows fewer than two validation runs per attempted problem on average.",
+        })
+
+    topics = [
+        {
+            "label": row.get("topic"),
+            "problems_attempted": int(row.get("attempts") or 0),
+            "problems_solved": int(row.get("solved") or 0),
+            "average_score": _nullable_avg([float(score) for score in row.get("scores") or []]),
+            "round_count": int(row.get("round_count") or 0),
+            "common_issue": row.get("main_issue") or None,
+            "evidence": [],
+        }
+        for row in topic_rows
+        if row.get("topic")
+    ]
+    patterns = [
+        {
+            "label": label,
+            "count": bucket["count"],
+            "round_count": len({item for item in bucket["sessions"] if item}),
+            "evidence": bucket["evidence"][:12],
+        }
+        for label, bucket in sorted(
+            failure_buckets.items(), key=lambda item: (-item[1]["count"], item[0])
+        )
+        if bucket["count"] >= 2 and len({item for item in bucket["sessions"] if item}) >= 2
+    ]
+    return {
+        "summary": {
+            "total_rounds": len(round_history),
+            "average_score": None,
+            "latest_score": None,
+            "best_score": None,
+            "recent_change": None,
+            "average_duration_seconds": None,
+            "trend": None,
+            "problems_attempted": attempted_count,
+            "problems_total": total_problems,
+            "problems_solved": solved_count,
+            "submission_rate": round(submitted_count / attempted_count * 100, 1) if attempted_count else None,
+        },
+        "skills": [],
+        "topics": topics,
+        "question_types": [],
+        "patterns": patterns,
+        "test_patterns": [],
+        "behavior": [],
+        "tests": [],
+        "submission": {
+            "problems_attempted": attempted_count,
+            "problems_total": total_problems,
+            "problems_submitted": submitted_count,
+            "problems_solved": solved_count,
+            "submission_rate": round(submitted_count / attempted_count * 100, 1) if attempted_count else None,
+            "coded_not_submitted": len(submission_problems),
+            "problems": submission_problems,
+        },
+        "time": time_metrics,
+        "improvement": {"improving": [], "declining": [], "stable": []},
+    }
+
+
+def _merge_recorded_technical_analytics(
+    canonical: Optional[Dict[str, Any]],
+    recorded: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Keep canonical scores while adding persisted draft/submission evidence."""
+    if not recorded or not recorded.get("has_data"):
+        return canonical
+    if not canonical:
+        return recorded
+
+    merged = dict(canonical)
+    analytics = dict(canonical.get("analytics") or {})
+    recorded_analytics = recorded.get("analytics") or {}
+    for key in ("topics", "patterns", "test_patterns", "time", "time_patterns", "complexity"):
+        if not analytics.get(key) and recorded_analytics.get(key):
+            analytics[key] = recorded_analytics[key]
+
+    canonical_submission = dict(analytics.get("submission") or {})
+    recorded_submission = recorded_analytics.get("submission") or {}
+    if recorded_submission:
+        for key in (
+            "problems_attempted",
+            "problems_total",
+            "problems_submitted",
+            "problems_solved",
+            "submission_rate",
+        ):
+            if recorded_submission.get(key) is not None:
+                canonical_submission[key] = recorded_submission[key]
+        existing_problems = list(canonical_submission.get("problems") or [])
+        problems_by_key = {
+            (
+                item.get("interview_id"),
+                item.get("round_id"),
+                item.get("problem"),
+            ): item
+            for item in existing_problems
+            if isinstance(item, dict)
+        }
+        for item in recorded_submission.get("problems") or []:
+            if not isinstance(item, dict):
+                continue
+            key = (item.get("interview_id"), item.get("round_id"), item.get("problem"))
+            if key not in problems_by_key:
+                problems_by_key[key] = item
+                continue
+            existing = problems_by_key[key]
+            if not existing.get("evidence") and item.get("evidence"):
+                problems_by_key[key] = {**existing, "evidence": item["evidence"]}
+        canonical_submission["problems"] = list(problems_by_key.values())
+        canonical_submission["coded_not_submitted"] = max(
+            int(canonical_submission.get("coded_not_submitted") or 0),
+            int(recorded_submission.get("coded_not_submitted") or 0),
+        )
+        analytics["submission"] = canonical_submission
+
+    merged["analytics"] = analytics
+    if int((recorded_submission or {}).get("coded_not_submitted") or 0) > 0:
+        merged["has_evidence"] = True
+        merged["comparison_notice"] = (
+            "Saved coding evidence is shown below. Technical scores remain unavailable until a final submission is captured."
+        )
+    return merged
 
 
 def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any]]:
@@ -3171,7 +4133,8 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
                i.overall_score,
                COALESCE(i.completed_at, i.created_at) AS completed_at,
                i.interview_type,
-               i.job_title
+               i.job_title,
+               i.duration_seconds
         FROM Interviews i
         WHERE i.user_id = %s
           AND i.attempt_status = 'completed'
@@ -3201,6 +4164,15 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
             "date": row[3].isoformat() if row[3] else None,
             "label": row[4] or ("Technical Round" if row[1] == "technical" else "Interview Round"),
             "role": row[5],
+            "duration_seconds": int(row[6]) if row[6] is not None else None,
+            "questions_completed": None,
+            "questions_total": None,
+            "problems_attempted": None,
+            "problems_total": None,
+            "problems_solved": None,
+            "change": None,
+            "key_result": None,
+            "completed_at": row[3].isoformat() if row[3] else None,
             "source_kind": "legacy_report",
             "score_state": "legacy",
             "included_in_trend": False,
@@ -3260,6 +4232,7 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
             WHERE current_analysis.interview_id = i.interview_id
               AND current_analysis.user_id = i.user_id
               AND current_analysis.schema_version = 'session-performance-v4'
+              AND current_analysis.producer_version = %s
               AND current_analysis.is_current = TRUE
               AND current_analysis.status = 'ready'
               AND current_analysis.analysis_json_encrypted IS NOT NULL
@@ -3281,7 +4254,7 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
           )
         ORDER BY COALESCE(i.completed_at, i.created_at) DESC
         """,
-        (user_id,),
+        (ANALYSIS_STAGE_VERSION, user_id),
     )
     availability_rows = cursor.fetchall() or []
     cursor.execute(
@@ -3367,6 +4340,54 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
         "by_mode": by_mode,
         "sessions": sessions,
     }
+
+
+def _performance_round_history(
+    interview_payload: Optional[Dict[str, Any]],
+    technical_payload: Optional[Dict[str, Any]],
+    legacy_history: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for mode, payload in (("interview", interview_payload), ("technical", technical_payload)):
+        for item in (payload or {}).get("round_history") or []:
+            if isinstance(item, dict):
+                items.append({**item, "mode": mode})
+        if not (payload or {}).get("round_history"):
+            for point in (payload or {}).get("trend") or []:
+                if not isinstance(point, dict):
+                    continue
+                items.append({
+                    "interview_id": point.get("interview_id"),
+                    "mode": mode,
+                    "role": point.get("role"),
+                    "company": None,
+                    "completed_at": point.get("date"),
+                    "score": point.get("score"),
+                    "duration_seconds": None,
+                    "score_state": point.get("score_state") or "ready",
+                    "source_kind": point.get("source_kind") or "recorded_evidence",
+                    "round_id": point.get("round_id"),
+                    "questions_completed": None,
+                    "questions_total": None,
+                    "problems_attempted": None,
+                    "problems_total": None,
+                    "problems_solved": None,
+                    "change": None,
+                    "key_result": None,
+                })
+    items.extend(item for item in legacy_history if isinstance(item, dict))
+    items.sort(key=lambda item: item.get("completed_at") or item.get("date") or "", reverse=False)
+    previous_by_mode: Dict[str, Optional[float]] = {}
+    for item in items:
+        item["date"] = item.get("completed_at") or item.get("date")
+        score = _performance_number(item.get("score"))
+        mode = str(item.get("mode") or "interview")
+        previous = previous_by_mode.get(mode)
+        item["change"] = round(score - previous, 1) if score is not None and previous is not None else None
+        if score is not None and item.get("score_state") != "legacy":
+            previous_by_mode[mode] = score
+    items.sort(key=lambda item: item.get("completed_at") or item.get("date") or "", reverse=True)
+    return items
 
 def _weak_pattern_details(flag: str) -> Dict[str, str]:
     mapping = {
@@ -5512,7 +6533,7 @@ async def get_performance(
                 interview_payload = recorded_interview
         except Exception:
             logger.exception("Failed to build recorded interview performance fallback")
-        if not technical_payload:
+        if not technical_payload or technical_payload.get("score_state") != "ready":
             try:
                 recorded_technical = _technical_performance_payload(cursor, current_user["user_id"])
                 if recorded_technical.get("has_data"):
@@ -5521,7 +6542,10 @@ async def get_performance(
                         "source_kind": "recorded_evidence",
                         "comparison_notice": "Showing submitted tests, runs, and attempted-problem evidence while the full analysis is prepared.",
                     })
-                    technical_payload = recorded_technical
+                    technical_payload = _merge_recorded_technical_analytics(
+                        technical_payload,
+                        recorded_technical,
+                    )
             except Exception:
                 logger.exception("Failed to build recorded technical performance fallback")
         empty_interview = _dynamic_payload("interview", False, [], [])
@@ -5545,6 +6569,11 @@ async def get_performance(
         interview_payload = interview_payload or empty_interview
         technical_payload = technical_payload or empty_technical
         role_context = _performance_role_context(cursor, current_user["user_id"])
+        round_history = _performance_round_history(
+            interview_payload,
+            technical_payload,
+            legacy_history,
+        )
         return {
             "interview": interview_payload,
             "technical": technical_payload,
@@ -5564,6 +6593,7 @@ async def get_performance(
                 ],
                 "legacy": legacy_history,
             },
+            "round_history": round_history,
             "availability": availability,
         }
     finally:

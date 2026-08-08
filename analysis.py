@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
 from analysis_pipeline import (
+    ANALYSIS_STAGE_VERSION,
     SESSION_PERFORMANCE_VERSION,
     enqueue_analysis,
 )
@@ -85,6 +86,7 @@ async def reconcile_performance(
               WHERE spa.interview_id = i.interview_id
                 AND spa.user_id = i.user_id
                 AND spa.schema_version = %s
+                AND spa.producer_version = %s
                 AND spa.status = 'ready'
                 AND spa.is_current = TRUE
                 AND spa.analysis_json_encrypted IS NOT NULL
@@ -96,7 +98,7 @@ async def reconcile_performance(
         (
             current_user["user_id"],
             cursor_completed_at, cursor_completed_at, cursor_interview_id,
-            SESSION_PERFORMANCE_VERSION, limit_value,
+            SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION, limit_value,
         ),
         fetchall=True,
     )
@@ -170,7 +172,26 @@ async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict =
     )
     if not interview:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
-    decision = _analysis_trigger_decision(interview[2], bool(interview[3] or interview[4]))
+    canonical_row = await async_execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM SessionPerformanceAnalyses
+            WHERE interview_id = %s
+              AND user_id = %s
+              AND schema_version = 'session-performance-v4'
+              AND producer_version = %s
+              AND status = 'ready'
+              AND is_current = TRUE
+              AND analysis_json_encrypted IS NOT NULL
+              AND evidence_index_encrypted IS NOT NULL
+        )
+        """,
+        (request.interview_id, current_user["user_id"], ANALYSIS_STAGE_VERSION),
+        fetchone=True,
+    )
+    has_current_report = bool(interview[3] or interview[4]) and bool(canonical_row and canonical_row[0])
+    decision = _analysis_trigger_decision(interview[2], has_current_report)
     if decision == "reject":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -179,7 +200,12 @@ async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict =
     if decision == "ready":
         return {"job_id": interview[5], "status": interview[2], "report_ready": True}
 
-    job_id = await enqueue_analysis(request.interview_id, current_user["user_id"], request.reason or "manual_trigger")
+    job_id = await enqueue_analysis(
+        request.interview_id,
+        current_user["user_id"],
+        request.reason or "manual_trigger",
+        force_canonical_rebuild=not has_current_report,
+    )
     await async_execute(
         """
         UPDATE Interviews

@@ -1,6 +1,7 @@
 export type PerformanceTab = "interview" | "coding"
 
 export interface PerformanceStateInput {
+  has_data?: boolean
   has_evidence?: boolean
   has_official_score?: boolean
   score_state?: string
@@ -25,6 +26,15 @@ function hasSessionState(payload?: PerformanceStateInput | null) {
   return Boolean(
     payload?.score_state
     && payload.score_state !== "missing",
+  )
+}
+
+export function hasPerformanceModeData(payload?: PerformanceStateInput | null) {
+  return Boolean(
+    payload?.has_data
+    || hasRecordedEvidence(payload)
+    || hasOfficialScore(payload)
+    || hasSessionState(payload)
   )
 }
 

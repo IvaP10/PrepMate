@@ -42,7 +42,7 @@ def test_report_role_comes_from_immutable_snapshot_and_exposes_reuse_state():
         "job_profile_id": 17,
     }
     encrypted = encrypt_data(json.dumps(snapshot)).encode("utf-8")
-    cursor = _Cursor(one_rows=[(encrypted,), (True,)])
+    cursor = _Cursor(one_rows=[(None, encrypted), (True,)])
 
     target = interview._report_job_target(
         cursor,
@@ -53,6 +53,8 @@ def test_report_role_comes_from_immutable_snapshot_and_exposes_reuse_state():
     )
 
     assert target == {
+        "profile_type": "custom",
+        "is_custom": True,
         "role": "Backend Engineer",
         "company": "Acme",
         "job_description": "Build reliable Python services.",

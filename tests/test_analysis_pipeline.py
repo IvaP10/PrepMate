@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("ENVIRONMENT", "test")
 
 import analysis_pipeline
-from analysis_pipeline import aggregate_cheating_risk, _valid_candidate_report
+from analysis_pipeline import aggregate_cheating_risk, _turn_observations, _valid_candidate_report
 
 
 class AnalysisPipelinePureTests(unittest.TestCase):
@@ -92,6 +92,46 @@ class AnalysisPipelinePureTests(unittest.TestCase):
         self.assertFalse(_valid_candidate_report({"error": "stage_failed"}, "interview-1"))
         self.assertFalse(_valid_candidate_report({**valid, "interview_id": "interview-2"}, "interview-1"))
         self.assertFalse(_valid_candidate_report({**valid, "evidence_status": None}, "interview-1"))
+
+    def test_technical_provenance_accepts_canonical_and_legacy_round_keys(self):
+        self.assertEqual(analysis_pipeline._technical_round_id({"round_id": "round-1"}), "round-1")
+        self.assertEqual(analysis_pipeline._technical_round_id({"technical_round_id": "round-2"}), "round-2")
+        self.assertIsNone(analysis_pipeline._technical_round_id({}))
+
+    def test_technical_stage_safe_payload_never_persists_decrypted_source(self):
+        safe = analysis_pipeline._safe_stage_payload(
+            "technical_code",
+            {
+                "round_count": 1,
+                "test_matrix": [{
+                    "round_id": "round-1",
+                    "source_code": "private code",
+                    "source_excerpt": "private excerpt",
+                    "result_json": {"cases": ["private"]},
+                    "evidence_state": "final_submission",
+                }],
+                "source_code": "private code",
+            },
+        )
+
+        assert safe["test_matrix"] == [{"round_id": "round-1", "evidence_state": "final_submission"}]
+        assert "source_code" not in safe
+
+    def test_interview_and_technical_turns_do_not_cross_contaminate_weaknesses(self):
+        turn = {
+            "response_id": "response-1",
+            "question_type": "technical_concept",
+            "taxonomy_keys": ["technical:python"],
+            "overall_score": 62,
+            "provenance": {},
+        }
+
+        interview_observations = _turn_observations([turn], "mock")
+        technical_observations = _turn_observations([turn], "technical")
+
+        self.assertEqual(interview_observations[0]["skill_key"], "interview:technical-python")
+        self.assertEqual(interview_observations[0]["source_kind"], "interview_response")
+        self.assertEqual(technical_observations, [])
 
     def test_openai_report_fallback_is_published_as_partial(self):
         report = {

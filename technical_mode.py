@@ -66,7 +66,6 @@ INTEGRITY_WARNING_EVENT_TYPES = {
     "fullscreen_exit",
     "screen_share_stopped",
     "face_missing",
-    "face_off_center",
     "camera_obstructed",
     "technical_permission_failed",
     "interview_permission_failed",
@@ -1748,6 +1747,47 @@ async def _load_active_problem_bank() -> List[Dict[str, Any]]:
     return bank
 
 
+async def _load_used_problem_history(
+    user_id: str,
+    interview_id: str,
+) -> tuple[set[str], set[str]]:
+    """Return problem IDs and families already shown to this candidate.
+
+    Technical rounds are frozen once prepared, so diversity has to be decided
+    before the next round is persisted.  Include cancelled/expired attempts as
+    well: a candidate has still seen those prompts and should not immediately
+    receive them again.
+    """
+    try:
+        rows = await async_execute(
+            """
+            SELECT problem_id,
+                   COALESCE(round_spec->>'problem_family_id', problem_id)
+            FROM TechnicalInterviewRounds
+            WHERE user_id = %s
+              AND interview_id <> %s
+              AND problem_id IS NOT NULL
+            ORDER BY created_at DESC, round_id DESC
+            """,
+            (user_id, interview_id),
+            fetchall=True,
+        )
+    except Exception:
+        logger.warning("Could not load Technical problem history; using bank rotation only", exc_info=True)
+        return set(), set()
+
+    problem_ids: set[str] = set()
+    problem_families: set[str] = set()
+    for row in rows or []:
+        problem_id = str(row[0] or "").strip()
+        problem_family = str((row[1] if len(row) > 1 else None) or problem_id).strip()
+        if problem_id:
+            problem_ids.add(problem_id)
+        if problem_family:
+            problem_families.add(problem_family)
+    return problem_ids, problem_families
+
+
 def _noncoding_authored_spec(round_type: str, context: Dict[str, Any]) -> Dict[str, Any]:
     topics = _string_list(context.get("technical_topics") or context.get("target_skills") or [], 4)
     topic = topics[0] if topics else {
@@ -2022,7 +2062,17 @@ async def _round_templates_for_profile(
     total_duration = max(10, min(120, int(context.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES))) * 60
     per_round_duration = max(300, total_duration // question_count)
     mode = "practice" if str(context.get("interview_mode") or "mock").lower() == "practice" else "mock"
+    historical_problem_ids, historical_problem_families = await _load_used_problem_history(
+        user_id,
+        interview_id,
+    )
     used_problem_ids: set[str] = set()
+    used_problem_families: set[str] = set()
+
+    def is_unused_this_session(item: Dict[str, Any]) -> bool:
+        problem_id = str(item.get("problem_id") or "")
+        problem_family = str(item.get("problem_family_id") or problem_id)
+        return problem_id not in used_problem_ids and problem_family not in used_problem_families
 
     for index, round_type in enumerate(requested_types, start=1):
         expected_difficulty = _expected_tier_difficulty(normalized, index, context)
@@ -2047,9 +2097,20 @@ async def _round_templates_for_profile(
                 reverse=True,
             )
             selected = next(
-                (item for item in supported if str(item.get("problem_id")) not in used_problem_ids),
+                (
+                    item
+                    for item in supported
+                    if is_unused_this_session(item)
+                    and str(item.get("problem_id") or "") not in historical_problem_ids
+                    and str(item.get("problem_family_id") or item.get("problem_id") or "")
+                    not in historical_problem_families
+                ),
                 None,
             )
+            # If this candidate has exhausted the eligible bank for the tier,
+            # prefer a new problem within this session before reusing history.
+            if selected is None:
+                selected = next((item for item in supported if is_unused_this_session(item)), None)
             if selected is None:
                 if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                     raise HTTPException(
@@ -2059,6 +2120,7 @@ async def _round_templates_for_profile(
                 selected = supported[0]
             spec = dict(selected)
             used_problem_ids.add(str(spec.get("problem_id")))
+            used_problem_families.add(str(spec.get("problem_family_id") or spec.get("problem_id") or ""))
         elif round_type == "coding":
             if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                 raise HTTPException(
@@ -2957,12 +3019,10 @@ def _enqueue_execution_job_sync(
         max_submissions = max(1, int(locked_round[2] or (3 if locked_round[1] == "practice" else 1)))
         submits_left: Optional[int] = None
         if lock_submission:
-            workflow_state = _json_value(locked_round[4], {}) if len(locked_round) > 4 else None
-            if isinstance(workflow_state, dict) and not workflow_state.get("approach"):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Commit your initial approach before the one-way final submission.",
-                )
+            # Approach evidence is optional in the current workspace.  Older
+            # rounds may contain it in workflow_state, but a missing approach
+            # must not make the visible Final Submit action fail because the
+            # current UI has no separate approach-commit step.
             cursor.execute(
                 """
                 SELECT COUNT(*)

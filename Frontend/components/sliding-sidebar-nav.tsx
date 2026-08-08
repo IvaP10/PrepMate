@@ -44,13 +44,17 @@ export function SlidingSidebarNav<T extends string>({
   const itemRefs = useRef(new Map<string, HTMLButtonElement>())
   const [activeRect, setActiveRect] = useState({ y: 4, height: 0 })
   const [isMoving, setIsMoving] = useState(false)
-  const prevActiveIdRef = useRef(activeId)
   const activeInGroup = items.some((item) => item.id === activeId)
+  const activeIdRef = useRef(activeId)
+  const activeInGroupRef = useRef(activeInGroup)
+  activeIdRef.current = activeId
+  activeInGroupRef.current = activeInGroup
+  const prevActiveIdRef = useRef(activeId)
 
   const measure = useCallback(() => {
     const container = containerRef.current
-    const activeItem = itemRefs.current.get(activeId)
-    if (!container || !activeItem || !activeInGroup) {
+    const activeItem = itemRefs.current.get(activeIdRef.current)
+    if (!container || !activeItem || !activeInGroupRef.current) {
       setActiveRect((prev) => (prev.height === 0 ? prev : { ...prev, height: 0 }))
       return
     }
@@ -65,15 +69,26 @@ export function SlidingSidebarNav<T extends string>({
       }
       return { y: nextY, height: nextHeight }
     })
-  }, [activeId, activeInGroup])
+  }, [])
 
   useEffect(() => {
     if (prevActiveIdRef.current === activeId) return
     prevActiveIdRef.current = activeId
     setIsMoving(true)
-    const timer = window.setTimeout(() => setIsMoving(false), SLIDE_MS)
-    return () => window.clearTimeout(timer)
-  }, [activeId])
+    let secondFrame: number | null = null
+    let timer: number | null = null
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        measure()
+        timer = window.setTimeout(() => setIsMoving(false), SLIDE_MS)
+      })
+    })
+    return () => {
+      window.cancelAnimationFrame(firstFrame)
+      if (secondFrame != null) window.cancelAnimationFrame(secondFrame)
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [activeId, measure])
 
   const measureRafRef = useRef<number | null>(null)
   const scheduleMeasure = useCallback(() => {
@@ -127,8 +142,9 @@ export function SlidingSidebarNav<T extends string>({
       <span
         aria-hidden="true"
         className={cn(
-          "hidden pointer-events-none absolute inset-x-1 top-0 overflow-hidden rounded-lg border border-primary/30 bg-primary/10 shadow-[0_6px_18px_rgba(79,70,229,0.12)] dark:border-primary/40 dark:bg-primary/18 dark:shadow-[0_0_24px_rgba(129,140,248,0.14)]",
+          "pointer-events-none absolute inset-x-1 top-0 overflow-hidden rounded-lg border border-primary/30 bg-primary/10 shadow-[0_6px_18px_rgba(79,70,229,0.12)] dark:border-primary/40 dark:bg-primary/18 dark:shadow-[0_0_24px_rgba(129,140,248,0.14)]",
           "backdrop-blur-md transition-[transform,height,box-shadow,background-color,backdrop-filter]",
+          "motion-reduce:transition-none",
           isMoving &&
             "border-primary/45 bg-primary/16 shadow-[0_10px_32px_rgba(79,70,229,0.22)] backdrop-blur-xl dark:bg-primary/24",
         )}
@@ -157,7 +173,7 @@ export function SlidingSidebarNav<T extends string>({
         const Icon = item.icon
         return (
           <button
-            key={`${item.id}-${selected ? "selected" : "idle"}`}
+            key={item.id}
             ref={(node) => {
               if (node) itemRefs.current.set(item.id, node)
               else itemRefs.current.delete(item.id)
@@ -170,7 +186,7 @@ export function SlidingSidebarNav<T extends string>({
               "relative z-10 flex w-full items-center rounded-lg border border-transparent text-sm font-medium transition-[color,background-color]",
               showLabel ? "h-10 pl-[10px] pr-3" : "h-10 justify-start pl-[14px] pr-3",
               selected
-                ? "border-primary/30 bg-primary/10 text-foreground shadow-[0_6px_18px_rgba(79,70,229,0.12)] dark:border-primary/40 dark:bg-primary/20"
+                ? "text-foreground"
                 : "text-muted-foreground hover:bg-primary/[0.04] hover:text-foreground dark:hover:bg-primary/[0.07]",
               buttonClassName,
             )}

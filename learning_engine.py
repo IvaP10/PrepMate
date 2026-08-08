@@ -335,6 +335,95 @@ def _mission_title(skill_key: str, evidence_text: str) -> str:
 def _phase_one_activity_definitions(skill_label: str, evidence_text: str, mode: str = "mock") -> List[Dict[str, Any]]:
     weakness = _bounded(evidence_text or f"Improve {skill_label}.", 360)
     if mode == "technical":
+        concept_focus = any(
+            token in f"{skill_label} {evidence_text}".lower()
+            for token in ("concept", "explanation", "complexity", "edge case")
+        )
+        if concept_focus:
+            return [
+                {
+                    "activity_type": "baseline",
+                    "title": "The Technical Explanation Gap from Your Last Round Is Identified",
+                    "description": weakness,
+                    "estimated_minutes": 1,
+                    "expected_result": "The focus was selected from the persisted Technical response and its round evidence.",
+                    "availability_status": "unlocked",
+                    "attempt_status": "submitted",
+                    "result_status": "passed",
+                    "mastery_status": "practising",
+                },
+                {
+                    "activity_type": "rewrite_answer",
+                    "title": "Explain the Concept with a Decision, Complexity, and Edge Case",
+                    "description": "Turn the incomplete explanation into a precise technical answer.",
+                    "estimated_minutes": 4,
+                    "expected_result": "Define the concept, justify the mechanism, state complexity, and cover an edge case.",
+                    "prompt": {
+                        "title": "Repair the technical explanation",
+                        "question": f"Using the previous evidence, explain {skill_label} precisely.",
+                        "weak_answer": weakness,
+                        "required_elements": ["definition", "decision", "complexity", "edge_case"],
+                        "pass_conditions": [
+                            {"id": "technical_decision", "label": "Names the concept or mechanism and why it fits", "weight": 1},
+                            {"id": "decision_and_result", "label": "Explains the time or space complexity or a trade-off", "weight": 1},
+                            {"id": "result", "label": "Covers a concrete edge case or failure mode", "weight": 1},
+                        ],
+                    },
+                },
+                {
+                    "activity_type": "guided_spoken_response",
+                    "title": "Give a 90-Second Technical Explanation Without Notes",
+                    "description": "Explain the same concept clearly before adding an example.",
+                    "estimated_minutes": 4,
+                    "expected_result": "Start with the direct definition, then explain the mechanism, complexity, and boundary case.",
+                    "prompt": {
+                        "title": "Explain the full concept before coding",
+                        "question": f"In 90 seconds, explain {skill_label} to an interviewer.",
+                        "input_type": "voice_or_text",
+                        "timer_seconds": 90,
+                        "pass_conditions": [
+                            {"id": "states_problem_early", "label": "Starts with a direct definition or invariant", "weight": 1},
+                            {"id": "technical_decision", "label": "Names the mechanism and why it fits", "weight": 1},
+                            {"id": "decision_and_result", "label": "States complexity and one boundary case", "weight": 1},
+                        ],
+                    },
+                },
+                {
+                    "activity_type": "rewrite_answer",
+                    "title": "Handle the Follow-Up on Trade-Offs and Failure Modes",
+                    "description": "Answer the deeper question that exposed the missing technical detail.",
+                    "estimated_minutes": 4,
+                    "expected_result": "Connect the mechanism to a trade-off and a concrete failure mode.",
+                    "prompt": {
+                        "title": "Answer the technical follow-up",
+                        "question": f"What trade-off or failure mode matters most when using {skill_label}?",
+                        "required_elements": ["tradeoff", "failure_mode", "mitigation"],
+                        "pass_conditions": [
+                            {"id": "technical_decision", "label": "Names a concrete mechanism or decision", "weight": 1},
+                            {"id": "result", "label": "Explains a trade-off, failure mode, or mitigation", "weight": 1},
+                        ],
+                    },
+                },
+                {
+                    "activity_type": "unseen_checkpoint",
+                    "title": "Answer a Related Technical Concept Without Hints",
+                    "description": "Verify that the explanation transfers to a new prompt.",
+                    "estimated_minutes": 6,
+                    "expected_result": "Recognise the concept, explain its mechanism, and state complexity and an edge case.",
+                    "is_checkpoint": True,
+                    "prompt": {
+                        "title": "Solve the related concept question",
+                        "question": f"Explain a related concept to {skill_label} without hints.",
+                        "timer_seconds": 120,
+                        "hide_hints": True,
+                        "pass_conditions": [
+                            {"id": "states_problem_early", "label": "Defines the concept before examples", "weight": 1},
+                            {"id": "technical_decision", "label": "Chooses the correct mechanism or data structure", "weight": 1},
+                            {"id": "decision_and_result", "label": "Gives complexity and one edge case", "weight": 1},
+                        ],
+                    },
+                },
+            ]
         return [
             {
                 "activity_type": "baseline",
@@ -1298,7 +1387,17 @@ def _ensure_active_improvement_mission(
     })
     mission_id = str(uuid.uuid4())
     mission_skill_id = str(uuid.uuid4())
-    title = f"Plan and Test {skill_label} Solutions Before Coding" if mode == "technical" else _mission_title(skill_key, evidence_text)
+    technical_concept_focus = mode == "technical" and any(
+        token in f"{skill_label} {evidence_text}".lower()
+        for token in ("concept", "explanation", "complexity", "edge case")
+    )
+    title = (
+        f"Strengthen {skill_label} Explanations Before Your Next Technical Round"
+        if technical_concept_focus
+        else f"Plan and Test {skill_label} Solutions Before Coding"
+        if mode == "technical"
+        else _mission_title(skill_key, evidence_text)
+    )
     target = _clip(max(75, baseline_score + 18))
     assignment_reason = _bounded(
         evidence_text
@@ -1540,6 +1639,128 @@ async def ensure_mission_from_weakness(
         interview_id,
         analysis_id,
         "technical" if mode == "technical" else "mock",
+    )
+
+
+def _technical_report_focus(weak_topics: Any) -> Optional[Dict[str, Any]]:
+    for item in weak_topics if isinstance(weak_topics, list) else []:
+        if not isinstance(item, dict):
+            continue
+        evidence_state = str(item.get("evidence_state") or "").lower()
+        round_ids = [str(value) for value in item.get("round_ids") or [] if value]
+        if evidence_state == "no_evidence" or not round_ids:
+            continue
+        topic = str(item.get("topic") or "Technical reasoning").strip()
+        repair_action = str(item.get("repair_action") or "").strip()
+        if not topic or not repair_action:
+            continue
+        return {
+            "skill_key": f"technical:{_slug(topic)}",
+            "mistake_key": f"technical:{_slug(topic)}",
+            "topic_label": topic,
+            "summary": repair_action,
+            "occurrence_count": max(1, len(round_ids)),
+            "round_id": round_ids[0],
+            "evidence_state": evidence_state,
+        }
+    return None
+
+
+def _ensure_mission_from_technical_report_sync(
+    user_id: str,
+    interview_id: str,
+    analysis_id: str,
+    weak_topics: Any,
+) -> Optional[str]:
+    focus = _technical_report_focus(weak_topics)
+    if not focus:
+        return None
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT mission_id, source_analysis_id
+            FROM ImprovementMissions
+            WHERE user_id = %s AND mode = 'technical' AND status = 'active'
+              AND weakness_type = 'technical_failure'
+              AND COALESCE(weakness_key, '') LIKE 'technical:%%'
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        )
+        existing = cursor.fetchone()
+        if existing and str(existing[1] or "") == str(analysis_id):
+            connection.commit()
+            return existing[0]
+        if existing:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM ImprovementRoadmapNodes
+                    WHERE mission_id = %s
+                      AND activity_type <> 'baseline'
+                      AND (
+                          result_status NOT IN ('not_attempted', 'draft')
+                          OR attempt_status NOT IN ('draft', 'not_started')
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM ImprovementAttemptSessions
+                    WHERE mission_id = %s
+                      AND status IN ('active', 'in_progress')
+                )
+                """,
+                (existing[0], existing[0]),
+            )
+            started = bool((cursor.fetchone() or [False])[0])
+            if started:
+                connection.commit()
+                return existing[0]
+            cursor.execute(
+                """
+                UPDATE ImprovementMissions
+                SET status = 'superseded', updated_at = NOW()
+                WHERE mission_id = %s AND status = 'active'
+                """,
+                (existing[0],),
+            )
+
+        mission_id = _ensure_active_improvement_mission(
+            cursor,
+            user_id,
+            [],
+            [focus],
+            [],
+            mode="technical",
+            source_interview_id=interview_id,
+            source_analysis_id=analysis_id,
+        )
+        connection.commit()
+        return mission_id
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
+async def ensure_mission_from_technical_report(
+    user_id: str,
+    interview_id: str,
+    analysis_id: str,
+    weak_topics: Any,
+) -> Optional[str]:
+    return await asyncio.to_thread(
+        _ensure_mission_from_technical_report_sync,
+        user_id,
+        interview_id,
+        analysis_id,
+        weak_topics,
     )
 
 

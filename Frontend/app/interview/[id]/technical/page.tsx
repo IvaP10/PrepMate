@@ -357,7 +357,6 @@ export default function TechnicalInterviewPage() {
   const proctoringStartedRef = useRef(false)
   const cameraVideoRef = useRef<HTMLVideoElement>(null)
   const faceMissingSinceRef = useRef<number | null>(null)
-  const faceOffCenterSinceRef = useRef<number | null>(null)
   const pageLoadTimeRef = useRef(Date.now())
   const lastMobileWarningRef = useRef<number | null>(null)
   const lastMultiplePeopleWarningRef = useRef<number | null>(null)
@@ -678,15 +677,6 @@ export default function TechnicalInterviewPage() {
       faceMissingSinceRef.current = null
     }
 
-    if (faceMetrics.facePresent && !faceMetrics.centered) {
-      if (!faceOffCenterSinceRef.current) faceOffCenterSinceRef.current = now
-      if (now - faceOffCenterSinceRef.current > 4000) {
-        warnStrictMode("face_off_center", "Camera check: stay centered and face the screen.")
-        faceOffCenterSinceRef.current = now + 8000
-      }
-    } else {
-      faceOffCenterSinceRef.current = null
-    }
   }, [faceMetrics, permissionState.cameraReady, sessionFlagged, warnStrictMode])
 
   useEffect(() => {
@@ -1508,7 +1498,7 @@ export default function TechnicalInterviewPage() {
   }
 
   return (
-    <div className="flex min-h-screen flex-col bg-background text-foreground">
+    <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background text-foreground">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-secondary px-3">
         <div className="flex min-w-0 items-center gap-2">
           <Button variant="ghost" size="icon-sm" className="text-foreground hover:bg-secondary hover:text-foreground" onClick={requestLeave}>
@@ -1599,14 +1589,6 @@ export default function TechnicalInterviewPage() {
           )}
         </div>
       </header>
-
-      {jobContext?.jd_summary && (
-        <details className="border-b border-border bg-card px-4 py-1.5 text-xs text-muted-foreground">
-          <summary className="cursor-pointer font-medium text-foreground">Role context</summary>
-          <p className="mt-2 max-w-5xl pb-1 leading-5">{jobContext.jd_summary}</p>
-          {!!jobContext.key_skills?.length && <p className="pb-1">Focus: {jobContext.key_skills.join(" · ")}</p>}
-        </details>
-      )}
 
       {sessionFlagged && (
         <div className="flex items-center gap-2 border-b border-rose-500/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold text-rose-800 dark:text-rose-200">

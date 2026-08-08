@@ -76,25 +76,25 @@ const profileChoices: {
   {
     value: "top_tier",
     label: "Top Tier",
-    interview: "High bar and deep follow-ups.",
+    interview: "Google, Microsoft, NVIDIA, Amazon, Adobe.",
     technical: "Google, Microsoft, NVIDIA, Amazon, Adobe.",
   },
   {
     value: "mid_tier",
     label: "Mid Tier",
-    interview: "Balanced execution and teamwork.",
+    interview: "Oracle, Cisco, Dell, SAP, Qualcomm.",
     technical: "Oracle, Cisco, Dell, SAP, Qualcomm.",
   },
   {
     value: "startup",
     label: "Startup",
-    interview: "Ownership, adaptability, and shipping.",
+    interview: "Early-stage startups and fast-moving product teams.",
     technical: "Early-stage startups and fast-moving product teams.",
   },
   {
     value: "custom",
     label: "Custom",
-    interview: "Use a saved role and full job description.",
+    interview: "Match a saved role and its full job description.",
     technical: "Match a saved role and its full job description.",
   },
 ]
@@ -448,7 +448,7 @@ export function InterviewSetupWizard({
                       aria-checked={selected}
                       disabled={savingProfile}
                       onClick={() => void selectProfile(profile.value)}
-                      className={`min-h-24 rounded-xl border p-3 text-left ${selected ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
+                      className={`min-h-20 rounded-xl border p-3 text-left ${selected ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
                     >
                       <span className={`text-sm font-semibold ${selected ? "text-primary" : "text-foreground"}`}>{profile.label}</span>
                       <span className="mt-1 block text-xs leading-4 text-muted-foreground">{technical ? profile.technical : profile.interview}</span>

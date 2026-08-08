@@ -7,7 +7,6 @@ import {
   FileText,
   BarChart3,
   Settings,
-  User,
   LogOut,
   Flame,
   Sun,
@@ -115,10 +114,6 @@ const primaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
   { icon: BarChart3, label: "Performance", id: "performance" },
   { icon: Target, label: "Improve", id: "improve" },
 ]
-const secondaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
-  { icon: CreditCard, label: "Membership", id: "membership" },
-  { icon: Settings, label: "Settings", id: "settings" },
-]
 interface DashboardResumeData {
   fullName: string
   email: string
@@ -169,32 +164,6 @@ function isPaidPlanType(planType?: string | null) {
   const normalized = (planType || "starter").toLowerCase()
   return normalized.includes("premium") || normalized.includes("pro")
 }
-
-function renderPlanBadge(planType?: string | null) {
-  const normalized = (planType || "starter").toLowerCase()
-  if (normalized.includes("premium")) {
-    return (
-      <span className="mt-0.5 inline-flex items-center gap-1 rounded border border-border bg-secondary px-2 py-0.5 text-xs font-semibold text-foreground self-start">
-        Premium
-      </span>
-    )
-  }
-  if (normalized.includes("pro")) {
-    return (
-      <span className="mt-0.5 inline-flex items-center gap-1 rounded border border-border bg-secondary px-2 py-0.5 text-xs font-semibold text-foreground self-start">
-        Pro
-      </span>
-    )
-  }
-  return (
-    <span className="mt-0.5 inline-flex items-center rounded bg-secondary/40 border border-border/50 px-2 py-0.5 text-xs font-semibold text-muted-foreground self-start">
-      Free
-    </span>
-  )
-}
-
-
-
 
 function mapResumeDataToDashboard(data: ResumeData): DashboardResumeData {
   return {
@@ -1891,22 +1860,27 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
     safeStorageSet("session", "dashboard_tab", nav)
   }
   const [showLogout, setShowLogout] = useState(false)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+  const accountMenuRef = useRef<HTMLDivElement>(null)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sidebarHovered, setSidebarHovered] = useState(false)
   const isExpanded = !sidebarCollapsed || sidebarHovered
-  const prevSidebarExpandedRef = useRef(isExpanded)
-  const [sidebarTransitioning, setSidebarTransitioning] = useState(false)
   useEffect(() => {
-    if (prevSidebarExpandedRef.current === isExpanded) return
-    prevSidebarExpandedRef.current = isExpanded
-    setSidebarTransitioning(true)
-    const timer = window.setTimeout(() => setSidebarTransitioning(false), 300)
-    return () => window.clearTimeout(timer)
-  }, [isExpanded])
-  const sidebarRevealClass = sidebarTransitioning
-    ? "transition-[margin,max-width,transform] duration-300 ease-in-out"
-    : ""
+    if (!accountMenuOpen) return
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAccountMenuOpen(false)
+    }
+    document.addEventListener("mousedown", closeOnOutsideClick)
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick)
+      document.removeEventListener("keydown", closeOnEscape)
+    }
+  }, [accountMenuOpen])
   const { justParsed } = useResume()
   const [learning, setLearning] = useState<LearningDashboard | null>(null)
   const [learningLoading, setLearningLoading] = useState(true)
@@ -2082,6 +2056,17 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
     }
   }
   const isPaidPlan = isPaidPlanType(user?.plan_type)
+  const accountName = user?.name?.trim() || user?.email?.split("@")[0] || "User"
+  const accountInitials = accountName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "U"
+  const accountMenuItems: { icon: any; label: string; id: ActiveNav }[] = [
+    { icon: CreditCard, label: "Subscription", id: "membership" },
+    { icon: Settings, label: "Settings", id: "settings" },
+  ]
 
   return (
     <>
@@ -2150,60 +2135,17 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               expanded={isExpanded}
               className="flex-1"
             />
-            <SlidingSidebarNav
-              ariaLabel="Account navigation"
-              items={secondaryNavItems}
-              activeId={activeNav}
-              onSelect={setActiveNav}
-              collapsed={!isExpanded}
-              expanded={isExpanded}
-              className="border-t border-border/60 pt-2"
-            />
-          </div>
-          <div className="border-t border-border p-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center pl-1">
-                {user?.avatar_url ? (
-                  <img src={user.avatar_url} alt="" className="h-9 w-9 rounded-full object-cover shrink-0" />
-                ) : (
-                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 shrink-0">
-                    <User className="h-4 w-4 text-primary" />
-                  </div>
-                )}
-                <div className={`${sidebarRevealClass} flex flex-col overflow-hidden ${
-                  isExpanded ? "ml-3 max-w-[140px] translate-x-0" : "ml-0 max-w-0 -translate-x-2 pointer-events-none"
-                }`}>
-                  <span className="text-sm font-medium text-foreground whitespace-nowrap">
-                    {user?.name || "User"}
-                  </span>
-                  {renderPlanBadge(user?.plan_type)}
-                </div>
-              </div>
-              <div className={`${sidebarRevealClass} overflow-hidden ${
-                isExpanded ? "max-w-[40px] translate-x-0" : "max-w-0 translate-x-2 pointer-events-none"
-              }`}>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => setShowLogout(true)}
-                  className="h-8 w-8 text-muted-foreground hover:text-foreground shrink-0"
-                  aria-label="Log out"
-                >
-                  <LogOut className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
           </div>
         </aside>
         {mobileMenuOpen && (
           <div
-            className="fixed inset-0 z-40 bg-black/50 md:hidden"
+            className="fixed inset-0 z-[200] bg-black/50 md:hidden"
             onClick={() => setMobileMenuOpen(false)}
           />
         )
         }
         <aside
-          className={`fixed inset-y-0 left-0 z-50 w-56 flex-col border-r border-border/40 bg-card/90 backdrop-blur-2xl transition-transform duration-300 md:hidden ${mobileMenuOpen ? "translate-x-0" : "-translate-x-full"
+          className={`fixed inset-y-0 left-0 z-[300] w-56 flex-col border-r border-border/40 bg-card/90 backdrop-blur-2xl transition-transform duration-300 md:hidden ${mobileMenuOpen ? "translate-x-0" : "-translate-x-full"
             }`}
         >
           <div className="flex h-16 items-center justify-between border-b border-border/40 px-6">
@@ -2237,52 +2179,10 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               buttonClassName="h-auto min-h-10 gap-3 py-2.5 pl-3"
               className="flex-1"
             />
-            <SlidingSidebarNav
-              ariaLabel="Account navigation"
-              items={secondaryNavItems}
-              activeId={activeNav}
-              onSelect={(id) => {
-                setActiveNav(id)
-                setMobileMenuOpen(false)
-              }}
-              buttonClassName="h-auto min-h-10 gap-3 py-2.5 pl-3"
-              className="border-t border-border/60 pt-3"
-            />
-          </div>
-          <div className="border-t border-border p-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                {user?.avatar_url ? (
-                  <img src={user.avatar_url} alt="" className="h-9 w-9 rounded-full object-cover" />
-                ) : (
-                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-primary/10">
-                    <User className="h-4 w-4 text-primary" />
-                  </div>
-                )}
-                <div className="flex flex-col">
-                  <span className="text-sm font-medium text-foreground">
-                    {user?.name || "User"}
-                  </span>
-                  {renderPlanBadge(user?.plan_type)}
-                </div>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => {
-                  setShowLogout(true)
-                  setMobileMenuOpen(false)
-                }}
-                className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                aria-label="Log out"
-              >
-                <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
           </div>
         </aside>
         <main className="flex min-w-0 flex-1 flex-col bg-transparent">
-          <header className="flex h-16 min-w-0 items-center justify-between bg-card/40 px-4 shadow-[0_1px_12px_-2px_rgba(0,0,0,0.15)] backdrop-blur-xl md:px-8">
+          <header className="relative z-[100] flex h-16 min-w-0 items-center justify-between bg-card/40 px-4 shadow-[0_1px_12px_-2px_rgba(0,0,0,0.15)] backdrop-blur-xl md:px-8">
             <div className="flex items-center gap-3">
               <Button
                 variant="ghost"
@@ -2307,7 +2207,11 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               </Button>
               <h1 className="text-lg font-semibold text-foreground">{getPageTitle()}</h1>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-foreground">
+                <Flame className="h-3.5 w-3.5 text-orange-500" />
+                <span>{streakDays} day{streakDays === 1 ? "" : "s"}</span>
+              </div>
               {onToggleTheme && (
                 <Button
                   variant="ghost"
@@ -2319,9 +2223,99 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                   {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
                 </Button>
               )}
-              <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-foreground">
-                <Flame className="h-3.5 w-3.5 text-orange-500" />
-                <span>{streakDays} day{streakDays === 1 ? "" : "s"}</span>
+              <div ref={accountMenuRef} className="relative z-[1000]">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => setAccountMenuOpen((open) => !open)}
+                  className="h-10 w-10 rounded-full border border-border bg-card p-0 hover:bg-accent"
+                  aria-label="Open account menu"
+                  aria-expanded={accountMenuOpen}
+                  aria-haspopup="menu"
+                >
+                  {user?.avatar_url ? (
+                    <img src={user.avatar_url} alt={accountName} className="h-full w-full rounded-full object-cover" />
+                  ) : (
+                    <span className="text-xs font-bold text-primary">{accountInitials}</span>
+                  )}
+                </Button>
+                {accountMenuOpen && (
+                  <div
+                    className={`absolute right-0 top-[calc(100%+0.5rem)] z-[1001] max-h-[calc(100dvh-5rem)] w-[min(260px,calc(100vw-1.5rem))] overflow-y-auto rounded-xl border shadow-xl ${
+                      theme === "dark"
+                        ? "border-white/10 bg-[#2f2f2f] text-white shadow-black/40"
+                        : "border-slate-200 bg-white text-slate-950 shadow-slate-900/15"
+                    }`}
+                    role="menu"
+                  >
+                    <div className="flex w-full items-center gap-2.5 px-3 pb-3 pt-3 text-left">
+                      <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ring-1 ${
+                        theme === "dark" ? "bg-[#1e1e1e] ring-white/10" : "bg-slate-100 ring-slate-200"
+                      }`}>
+                        {user?.avatar_url ? (
+                          <img src={user.avatar_url} alt={accountName} className="h-full w-full object-cover" />
+                        ) : (
+                          <span className={`text-sm font-bold ${theme === "dark" ? "text-white/80" : "text-slate-600"}`}>
+                            {accountInitials}
+                          </span>
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="truncate text-base font-semibold leading-5">
+                          {accountName}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-0.5 px-1.5 pb-1.5">
+                      {accountMenuItems.map(({ icon: Icon, label, id }) => {
+                        const selected = activeNav === id
+                        return (
+                          <button
+                            key={label}
+                            type="button"
+                            role="menuitem"
+                            aria-current={selected ? "page" : undefined}
+                            onClick={() => {
+                              setActiveNav(id)
+                              setAccountMenuOpen(false)
+                            }}
+                            className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium transition-colors ${
+                              selected
+                                ? theme === "dark"
+                                  ? "bg-white/[0.09] text-white"
+                                  : "bg-slate-100 text-slate-950"
+                                : theme === "dark"
+                                  ? "text-white/65 hover:bg-white/[0.06] hover:text-white"
+                                  : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
+                            }`}
+                          >
+                            <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+                            <span>{label}</span>
+                          </button>
+                        )
+                      })}
+
+                      <button
+                        type="button"
+                        role="menuitem"
+                        aria-label="Log out"
+                        onClick={() => {
+                          setAccountMenuOpen(false)
+                          setShowLogout(true)
+                        }}
+                        className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium transition-colors ${
+                          theme === "dark"
+                            ? "text-red-400 hover:bg-red-400/10"
+                            : "text-red-600 hover:bg-red-50"
+                        }`}
+                      >
+                        <LogOut className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+                        <span>Sign Out</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </header>

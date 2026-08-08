@@ -1,168 +1,175 @@
 "use client"
 
-import { useState } from "react"
-import { ChevronDown, ChevronUp } from "lucide-react"
+import { Clock3 } from "lucide-react"
 
 interface QuestionDeepDiveProps {
   index: number
   sectionId?: string
-  responseId?: string
   question: string
-  response: string
-  score: number | null
-  feedback?: string
-  coachingHint?: string
-  strongerAnswerOutline?: string
-  mistake?: { type?: string; diagnosis?: string; quote?: string } | null
-  whyBad?: string
-  betterStructure?: string[]
-  improvedAnswer?: string
-  sessionAverageScore?: number | null
-  flags?: string[]
-  evidenceQuotes?: string[]
+  response?: string
+  transcript?: string
+  score?: number | null
+  status?: string
+  timeUsedSeconds?: number | null
+  whatCandidateAnswered?: string
+  whatWasGood?: string[]
+  whatReducedScore?: string[]
+  evidence?: {
+    correctly_mentioned?: string[]
+    missing?: string[]
+    incorrect_claims?: string[]
+    contradictions?: string[]
+    quotes?: string[]
+  }
+  answerStructure?: Record<string, string>
+  projectResumeCoverage?: {
+    covered?: string[]
+    missing?: string[]
+    incorrect?: string[]
+  }
+  topic?: string
+}
+
+function duration(value?: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return "—"
+  const minutes = Math.floor(value / 60)
+  const seconds = Math.round(value % 60)
+  return `${minutes}m ${seconds}s`
+}
+
+function statusClass(status: string) {
+  if (status === "Completed") return "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+  if (status === "Unable to Evaluate") return "border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
+  if (status === "Incomplete") return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+  return "border-border bg-secondary text-muted-foreground"
 }
 
 export function QuestionDeepDive({
   index,
   sectionId,
   question,
-  response,
-  score,
-  feedback,
-  coachingHint,
-  strongerAnswerOutline,
-  mistake,
-  whyBad,
-  betterStructure = [],
-  improvedAnswer,
-  sessionAverageScore,
-  flags = [],
-  evidenceQuotes = [],
+  response = "",
+  transcript,
+  score = 0,
+  status = "Not Answered",
+  timeUsedSeconds,
+  whatCandidateAnswered,
+  whatWasGood = [],
+  whatReducedScore = [],
+  evidence = {},
+  answerStructure = {},
+  projectResumeCoverage,
+  topic,
 }: QuestionDeepDiveProps) {
-  const [isExpanded, setIsExpanded] = useState(false)
-  const isLongResponse = response.length > 300
-  const displayedResponse = isExpanded ? response : response.slice(0, 300) + (isLongResponse ? "..." : "")
-
-  const isGoodScore = score !== null && score >= 80
-  const workedText = evidenceQuotes.length
-    ? `Captured evidence: ${evidenceQuotes[0]}`
-    : isGoodScore
-      ? feedback || "This was one of the stronger captured answers in the session."
-      : "No clear strength was captured for this answer."
-
-  const getScoreColor = (s: number | null) => {
-    if (s === null) return "text-muted-foreground bg-secondary/30 border-border"
-    if (s >= 80) return "text-emerald-500 bg-emerald-500/10 border-emerald-500/20"
-    if (s >= 60) return "text-amber-500 bg-amber-500/10 border-amber-500/20"
-    return "text-rose-500 bg-rose-500/10 border-rose-500/20"
-  }
+  const unanswered = status === "Not Answered"
+  const answerText = transcript || response
+  const scoreLabel = status === "Unable to Evaluate" ? "Unable to Evaluate" : `${Math.round(score ?? 0)}/10`
+  const good = whatWasGood.length ? whatWasGood : evidence.correctly_mentioned || []
+  const reduced = whatReducedScore.length ? whatReducedScore : [
+    ...(evidence.missing || []).map((item) => `Missing: ${item}`),
+    ...(evidence.incorrect_claims || []).map((item) => `Incorrect: ${item}`),
+    ...(evidence.contradictions || []).map((item) => `Contradiction: ${item}`),
+  ]
 
   return (
-    <section id={sectionId || `question-${index}`} data-report-section className="scroll-margin-top: 5rem py-6 border-b border-border last:border-b-0 space-y-6">
-      {/* Header and Score Info */}
-      <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-        <div className="space-y-1.5 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold text-primary uppercase tracking-wider">
-              Question {index}
-            </span>
-            {flags.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {flags.map((flg) => (
-                  <span key={flg} className="inline-flex items-center rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400 border border-amber-500/20">
-                    {flg.replace(/_/g, " ")}
-                  </span>
+    <section id={sectionId || `question-${index}`} data-report-section className="scroll-mt-8 space-y-5 border-b border-border pb-8 last:border-b-0">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <p className="text-xs font-bold uppercase tracking-[0.16em] text-muted-foreground">Question {index}</p>
+          <h2 className="mt-1 text-xl font-bold tracking-tight">{question || "Question text unavailable"}</h2>
+          {topic && <p className="mt-1 text-xs text-muted-foreground">{topic}</p>}
+        </div>
+        <div className="flex items-center gap-2 sm:text-right">
+          <span className={`rounded-full border px-2.5 py-1 text-xs font-medium ${statusClass(status)}`}>{status}</span>
+          <span className="font-mono text-lg font-medium tabular-nums">{scoreLabel}</span>
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Clock3 className="h-4 w-4" />
+        <span className="font-bold">Time used:</span> <span className="font-mono text-foreground">{duration(timeUsedSeconds)}</span>
+      </div>
+
+      <section className="rounded-md border border-border bg-card p-4">
+        <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Full answer / transcript</h3>
+        <p className="mt-3 whitespace-pre-wrap text-sm leading-6">{answerText || "No answer was captured."}</p>
+      </section>
+
+      <section className="rounded-md border border-border bg-card p-4">
+        <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">What candidate answered</h3>
+        <p className="mt-3 whitespace-pre-wrap text-sm leading-6">{whatCandidateAnswered || answerText || "No answer was captured."}</p>
+      </section>
+
+      {!unanswered && (
+        <>
+          {!!good.length && (
+            <EvidenceList title="What was good" items={good} tone="good" />
+          )}
+          {!!reduced.length && (
+            <EvidenceList title="What reduced score" items={reduced} tone="neutral" />
+          )}
+
+          {(evidence.correctly_mentioned?.length || evidence.missing?.length || evidence.incorrect_claims?.length || evidence.quotes?.length) ? (
+            <section className="rounded-md border border-border bg-card p-4">
+              <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Evidence</h3>
+              <div className="mt-3 grid gap-4 sm:grid-cols-2">
+                <EvidenceColumn label="Correctly mentioned" items={evidence.correctly_mentioned || []} />
+                <EvidenceColumn label="Missing" items={evidence.missing || []} />
+                <EvidenceColumn label="Incorrect claims" items={evidence.incorrect_claims || []} />
+                <EvidenceColumn label="Recorded quotes" items={evidence.quotes || []} />
+              </div>
+            </section>
+          ) : null}
+
+          {!!Object.keys(answerStructure).length && (
+            <section className="rounded-md border border-border bg-card p-4">
+              <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Answer structure</h3>
+              <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                {Object.entries(answerStructure).map(([key, value]) => (
+                  <div key={key} className="rounded-md border border-border/70 bg-background px-3 py-2">
+                    <p className="text-xs font-bold uppercase text-muted-foreground">{key}</p>
+                    <p className="mt-1 text-sm">{value}</p>
+                  </div>
                 ))}
               </div>
-            )}
-          </div>
-          <h3 className="text-lg font-semibold text-foreground leading-snug">
-            {question}
-          </h3>
-        </div>
-
-        {/* Score Ring / Badge */}
-        <div className="flex items-center gap-3 shrink-0">
-          <div className={`flex flex-col items-center justify-center border rounded-lg p-2.5 min-w-[70px] ${getScoreColor(score)}`}>
-            <span className="text-xl font-bold font-mono leading-none">{Math.round(score ?? 0)}%</span>
-            <span className="text-[10px] text-muted-foreground uppercase font-semibold mt-1">Score</span>
-          </div>
-          {sessionAverageScore !== undefined && sessionAverageScore !== null && (
-            <div className="text-[11px] text-muted-foreground flex flex-col">
-              <span>Avg score:</span>
-              <span className="font-semibold text-foreground">{Math.round(sessionAverageScore)}%</span>
-            </div>
+            </section>
           )}
-        </div>
-      </div>
 
-      {/* Response Box */}
-      <div className="bg-secondary/10 border border-border/50 rounded-lg p-4 space-y-2">
-        <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Your Response</h4>
-        <div className="text-sm leading-relaxed text-foreground/80 whitespace-pre-wrap">
-          {displayedResponse || <span className="italic">No response captured.</span>}
-        </div>
-        {isLongResponse && (
-          <button
-            onClick={() => setIsExpanded(!isExpanded)}
-            className="text-xs font-semibold text-primary flex items-center gap-1 hover:underline mt-1 pt-1 border-t border-border/30 w-full justify-center"
-          >
-            {isExpanded ? (
-              <>
-                Show Less <ChevronUp className="h-3 w-3" />
-              </>
-            ) : (
-              <>
-                View Full Response <ChevronDown className="h-3 w-3" />
-              </>
-            )}
-          </button>
-        )}
-      </div>
-
-      {/* Feedback & Suggestions */}
-      <div className="grid gap-5 md:grid-cols-2">
-        {/* Good parts */}
-        <div className="space-y-2 border border-emerald-500/20 bg-emerald-500/5 p-4 rounded-lg">
-          <h4 className="text-xs font-semibold text-emerald-500 uppercase tracking-wider">Captured strength</h4>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            {workedText}
-          </p>
-        </div>
-
-        {/* Needs improvement */}
-        <div className="space-y-2 border border-border/60 bg-card p-4 rounded-lg">
-          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Your mistake</h4>
-          <p className="text-sm leading-relaxed text-muted-foreground">
-            {mistake?.diagnosis || feedback || coachingHint || "No suggestions recorded."}
-          </p>
-          {whyBad && <p className="text-xs leading-relaxed text-muted-foreground/80">Why it hurts: {whyBad}</p>}
-        </div>
-      </div>
-
-      {betterStructure.length > 0 && (
-        <div className="rounded-lg border border-border/60 bg-secondary/10 p-4">
-          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Better answer structure</h4>
-          <div className="mt-3 grid gap-2 sm:grid-cols-2">
-            {betterStructure.map((step, idx) => (
-              <div key={`${step}-${idx}`} className="rounded-md border border-border/40 bg-background/60 p-3">
-                <p className="text-[11px] font-semibold uppercase text-muted-foreground">Step {idx + 1}</p>
-                <p className="mt-1 text-sm leading-5 text-foreground/80">{step}</p>
+          {projectResumeCoverage && (
+            <section className="rounded-md border border-border bg-card p-4">
+              <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Project / resume coverage</h3>
+              <div className="mt-3 grid gap-4 sm:grid-cols-3">
+                <EvidenceColumn label="Covered" items={projectResumeCoverage.covered || []} />
+                <EvidenceColumn label="Missing" items={projectResumeCoverage.missing || []} />
+                <EvidenceColumn label="Incorrect" items={projectResumeCoverage.incorrect || []} />
               </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Stronger Answer Rewrite (Rewritten Answer Block) */}
-      {(improvedAnswer || strongerAnswerOutline) && (
-        <div className="report-rewrite-block p-4 space-y-2">
-          <h4 className="text-xs font-semibold text-primary uppercase tracking-wider">Your Answer, Rewritten</h4>
-          <p className="text-sm leading-relaxed text-foreground/80 whitespace-pre-wrap">
-            {improvedAnswer || strongerAnswerOutline}
-          </p>
-        </div>
+            </section>
+          )}
+        </>
       )}
     </section>
+  )
+}
+
+function EvidenceList({ title, items, tone }: { title: string; items: string[]; tone: "good" | "neutral" }) {
+  return (
+    <section className={`rounded-md border p-4 ${tone === "good" ? "border-emerald-500/20 bg-emerald-500/5" : "border-border bg-card"}`}>
+      <h3 className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">{title}</h3>
+      <ul className="mt-3 space-y-2 text-sm leading-6">
+        {items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
+      </ul>
+    </section>
+  )
+}
+
+function EvidenceColumn({ label, items }: { label: string; items: string[] }) {
+  if (!items.length) return null
+  return (
+    <div>
+      <p className="text-xs font-bold text-muted-foreground">{label}</p>
+      <ul className="mt-2 space-y-1 text-sm leading-5">
+        {items.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
+      </ul>
+    </div>
   )
 }

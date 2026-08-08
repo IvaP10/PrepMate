@@ -16,14 +16,18 @@ from database import async_execute
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
 from learning_engine import (
     ensure_mission_from_weakness,
+    ensure_mission_from_technical_report,
     ingest_interview_evidence,
     validate_mission_with_analysis,
 )
-from llm_router import complete_json_async
-from premium_report_builder import build_premium_report
 from report_generator import build_async_behavioral_report, build_async_technical_report
 from security_utils import decrypt_data, decrypt_json, encrypt_data, stable_hash
-from weakness_engine import RUBRIC_VERSION, TAXONOMY_VERSION, persist_weakness_states
+from weakness_engine import (
+    RUBRIC_VERSION,
+    TAXONOMY_VERSION,
+    persist_weakness_states,
+    retire_superseded_analysis_evidence,
+)
 
 logger = logging.getLogger("analysis_pipeline")
 
@@ -43,7 +47,7 @@ ANALYSIS_STAGES = (
 ANALYSIS_PREFLIGHT_STAGES = ("assessment_completion",)
 ANALYSIS_EXECUTION_STAGES = ANALYSIS_PREFLIGHT_STAGES + ANALYSIS_STAGES
 
-ANALYSIS_STAGE_VERSION = "evidence-v4"
+ANALYSIS_STAGE_VERSION = "evidence-v6"
 ANALYSIS_LEASE_SECONDS = 90
 ANALYSIS_MAX_RETRIES = 3
 TERMINAL_INTERVIEW_STATUSES = {"completed", "report_ready", "partial", "failed", "cancelled"}
@@ -399,13 +403,14 @@ async def enqueue_analysis_result(
                     SELECT 1 FROM SessionPerformanceAnalyses
                     WHERE interview_id = %s AND user_id = %s
                       AND schema_version = %s
+                      AND producer_version = %s
                       AND status = 'ready'
                       AND is_current = TRUE
                       AND analysis_json_encrypted IS NOT NULL
                       AND evidence_index_encrypted IS NOT NULL
                     LIMIT 1
                     """,
-                    (interview_id, user_id, SESSION_PERFORMANCE_VERSION),
+                    (interview_id, user_id, SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION),
                 )
                 canonical_ready = bool(cursor.fetchone())
                 if canonical_ready or not force_canonical_rebuild:
@@ -848,41 +853,6 @@ async def _queue_learning_from_analysis(interview_id: str, user_id: str) -> None
         logger.warning("Learning exercise generation skipped for %s", stable_hash(interview_id, "interview"))
 
 
-async def _report_action_for_mode(user_id: str, mode: str) -> Optional[Dict[str, Any]]:
-    row = await async_execute(
-        """
-        SELECT mission.mission_id, node.roadmap_node_id, node.exercise_id,
-               node.activity_type, node.title
-        FROM ImprovementMissions mission
-        LEFT JOIN LATERAL (
-            SELECT roadmap_node_id, exercise_id, activity_type, title
-            FROM ImprovementRoadmapNodes
-            WHERE mission_id = mission.mission_id AND user_id = mission.user_id
-              AND availability_status IN ('current', 'available')
-              AND exercise_id IS NOT NULL
-              AND result_status NOT IN ('passed', 'strong_pass')
-            ORDER BY CASE WHEN availability_status = 'current' THEN 0 ELSE 1 END,
-                     order_index
-            LIMIT 1
-        ) node ON TRUE
-        WHERE mission.user_id = %s AND mission.mode = %s AND mission.status = 'active'
-        ORDER BY mission.priority_score DESC, mission.updated_at DESC
-        LIMIT 1
-        """,
-        (user_id, "technical" if mode == "technical" else "mock"),
-        fetchone=True,
-    )
-    if not row:
-        return None
-    return {
-        "action": "open_improve_activity",
-        "mission_id": row[0],
-        "roadmap_node_id": row[1],
-        "exercise_id": row[2],
-        "activity_type": row[3],
-        "label": row[4],
-    }
-
 
 async def _run_analysis_job_legacy(job_id: str) -> None:
     job = await async_execute(
@@ -1087,19 +1057,76 @@ def _decrypt_storage_text(value: Any) -> str:
     return decrypt_data(str(value))
 
 
+def _technical_round_id(provenance: Any) -> Optional[str]:
+    if not isinstance(provenance, dict):
+        return None
+    value = provenance.get("round_id") or provenance.get("technical_round_id")
+    return str(value) if value else None
+
+
+def _technical_source_text(encrypted: Any, legacy_code: Any = None, legacy_excerpt: Any = None) -> str:
+    if encrypted:
+        try:
+            decrypted = _decrypt_storage_text(encrypted)
+            if decrypted and decrypted != "[encrypted]":
+                return decrypted
+        except Exception:
+            logger.warning("Technical source payload could not be decrypted", exc_info=True)
+    for value in (legacy_code, legacy_excerpt):
+        text = str(value or "")
+        if text and text != "[encrypted]":
+            return text
+    return ""
+
+
+def _technical_source_excerpt(source_code: str, legacy_excerpt: Any = None, limit: int = 3000) -> str:
+    excerpt = str(legacy_excerpt or "")
+    if excerpt and excerpt != "[encrypted]":
+        return excerpt
+    if len(source_code) <= limit:
+        return source_code
+    return source_code[:limit].rsplit("\n", 1)[0]
+
+
 def _safe_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
     allowed = {
-        "version", "interview_id", "analysis_id", "report_type", "report_subtype",
-        "profile_type", "readiness_label", "overall_score", "recommendation_confidence",
-        "scoring_confidence", "evidence_policy", "evidence_summary", "evidence_status",
-        "dimension_scores", "behavioral_metrics", "technical_process", "weak_topics",
-        "findings",
+        "version", "interview_id", "analysis_id", "report_type", "profile_type",
+        "overall_score", "score_breakdown", "counts", "dimension_scores",
+        "behavioral_metrics", "technical_process", "evidence_summary", "evidence_status",
+        "report_state", "strengths", "summary", "duration_seconds", "time_used_seconds",
+        "time_allowed_seconds", "round_analysis", "timeline", "integrity_summary",
         "candidate_visible_integrity", "ai_enhanced", "ai_provider_policy",
-        "ai_fallback_reason", "report_actions",
-        "report_state", "evidence_hash", "evidence_manifest_id", "generation_provenance",
-        "score_provenance",
+        "ai_fallback_reason", "evidence_hash", "evidence_manifest_id",
+        "generation_provenance", "score_provenance",
     }
-    return {key: value for key, value in report.items() if key in allowed}
+    safe = {key: value for key, value in report.items() if key in allowed}
+    technical = report.get("technical")
+    if isinstance(technical, dict):
+        safe["technical"] = {
+            key: value
+            for key, value in technical.items()
+            if key not in {"problems", "test_matrix"}
+        }
+        safe["technical"]["problems"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"source_code", "prompt"}
+            }
+            for item in technical.get("problems") or []
+            if isinstance(item, dict)
+        ]
+    for key in ("questions", "per_turn_feedback"):
+        safe[key] = [
+            {
+                item_key: item_value
+                for item_key, item_value in item.items()
+                if item_key not in {"response", "transcript", "what_candidate_answered"}
+            }
+            for item in report.get(key) or []
+            if isinstance(item, dict)
+        ]
+    return safe
 
 
 def _report_has_noncritical_degradation(
@@ -1281,14 +1308,25 @@ def _safe_stage_payload(stage: str, output: Dict[str, Any]) -> Dict[str, Any]:
             ],
         }
     if stage in {"technical_code", "technical_analysis"}:
-        return {
+        safe = {
             key: value
             for key, value in output.items()
             if key not in {
                 "submissions", "final_submissions", "all_submissions", "run_events",
                 "drafts", "typed_responses", "source_code", "source_excerpt",
+                "rounds",
             }
         }
+        safe["test_matrix"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"source_code", "source_excerpt", "metadata", "result_json"}
+            }
+            for item in output.get("test_matrix") or []
+            if isinstance(item, dict)
+        ]
+        return safe
     if stage in {"report_generation", "deterministic_report", "semantic_enhancement", "report_validation", "complete"}:
         return _safe_report_payload(output)
     return output
@@ -1313,7 +1351,7 @@ def _legacy_stage_outputs(outputs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[
     }
 
 
-def _turn_observations(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _turn_observations(turns: List[Dict[str, Any]], mode: str = "mock") -> List[Dict[str, Any]]:
     observations: List[Dict[str, Any]] = []
     technical_types = {
         "technical_concept", "system_design", "ml", "backend", "database",
@@ -1330,18 +1368,24 @@ def _turn_observations(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             topic = re.sub(r"[^a-z0-9]+", "-", str(turn.get("topic") or "general").lower()).strip("-")
             skill_keys = [f"interview:{topic or 'general'}"]
         provenance = turn.get("provenance") or {}
+        round_id = _technical_round_id(provenance)
+        if mode == "technical" and not round_id:
+            continue
         for skill_key in skill_keys:
+            normalized_skill_key = skill_key
+            if mode != "technical" and normalized_skill_key.lower().startswith(("technical:", "algorithm:", "debugging:")):
+                normalized_skill_key = f"interview:{re.sub(r'[^a-z0-9]+', '-', normalized_skill_key.lower()).strip('-')}"
             observations.append({
-                "skill_key": skill_key,
+                "skill_key": normalized_skill_key,
                 "source_key": turn.get("response_id"),
                 "source_kind": (
                     "technical_response"
-                    if str(turn.get("question_type") or "").lower() in technical_types
+                    if mode == "technical" and str(turn.get("question_type") or "").lower() in technical_types
                     else "interview_response"
                 ),
                 "evidence_type": "interview",
                 "response_id": turn.get("response_id"),
-                "round_id": provenance.get("technical_round_id"),
+                "round_id": round_id,
                 "question_spec_id": turn.get("question_spec_id"),
                 "score": turn.get("overall_score"),
                 "confidence": turn.get("confidence_value") or turn.get("confidence"),
@@ -1372,26 +1416,41 @@ async def _persist_canonical_performance(
     mode = "technical" if report_type == "technical" or "technical" in interview_type else "mock"
     turns = list((stage_outputs.get("nlp_content") or {}).get("turns") or [])
     technical = stage_outputs.get("technical_code") or {}
-    observations = _turn_observations(turns)
+    observations = _turn_observations(turns, mode)
+    observed_response_ids = {
+        str(item.get("response_id"))
+        for item in observations
+        if item.get("response_id")
+    }
     for item in technical.get("test_matrix") or []:
-        if item.get("final_pass_rate") is None:
+        score = item.get("final_pass_rate")
+        source_kind = "technical_execution"
+        if score is None and item.get("evidence_state") == "assessed_response":
+            score = item.get("score")
+            source_kind = "technical_response"
+        if score is None:
+            continue
+        if source_kind == "technical_response" and item.get("response_id") in observed_response_ids:
             continue
         observations.append({
             "skill_key": f"technical:{item.get('algorithm_pattern') or item.get('round_type') or 'coding'}",
             "source_key": item.get("round_id") or item.get("response_id"),
-            "source_kind": "technical_execution",
+            "source_kind": source_kind,
             "evidence_type": "interview",
             "round_id": item.get("round_id"),
             "response_id": item.get("response_id"),
             "question_spec_id": item.get("question_spec_id"),
-            "score": item.get("final_pass_rate"),
+            "score": score,
             "confidence": 0.9,
-            "flags": [] if float(item.get("final_pass_rate") or 0) >= 75 else ["test-case-failure"],
+            "flags": [] if float(score or 0) >= 75 else [
+                "technical-response-needs-work" if source_kind == "technical_response" else "test-case-failure"
+            ],
         })
 
     question_analyses = [
         {
             "response_id": turn.get("response_id"),
+            "round_id": _technical_round_id(turn.get("provenance") or {}),
             "question_spec_id": turn.get("question_spec_id"),
             "question": turn.get("question"),
             "taxonomy_keys": turn.get("taxonomy_keys") or [],
@@ -1456,6 +1515,7 @@ async def _persist_canonical_performance(
         "responses": [
             {
                 "response_id": item.get("response_id"),
+                "round_id": item.get("round_id"),
                 "question_spec_id": item.get("question_spec_id"),
                 "taxonomy_keys": item.get("taxonomy_keys") or [],
                 "evidence_quotes": item.get("evidence_quotes") or [],
@@ -1467,6 +1527,11 @@ async def _persist_canonical_performance(
                 "round_id": item.get("round_id"),
                 "submission_id": item.get("submission_id"),
                 "response_id": item.get("response_id"),
+                "response_ids": item.get("response_ids") or [],
+                "run_id": item.get("run_id") or item.get("latest_run_id"),
+                "snapshot_id": item.get("snapshot_id"),
+                "evidence_state": item.get("evidence_state"),
+                "has_candidate_evidence": item.get("evidence_state") not in {None, "no_evidence"},
                 "final_verdict": item.get("final_verdict"),
                 "reasoning_evidence_ids": next((
                     reasoning.get("evidence_ids") or []
@@ -1510,8 +1575,12 @@ async def _persist_canonical_performance(
     safe_canonical["question_count"] = len(question_analyses)
     safe_canonical["technical_evidence_count"] = len(technical.get("test_matrix") or [])
     safe_evidence_index = {
-        "response_ids": [item.get("response_id") for item in question_analyses],
-        "round_ids": [item.get("round_id") for item in technical.get("test_matrix") or []],
+        "response_ids": [item.get("response_id") for item in question_analyses if item.get("response_id")],
+        "round_ids": [
+            item.get("round_id")
+            for item in technical.get("test_matrix") or []
+            if item.get("round_id") and item.get("evidence_state") != "no_evidence"
+        ],
         "submission_ids": [
             item.get("submission_id")
             for item in technical.get("test_matrix") or []
@@ -1636,6 +1705,7 @@ async def _persist_canonical_performance(
 
     analysis_id, created = await asyncio.to_thread(_persist_revision)
     if created:
+        await retire_superseded_analysis_evidence(interview_id, analysis_id)
         await persist_weakness_states(user_id, analysis_id, interview_id, observations)
         await validate_mission_with_analysis(
             user_id, interview_id, analysis_id, mode, observations
@@ -1878,12 +1948,19 @@ async def run_analysis_job(
         )
         mode = "technical" if str(report.get("report_type") or "").lower() == "technical" else "mock"
         await _queue_learning_from_analysis(interview_id, user_id)
-        await ensure_mission_from_weakness(user_id, interview_id, analysis_id, mode)
-        report_action = await _report_action_for_mode(user_id, mode)
+        report_focus_mission = None
+        if mode == "technical":
+            report_focus_mission = await ensure_mission_from_technical_report(
+                user_id,
+                interview_id,
+                analysis_id,
+                (legacy_stage_outputs.get("technical_code") or {}).get("weak_topics") or [],
+            )
+        if not report_focus_mission:
+            await ensure_mission_from_weakness(user_id, interview_id, analysis_id, mode)
         report = {
             **report,
             "analysis_id": analysis_id,
-            "report_actions": [report_action] if report_action else [],
         }
         report.pop("recruiter_only", None)
         safe_report = _safe_report_payload(report)
@@ -1933,7 +2010,12 @@ async def run_analysis_job(
                 report_json = %s, report_json_encrypted = %s,
                 completed_at = COALESCE(completed_at, NOW())
             WHERE interview_id = %s AND status <> 'cancelled'
-              AND NOT (status IN ('completed', 'report_ready', 'partial', 'failed') AND report_json IS NOT NULL)
+              AND (
+                  report_json IS NULL
+                  OR report_json_encrypted IS NULL
+                  OR analysis_status IN ('not_requested', 'queued', 'running', 'failed', 'partial')
+                  OR status IN ('analysis_pending', 'analysis_running')
+              )
             """,
             (
                 final_status, report.get("overall_score"),
@@ -2331,12 +2413,72 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         }
 
     if stage == "technical_code":
+        session_row = await async_execute(
+            """
+            SELECT started_at, completed_at, duration_seconds, deadline_at, settings
+            FROM Interviews
+            WHERE interview_id = %s
+            """,
+            (interview_id,),
+            fetchone=True,
+        )
+        session_settings = _json_value(session_row[4], {}) if session_row else {}
+        if not isinstance(session_settings, dict):
+            session_settings = {}
+        technical_settings = session_settings.get("technical") if isinstance(session_settings.get("technical"), dict) else {}
+        duration_used_seconds = session_row[2] if session_row and session_row[2] is not None else None
+        if duration_used_seconds is None and session_row and session_row[0] and session_row[1]:
+            duration_used_seconds = max(0, int((session_row[1] - session_row[0]).total_seconds()))
+        duration_allowed_seconds = (
+            technical_settings.get("duration_seconds")
+            or technical_settings.get("total_duration_seconds")
+            or session_settings.get("duration_seconds")
+        )
+        if duration_allowed_seconds is None and session_row and session_row[0] and session_row[3]:
+            duration_allowed_seconds = max(0, int((session_row[3] - session_row[0]).total_seconds()))
+        round_rows = await async_execute(
+            """
+            SELECT round_id, round_type, language, prompt, metadata,
+                   status, created_at, completed_at, duration_seconds,
+                   deadline_at, round_number, started_at
+            FROM TechnicalInterviewRounds
+            WHERE interview_id = %s
+            ORDER BY created_at, round_id
+            """,
+            (interview_id,),
+            fetchall=True,
+        )
+        round_catalog: Dict[str, Dict[str, Any]] = {}
+        for row in round_rows or []:
+            round_id = str(row[0])
+            metadata = _json_value(row[4], {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            prompt = str(row[3] or "")
+            round_catalog[round_id] = {
+                "round_id": row[0],
+                "round_type": row[1],
+                "language": row[2],
+                "prompt": prompt,
+                "metadata": metadata,
+                "status": row[5],
+                "created_at": row[6],
+                "completed_at": row[7],
+                "duration_seconds": row[8],
+                "deadline_at": row[9],
+                "round_number": row[10],
+                "started_at": row[11],
+                "algorithm_pattern": metadata.get("algorithm_pattern"),
+                "expected_time_complexity": metadata.get("expected_time_complexity"),
+                "expected_space_complexity": metadata.get("expected_space_complexity"),
+                "title": metadata.get("title") or (prompt.splitlines()[0][:80] if prompt else "Technical round"),
+            }
         submission_rows = await async_execute(
             """
             SELECT ts.submission_id, ts.round_id, ts.language, ts.source_excerpt, ts.source_code, ts.submit_number,
                    ts.visible_passed, ts.visible_total, ts.hidden_passed, ts.hidden_total,
                    ts.runtime_ms, ts.memory_kb, ts.status, ts.result_json, ts.created_at,
-                   tir.prompt, tir.metadata
+                   tir.prompt, tir.metadata, ts.source_code_encrypted
             FROM TechnicalSubmissions ts
             JOIN TechnicalInterviewRounds tir ON tir.round_id = ts.round_id
             WHERE ts.interview_id = %s
@@ -2350,12 +2492,12 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         for row in submission_rows or []:
             result_json = _json_value(row[13], {})
             metadata = _json_value(row[16], {})
-            source_code = row[4] or row[3] or ""
+            source_code = _technical_source_text(row[17], row[4], row[3])
             item = {
                 "submission_id": row[0],
                 "round_id": row[1],
                 "language": row[2],
-                "source_excerpt": row[3] or "",
+                "source_excerpt": _technical_source_excerpt(source_code, row[3]),
                 "source_chars": len(source_code),
                 "source_code": source_code,
                 "submit_number": int(row[5] or 0),
@@ -2380,6 +2522,14 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 latest_by_round[item["round_id"]] = item
 
         final_submissions = list(latest_by_round.values())
+        for item in final_submissions:
+            round_item = round_catalog.get(str(item.get("round_id"))) or {}
+            started_at = round_item.get("started_at") or round_item.get("created_at")
+            if started_at and item.get("created_at"):
+                try:
+                    item["elapsed_seconds"] = max(0, int((item["created_at"] - started_at).total_seconds()))
+                except (AttributeError, TypeError):
+                    pass
         visible_passed = sum(item["visible_passed"] for item in final_submissions)
         visible_total = sum(item["visible_total"] for item in final_submissions)
         hidden_passed = sum(item["hidden_passed"] for item in final_submissions)
@@ -2395,7 +2545,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT tre.run_id, tre.round_id, tre.language, tre.source_chars, tre.source_excerpt, tre.source_code,
                    tre.exit_code, tre.runtime_ms, tre.metadata, tre.hidden_validation_result,
-                   tir.prompt, tir.metadata
+                   tir.prompt, tir.metadata, tre.source_code_encrypted, tre.created_at
             FROM TechnicalRunEvents tre
             JOIN TechnicalInterviewRounds tir ON tir.round_id = tre.round_id
             WHERE tir.interview_id = %s
@@ -2411,13 +2561,14 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 "language": row[2],
                 "source_chars": row[3],
                 "source_excerpt": row[4] or "",
-                "source_code": row[5] or row[4] or "",
+                "source_code": _technical_source_text(row[12], row[5], row[4]),
                 "exit_code": row[6],
                 "runtime_ms": row[7],
                 "metadata": _json_value(row[8], {}),
                 "validation": _json_value(row[9], {}),
                 "prompt": row[10] or "",
                 "round_metadata": _json_value(row[11], {}),
+                "created_at": row[13],
             }
             for row in run_rows or []
         ]
@@ -2432,13 +2583,21 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             item["pass_count"] = int(validation.get("pass_count") or 0)
             item["algorithm_pattern"] = metadata.get("algorithm_pattern")
             item["title"] = metadata.get("title") or (item.get("prompt") or "Technical problem").splitlines()[0][:80]
+            item["source_excerpt"] = _technical_source_excerpt(item.get("source_code") or "", item.get("source_excerpt"))
+            round_item = round_catalog.get(str(item.get("round_id"))) or {}
+            started_at = round_item.get("started_at") or round_item.get("created_at")
+            if started_at and item.get("created_at"):
+                try:
+                    item["elapsed_seconds"] = max(0, int((item["created_at"] - started_at).total_seconds()))
+                except (AttributeError, TypeError):
+                    pass
         latest = submissions[0] if submissions else {}
         draft_rows = await async_execute(
             """
             SELECT DISTINCT ON (tcs.round_id)
                    tcs.snapshot_id, tcs.round_id, tcs.language, tcs.source_chars,
                    tcs.source_excerpt, tcs.source_code,
-                   tcs.metadata, tcs.created_at, tir.prompt, tir.metadata
+                   tcs.metadata, tcs.created_at, tir.prompt, tir.metadata, tcs.source_code_encrypted
             FROM TechnicalCodeSnapshots tcs
             JOIN TechnicalInterviewRounds tir ON tir.round_id = tcs.round_id
             WHERE tcs.interview_id = %s
@@ -2455,7 +2614,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 "language": row[2],
                 "source_chars": row[3],
                 "source_excerpt": row[4] or "",
-                "source_code": row[5] or row[4] or "",
+                "source_code": _technical_source_text(row[10], row[5], row[4]),
                 "metadata": _json_value(row[6], {}),
                 "created_at": row[7],
                 "prompt": row[8] or "",
@@ -2467,6 +2626,14 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             metadata = item.get("round_metadata") or item.get("metadata") or {}
             item["algorithm_pattern"] = metadata.get("algorithm_pattern")
             item["title"] = metadata.get("title") or (item.get("prompt") or "Technical problem").splitlines()[0][:80]
+            item["source_excerpt"] = _technical_source_excerpt(item.get("source_code") or "", item.get("source_excerpt"))
+            round_item = round_catalog.get(str(item.get("round_id"))) or {}
+            started_at = round_item.get("started_at") or round_item.get("created_at")
+            if started_at and item.get("created_at"):
+                try:
+                    item["elapsed_seconds"] = max(0, int((item["created_at"] - started_at).total_seconds()))
+                except (AttributeError, TypeError):
+                    pass
         latest_signal = latest or (drafts[0] if drafts else {})
         reasoning_rows = await async_execute(
             """
@@ -2507,6 +2674,50 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             }
             reasoning_by_round.setdefault(str(row[1] or "unassigned"), []).append(item)
 
+        telemetry_rows = await async_execute(
+            """
+            SELECT round_id, event_type, payload, created_at
+            FROM TechnicalTelemetryEvents
+            WHERE interview_id = %s
+            ORDER BY created_at
+            """,
+            (interview_id,),
+            fetchall=True,
+        )
+        activity_events = []
+        for row in telemetry_rows or []:
+            payload = _json_value(row[2], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            detail = payload.get("label") or payload.get("event_label") or payload.get("reason")
+            activity_events.append({
+                "round_id": str(row[0]) if row[0] else None,
+                "event_type": row[1],
+                "detail": str(detail) if detail else None,
+                "created_at": row[3],
+            })
+
+        technical_question_types = {
+            "technical_concept", "system_design", "ml", "backend", "database",
+            "os", "network", "oop", "sql", "technical_explanation",
+        }
+        typed_turns = [
+            turn
+            for turn in (outputs.get("nlp_content", {}).get("turns") or [])
+            if str(turn.get("question_type") or "").lower() in technical_question_types
+        ]
+        typed_scores = [
+            turn.get("overall_score")
+            for turn in typed_turns
+            if not turn.get("insufficient_evidence") and turn.get("overall_score") is not None
+        ]
+        typed_assessed_round_ids = {
+            _technical_round_id(turn.get("provenance") or {})
+            for turn in typed_turns
+            if not turn.get("insufficient_evidence")
+            and turn.get("overall_score") is not None
+            and _technical_round_id(turn.get("provenance") or {})
+        }
         submitted_round_ids = {
             str(item.get("round_id"))
             for item in final_submissions
@@ -2564,7 +2775,10 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                     + (10.0 if has_explanation else 0.0),
                 )
 
-            official_dimension_eligible = round_key in submitted_round_ids
+            official_dimension_eligible = (
+                round_key in submitted_round_ids
+                or round_key in typed_assessed_round_ids
+            )
             if official_dimension_eligible and communication_score is not None:
                 communication_scores.append(communication_score)
             if official_dimension_eligible and tradeoff_score is not None:
@@ -2586,18 +2800,9 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 ),
                 "official_dimension_eligible": official_dimension_eligible,
             })
-        technical_question_types = {
-            "technical_concept", "system_design", "ml", "backend", "database",
-            "os", "network", "oop", "sql", "technical_explanation",
-        }
-        typed_turns = [
-            turn
-            for turn in (outputs.get("nlp_content", {}).get("turns") or [])
-            if str(turn.get("question_type") or "").lower() in technical_question_types
-        ]
         typed_matrix = [
             {
-                "round_id": (turn.get("provenance") or {}).get("technical_round_id"),
+                "round_id": _technical_round_id(turn.get("provenance") or {}),
                 "response_id": turn.get("response_id"),
                 "question_spec_id": turn.get("question_spec_id"),
                 "title": turn.get("topic") or str(turn.get("question_type") or "Technical response").replace("_", " ").title(),
@@ -2615,12 +2820,173 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             }
             for turn in typed_turns
         ]
-        typed_scores = [
-            turn.get("overall_score")
-            for turn in typed_turns
-            if not turn.get("insufficient_evidence") and turn.get("overall_score") is not None
-        ]
+        latest_run_by_round: Dict[str, Dict[str, Any]] = {}
+        for item in submissions:
+            key = str(item.get("round_id")) if item.get("round_id") else ""
+            if key and key not in latest_run_by_round:
+                latest_run_by_round[key] = item
+        latest_draft_by_round = {
+            str(item.get("round_id")): item
+            for item in drafts
+            if item.get("round_id")
+        }
+        run_counts_by_round = Counter(
+            str(item.get("round_id"))
+            for item in submissions
+            if item.get("round_id")
+        )
+        draft_counts_by_round = Counter(
+            str(item.get("round_id"))
+            for item in drafts
+            if item.get("round_id")
+        )
+        matrix_by_round: Dict[str, Dict[str, Any]] = {}
+        for key, round_item in round_catalog.items():
+            matrix_by_round[key] = {
+                **round_item,
+                "evidence_state": "no_evidence",
+                "insufficient_evidence": True,
+                "final_verdict": "no_evidence",
+                "visible_passed": 0,
+                "visible_total": 0,
+                "hidden_passed": 0,
+                "hidden_total": 0,
+                "final_pass_rate": None,
+                "source_excerpt": "",
+                "source_code": "",
+                "run_count": int(run_counts_by_round.get(key) or 0),
+                "draft_count": int(draft_counts_by_round.get(key) or 0),
+                "time_allowed_seconds": round_item.get("duration_seconds"),
+            }
+        for item in final_submissions:
+            key = str(item.get("round_id")) if item.get("round_id") else ""
+            if not key:
+                continue
+            matrix_by_round[key] = {
+                **matrix_by_round.get(key, {}),
+                "submission_id": item.get("submission_id"),
+                "round_id": item.get("round_id"),
+                "round_type": matrix_by_round.get(key, {}).get("round_type") or "coding",
+                "title": item.get("title"),
+                "language": item.get("language"),
+                "prompt": item.get("prompt", ""),
+                "metadata": item.get("metadata") or matrix_by_round.get(key, {}).get("metadata") or {},
+                "submit_number": item.get("submit_number"),
+                "visible_passed": item.get("visible_passed", 0),
+                "visible_total": item.get("visible_total", 0),
+                "hidden_passed": item.get("hidden_passed", 0),
+                "hidden_total": item.get("hidden_total", 0),
+                "runtime_ms": item.get("runtime_ms"),
+                "time_used_seconds": item.get("elapsed_seconds"),
+                "time_allowed_seconds": matrix_by_round.get(key, {}).get("time_allowed_seconds"),
+                "memory_kb": item.get("memory_kb"),
+                "algorithm_pattern": item.get("algorithm_pattern"),
+                "expected_time_complexity": item.get("expected_time_complexity"),
+                "expected_space_complexity": item.get("expected_space_complexity"),
+                "source_excerpt": item.get("source_excerpt", ""),
+                "source_code": item.get("source_code", ""),
+                "final_pass_rate": round(
+                    ((item["visible_passed"] + item["hidden_passed"])
+                     / max(item["visible_total"] + item["hidden_total"], 1)) * 100,
+                    1,
+                ),
+                "final_verdict": (
+                    "accepted"
+                    if (item["visible_passed"] + item["hidden_passed"])
+                    == (item["visible_total"] + item["hidden_total"])
+                    and (item["visible_total"] + item["hidden_total"]) > 0
+                    else "needs_work"
+                ),
+                "evidence_state": "final_submission",
+                "insufficient_evidence": False,
+            }
+        for key, run in latest_run_by_round.items():
+            if key not in matrix_by_round:
+                continue
+            item = matrix_by_round[key]
+            item["latest_run_id"] = run.get("run_id")
+            if item.get("evidence_state") == "no_evidence":
+                validation = run.get("validation") or {}
+                item.update({
+                    "round_id": run.get("round_id"),
+                    "round_type": item.get("round_type") or "coding",
+                    "title": run.get("title") or item.get("title"),
+                    "language": run.get("language") or item.get("language"),
+                    "prompt": run.get("prompt") or item.get("prompt", ""),
+                    "algorithm_pattern": run.get("algorithm_pattern") or item.get("algorithm_pattern"),
+                    "source_excerpt": run.get("source_excerpt", ""),
+                    "source_code": run.get("source_code", ""),
+                    "visible_passed": int(run.get("visible_passed") or validation.get("visible_passed") or 0),
+                    "visible_total": int(run.get("visible_total") or validation.get("visible_total") or 0),
+                    "hidden_passed": int(run.get("hidden_passed") or validation.get("hidden_passed") or 0),
+                    "hidden_total": int(run.get("hidden_total") or validation.get("hidden_total") or 0),
+                    "total_count": int(run.get("total_count") or validation.get("total_count") or 0),
+                    "pass_count": int(run.get("pass_count") or validation.get("pass_count") or 0),
+                    "runtime_ms": run.get("runtime_ms"),
+                    "time_used_seconds": run.get("elapsed_seconds"),
+                    "time_allowed_seconds": item.get("time_allowed_seconds"),
+                    "evidence_state": "run_only",
+                    "final_verdict": "run_only",
+                    "insufficient_evidence": True,
+                })
+        for key, draft in latest_draft_by_round.items():
+            if key not in matrix_by_round:
+                continue
+            item = matrix_by_round[key]
+            item["snapshot_id"] = draft.get("snapshot_id")
+            if item.get("evidence_state") == "no_evidence":
+                item.update({
+                    "round_id": draft.get("round_id"),
+                    "round_type": item.get("round_type") or "coding",
+                    "title": draft.get("title") or item.get("title"),
+                    "language": draft.get("language") or item.get("language"),
+                    "prompt": draft.get("prompt") or item.get("prompt", ""),
+                    "algorithm_pattern": draft.get("algorithm_pattern") or item.get("algorithm_pattern"),
+                    "source_excerpt": draft.get("source_excerpt", ""),
+                    "source_code": draft.get("source_code", ""),
+                    "evidence_state": "draft_only",
+                    "final_verdict": "draft_only",
+                    "insufficient_evidence": True,
+                    "time_used_seconds": draft.get("elapsed_seconds"),
+                    "time_allowed_seconds": item.get("time_allowed_seconds"),
+                })
+        unlinked_typed: List[Dict[str, Any]] = []
+        for typed in typed_matrix:
+            key = str(typed.get("round_id")) if typed.get("round_id") else ""
+            if not key or key not in matrix_by_round:
+                unlinked_typed.append(typed)
+                continue
+            item = matrix_by_round[key]
+            response_id = typed.get("response_id")
+            response_ids = item.setdefault("response_ids", [])
+            if response_id and response_id not in response_ids:
+                response_ids.append(response_id)
+            if not item.get("response_id"):
+                item["response_id"] = response_id
+            if typed.get("question_spec_id"):
+                item.setdefault("question_spec_id", typed.get("question_spec_id"))
+            if typed.get("taxonomy_keys"):
+                item["taxonomy_keys"] = typed.get("taxonomy_keys")
+            item["typed_response_count"] = int(item.get("typed_response_count") or 0) + 1
+            if typed.get("score") is not None:
+                item["typed_score"] = typed.get("score")
+            if typed.get("dimension_scores"):
+                item["typed_dimension_scores"] = typed.get("dimension_scores")
+            if item.get("evidence_state") in {"no_evidence", "insufficient_evidence"}:
+                item["score"] = typed.get("score")
+                item["dimension_scores"] = typed.get("dimension_scores") or {}
+                item["confidence"] = typed.get("confidence")
+                item["insufficient_evidence"] = bool(typed.get("insufficient_evidence"))
+                item["evidence_state"] = (
+                    "insufficient_evidence"
+                    if typed.get("insufficient_evidence")
+                    else "assessed_response"
+                )
+                item["final_verdict"] = typed.get("final_verdict") or item.get("final_verdict")
+        test_matrix = list(matrix_by_round.values()) + unlinked_typed
         return {
+            "round_count": len(round_catalog),
+            "rounds": list(round_catalog.values()),
             "submission_count": len(final_submissions),
             "typed_response_count": len(typed_turns),
             "typed_assessed_count": len(typed_scores),
@@ -2647,30 +3013,12 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             "all_submissions": all_submissions,
             "run_events": submissions,
             "drafts": drafts,
-            "test_matrix": [
-                {
-                    "submission_id": item.get("submission_id"),
-                    "round_id": item["round_id"],
-                    "title": item["title"],
-                    "language": item["language"],
-                    "submit_number": item["submit_number"],
-                    "visible_passed": item["visible_passed"],
-                    "visible_total": item["visible_total"],
-                    "hidden_passed": item["hidden_passed"],
-                    "hidden_total": item["hidden_total"],
-                    "runtime_ms": item["runtime_ms"],
-                    "memory_kb": item["memory_kb"],
-                    "prompt": item.get("prompt", ""),
-                    "algorithm_pattern": item.get("algorithm_pattern"),
-                    "source_excerpt": item.get("source_excerpt", ""),
-                    "source_code": item.get("source_code", ""),
-                    "final_pass_rate": round(((item["visible_passed"] + item["hidden_passed"]) / max(item["visible_total"] + item["hidden_total"], 1)) * 100, 1),
-                    "final_verdict": "accepted" if (item["visible_passed"] + item["hidden_passed"]) == (item["visible_total"] + item["hidden_total"]) and (item["visible_total"] + item["hidden_total"]) > 0 else "needs_work",
-                }
-                for item in final_submissions
-            ] + typed_matrix,
+            "test_matrix": test_matrix,
+            "activity_events": activity_events,
+            "duration_used_seconds": duration_used_seconds,
+            "duration_allowed_seconds": duration_allowed_seconds,
             "typed_responses": typed_turns,
-            "weak_topics": _technical_weak_topics(final_submissions, submissions, drafts),
+            "weak_topics": _technical_weak_topics(final_submissions, submissions, drafts, typed_matrix),
             "evidence": {
                 "final_submission_present": bool(final_submissions),
                 "draft_or_run_only": bool((submissions or drafts) and not final_submissions),
@@ -2761,231 +3109,35 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         transcript_output = outputs.get("transcription_diarization", {})
         technical_output = outputs.get("technical_code", {})
         heuristic_report = _with_transcript(heuristic_report, transcript_output)
-        candidate_word_count = int(transcript_output.get("candidate_word_count") or 0)
-        if candidate_word_count < 5 and not technical_output.get("submission_count"):
-            return _with_transcript(
-                heuristic_report,
-                transcript_output,
-                ai_enhanced=False,
-                ai_fallback_reason="no_candidate_evidence",
-            )
-        if (outputs.get("__deterministic_only") or {}).get("enabled"):
-            return {
-                **heuristic_report,
-                "ai_enhanced": False,
-                "ai_provider_policy": "deterministic_only",
-                "ai_fallback_reason": None,
-            }
-        return await _enhance_report_with_openai(
-            interview_id=interview_id,
-            profile_type=profile_type,
-            interview_type=interview_type,
-            heuristic_report=heuristic_report,
-            stage_outputs=outputs,
-        )
+        return {
+            **heuristic_report,
+            "ai_enhanced": False,
+            "ai_provider_policy": "disabled_for_candidate_report",
+            "ai_fallback_reason": None,
+        }
 
     return {"stage": stage, "status": "skipped"}
 
-
-async def _enhance_report_with_openai(
-    *,
-    interview_id: str,
-    profile_type: str,
-    interview_type: str,
-    heuristic_report: Dict[str, Any],
-    stage_outputs: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    turns = (stage_outputs.get("nlp_content") or {}).get("turns") or []
-    compact_turns = [
-        {
-            "question": str(turn.get("question") or "")[:280],
-            "topic": turn.get("topic"),
-            "response": str(turn.get("response") or "")[:700],
-            "score": turn.get("overall_score"),
-            "feedback": turn.get("feedback"),
-            "confidence": turn.get("confidence"),
-            "insufficient_evidence": turn.get("insufficient_evidence"),
-            "evidence": turn.get("evidence", [])[:3],
-        }
-        for turn in turns[:18]
-    ]
-    technical_stage = stage_outputs.get("technical_code") or {}
-    semantic_technical = {
-        "submission_count": int(technical_stage.get("submission_count") or 0),
-        "typed_response_count": int(technical_stage.get("typed_response_count") or 0),
-        "run_event_count": int(technical_stage.get("run_event_count") or 0),
-        "draft_count": int(technical_stage.get("draft_count") or 0),
-        "correctness_score": technical_stage.get("correctness_score"),
-        "test_matrix": [
-            {
-                key: item.get(key)
-                for key in (
-                    "round_id", "response_id", "round_type", "title", "algorithm_pattern",
-                    "visible_passed", "visible_total", "hidden_passed", "hidden_total",
-                    "final_pass_rate", "final_verdict", "score", "confidence",
-                )
-            }
-            for item in (technical_stage.get("test_matrix") or [])
-            if isinstance(item, dict)
-        ],
-        "weak_topics": technical_stage.get("weak_topics") or [],
-    }
-    payload = {
-        "heuristic_report": heuristic_report,
-        "evidence_policy": {
-            "scores_require_evidence": True,
-            "insufficient_evidence_turns": sum(1 for turn in turns if turn.get("insufficient_evidence")),
-            "low_confidence_turns": sum(1 for turn in turns if turn.get("confidence") == "low"),
-        },
-        "turns": compact_turns,
-        "audio_features": stage_outputs.get("audio_features") or {},
-        "video_features": stage_outputs.get("video_features") or {},
-        "technical_code": semantic_technical,
-        "cheating_risk": stage_outputs.get("cheating_risk") or {},
-    }
-    report_cache_key = "report_generation:" + stable_hash(json.dumps({
-        "interview_id": interview_id,
-        "interview_type": interview_type,
-        "profile_type": profile_type,
-        "version": heuristic_report.get("version"),
-        "overall": heuristic_report.get("overall_score"),
-        "candidate_words": (stage_outputs.get("transcription_diarization") or {}).get("candidate_word_count"),
-        "technical_submissions": (stage_outputs.get("technical_code") or {}).get("submission_count"),
-    }, sort_keys=True, default=str))
-    if (heuristic_report.get("evidence_status") or {}).get("status") == "no_candidate_evidence":
-        return {
-            **heuristic_report,
-            "ai_enhanced": False,
-            "ai_provider_policy": "skipped",
-            "ai_fallback_reason": "no_candidate_evidence",
-            "evidence_policy": payload["evidence_policy"],
-        }
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["summary", "readiness_label", "strengths", "improvements", "practice_plan", "student_summary"],
-        "properties": {
-            "summary": {"type": "string"},
-            "readiness_label": {"type": "string"},
-            "strengths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5},
-            "improvements": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["title", "detail"],
-                    "properties": {"title": {"type": "string"}, "detail": {"type": "string"}},
-                },
-                "minItems": 1,
-                "maxItems": 5,
-            },
-            "practice_plan": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["day", "task"],
-                    "properties": {"day": {"type": "string"}, "task": {"type": "string"}},
-                },
-                "minItems": 3,
-                "maxItems": 7,
-            },
-            "student_summary": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["headline", "blocker", "next_step", "interviewer_signal", "proof_point"],
-                "properties": {
-                    "headline": {"type": "string"},
-                    "blocker": {"type": "string"},
-                    "next_step": {"type": "string"},
-                    "interviewer_signal": {"type": "string"},
-                    "proof_point": {"type": "string"},
-                },
-            },
-        },
-    }
-    try:
-        ai_report = await asyncio.wait_for(
-            complete_json_async(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a senior interview debrief writer. Improve the report narrative using the "
-                            "provided scores and transcript evidence. Do not invent facts, companies, projects, "
-                            "or scores. Keep feedback actionable and candidate-visible."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Interview type: {interview_type}\nProfile type: {profile_type}\n"
-                            "Generate concise report fields from this analysis payload:\n"
-                            f"{json.dumps(payload, default=str)[:14000]}"
-                        ),
-                    },
-                ],
-                event_type="report_generation_llm",
-                temperature=0.25,
-                max_tokens=1800,
-                interview_id=interview_id,
-                metadata={
-                    "profile_type": profile_type,
-                    "interview_type": interview_type,
-                    "report_version": heuristic_report.get("version"),
-                },
-                json_schema=schema,
-                provider_policy="openai_preferred",
-                cache_key=report_cache_key,
-            ),
-            timeout=120,
-        )
-        merged = {
-            **heuristic_report,
-            "version": f"{heuristic_report.get('version', 'async_report')}_openai_enhanced",
-            "summary": ai_report.get("summary") or heuristic_report.get("summary"),
-            "readiness_label": ai_report.get("readiness_label") or heuristic_report.get("readiness_label"),
-            "strengths": ai_report.get("strengths") or heuristic_report.get("strengths", []),
-            "improvements": ai_report.get("improvements") or heuristic_report.get("improvements", []),
-            "practice_plan": ai_report.get("practice_plan") or heuristic_report.get("practice_plan", []),
-            "improvement_plan": heuristic_report.get("improvement_plan", {}),
-            "student_summary": ai_report.get("student_summary") or heuristic_report.get("student_summary", {}),
-            "ai_enhanced": True,
-            "ai_provider_policy": "openai_preferred",
-            "evidence_policy": payload["evidence_policy"],
-        }
-        return merged
-    except asyncio.TimeoutError:
-        logger.error("OpenAI report generation timed out for %s; using heuristic report", stable_hash(interview_id, "interview"))
-        return {
-            **heuristic_report,
-            "ai_enhanced": False,
-            "ai_provider_policy": "openai_preferred",
-            "ai_fallback_reason": "report_generation_llm_timeout",
-            "evidence_policy": payload["evidence_policy"],
-        }
-    except Exception:
-        logger.error("OpenAI report enhancement failed for %s; using heuristic report", stable_hash(interview_id, "interview"))
-        return {
-            **heuristic_report,
-            "ai_enhanced": False,
-            "ai_provider_policy": "openai_preferred",
-            "ai_fallback_reason": "report_generation_llm_failed",
-            "evidence_policy": payload["evidence_policy"],
-        }
 
 
 async def _load_turns(interview_id: str) -> List[Dict[str, Any]]:
     rows = await async_execute(
         """
-        SELECT ir.response_id, iq.question_text, iq.question_type, iq.topic_label,
-               ir.answer_text_encrypted, ir.user_response, ir.response_time_seconds,
+        SELECT ir.response_id, iq.question_id, iq.question_text, iq.question_type, iq.topic_label,
+               iq.is_followup, ir.answer_text_encrypted, ir.user_response, ir.response_time_seconds,
                iq.question_spec_id, iq.taxonomy_keys, iq.blueprint_section_id,
                iq.parent_question_id, assessment.evaluator_version,
                assessment.assessment_json, ir.timing_json, ir.input_mode,
-               iq.provenance
-        FROM InterviewResponses ir
-        JOIN InterviewQuestions iq ON ir.question_id = iq.question_id
+               iq.provenance, iq.expected_points, iq.rubric_json, iq.question_order,
+               ir.created_at
+        FROM InterviewQuestions iq
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM InterviewResponses candidate_response
+            WHERE candidate_response.question_id = iq.question_id
+            ORDER BY candidate_response.created_at DESC
+            LIMIT 1
+        ) ir ON TRUE
         LEFT JOIN LATERAL (
             SELECT evaluator_version, assessment_json
             FROM ResponseAssessments
@@ -2993,32 +3145,38 @@ async def _load_turns(interview_id: str) -> List[Dict[str, Any]]:
             ORDER BY created_at DESC
             LIMIT 1
         ) assessment ON TRUE
-        WHERE ir.interview_id = %s
-        ORDER BY iq.question_order, ir.created_at
+        WHERE iq.interview_id = %s
+        ORDER BY iq.question_order, ir.created_at NULLS LAST
         """,
         (interview_id,),
         fetchall=True,
     )
     turns: List[Dict[str, Any]] = []
     for row in rows or []:
-        encrypted_answer = _decrypt_storage_text(row[4]) if row[4] else ""
-        legacy_answer = "" if row[5] == "[encrypted]" else str(row[5] or "")
+        encrypted_answer = _decrypt_storage_text(row[6]) if row[6] else ""
+        legacy_answer = "" if row[7] == "[encrypted]" else str(row[7] or "")
         turns.append({
             "response_id": row[0],
-            "question": row[1] or "",
-            "question_type": row[2] or "main",
-            "topic": row[3] or "General",
+            "question_id": row[1],
+            "question": row[2] or "",
+            "question_type": row[3] or "main",
+            "topic": row[4] or "General",
+            "is_followup": bool(row[5]),
             "response": encrypted_answer or legacy_answer,
-            "time_taken": row[6],
-            "question_spec_id": row[7],
-            "taxonomy_keys": _json_value(row[8], []),
-            "blueprint_section_id": row[9],
-            "parent_question_id": row[10],
-            "evaluator_version": row[11],
-            "assessment": _json_value(row[12], None),
-            "timing": _json_value(row[13], {}),
-            "input_mode": row[14],
-            "provenance": _json_value(row[15], {}),
+            "time_taken": row[8],
+            "question_spec_id": row[9],
+            "taxonomy_keys": _json_value(row[10], []),
+            "blueprint_section_id": row[11],
+            "parent_question_id": row[12],
+            "evaluator_version": row[13],
+            "assessment": _json_value(row[14], None),
+            "timing": _json_value(row[15], {}),
+            "input_mode": row[16],
+            "provenance": _json_value(row[17], {}),
+            "expected_points": _json_value(row[18], []),
+            "rubric_json": _json_value(row[19], {}),
+            "question_order": row[20],
+            "created_at": row[21],
         })
     return turns
 
@@ -3179,6 +3337,24 @@ def _assessment_feedback(assessment: Dict[str, Any], flags: List[str]) -> str:
 
 
 def _score_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
+    if not str(turn.get("response") or "").strip():
+        return {
+            **turn,
+            "star_score": None,
+            "communication_score": None,
+            "technical_score": None,
+            "overall_score": 0.0,
+            "feedback": "No candidate response was captured for this question.",
+            "confidence": "high",
+            "confidence_value": 1.0,
+            "insufficient_evidence": True,
+            "authoritative": False,
+            "evidence": [],
+            "answer_quality_flags": ["no_response"],
+            "rubric_scores": {},
+            "evidence_basis": {"assessment_status": "no_response"},
+            "evaluator_version": turn.get("evaluator_version"),
+        }
     assessment = turn.get("assessment")
     if not isinstance(assessment, dict):
         return {
@@ -3310,6 +3486,7 @@ def _technical_weak_topics(
     submissions: List[Dict[str, Any]],
     run_events: Optional[List[Dict[str, Any]]] = None,
     drafts: Optional[List[Dict[str, Any]]] = None,
+    typed_responses: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     topics: Dict[str, Dict[str, Any]] = {}
     final_round_ids = {item.get("round_id") for item in submissions if item.get("round_id")}
@@ -3326,14 +3503,29 @@ def _technical_weak_topics(
         for item in (drafts or [])
         if item.get("round_id") not in final_round_ids and item.get("round_id") not in run_round_ids
     )
+    evidence_items.extend(
+        (
+            item,
+            "assessed_response"
+            if item.get("score") is not None and not item.get("insufficient_evidence")
+            else "insufficient_evidence",
+        )
+        for item in (typed_responses or [])
+    )
 
     for item, evidence_state in evidence_items:
-        topic = item.get("algorithm_pattern") or "technical correctness"
+        typed_evidence = evidence_state in {"assessed_response", "insufficient_evidence"}
+        topic = item.get("algorithm_pattern") or (
+            item.get("title") if typed_evidence else "technical correctness"
+        ) or "technical correctness"
         total = int(item.get("visible_total") or 0) + int(item.get("hidden_total") or 0)
         passed = int(item.get("visible_passed") or 0) + int(item.get("hidden_passed") or 0)
         if not total:
             total = int(item.get("total_count") or 0)
             passed = int(item.get("pass_count") or 0)
+        if typed_evidence and item.get("score") is not None:
+            total = 100
+            passed = max(0, min(100, int(float(item.get("score") or 0))))
         bucket = topics.setdefault(
             topic,
             {
@@ -3343,12 +3535,16 @@ def _technical_weak_topics(
                 "round_ids": [],
                 "evidence_states": set(),
                 "titles": [],
+                "typed_evidence": False,
             },
         )
         bucket["passed"] += passed
         bucket["total"] += total
-        bucket["round_ids"].append(item.get("round_id"))
+        round_id = item.get("round_id")
+        if round_id and round_id not in bucket["round_ids"]:
+            bucket["round_ids"].append(round_id)
         bucket["evidence_states"].add(evidence_state)
+        bucket["typed_evidence"] = bucket["typed_evidence"] or typed_evidence
         if item.get("title"):
             bucket["titles"].append(item.get("title"))
     weak = []
@@ -3365,7 +3561,9 @@ def _technical_weak_topics(
                 "evidence_state": ", ".join(evidence_states),
                 "example_questions": list(dict.fromkeys(bucket["titles"]))[:3],
                 "repair_action": (
-                    "Submit a final solution for this pattern so correctness can be graded."
+                    "Complete the technical explanation with the decision, complexity, and edge case that were missing."
+                    if bucket.get("typed_evidence") and total == 0
+                    else "Submit a final solution for this pattern so correctness can be graded."
                     if draft_or_run_only and total == 0
                     else "Redo the failing solution with one minimal edge case first, then generalize the algorithm."
                 ),

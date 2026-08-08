@@ -47,24 +47,15 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
 
   const planType = (user?.plan_type || "starter").toLowerCase()
   const planLabel = planType.includes("premium") ? "Premium" : planType.includes("pro") ? "Pro" : "Free"
-  const planDescription = planType.includes("premium")
-    ? "Premium includes higher weekly mock limits, technical rounds, custom JD-based rounds, code review, and priority support."
-    : planType.includes("pro")
-      ? "Pro includes weekly technical assessments, custom mock interviews, and higher mock interview limits."
-      : "Free includes 1 AI mock interview per week. Register by 31 August 2026 to get Premium free for 30 days."
 
   return (
     <div className="space-y-6">
       
       <div className="dashboard-card">
-        <h3 className="mb-1 text-sm font-semibold text-foreground">Current Plan</h3>
-        <p className="mb-4 text-xs text-muted-foreground">Manage your subscription and plan.</p>
-        <div className="sub-card flex flex-col items-stretch gap-4 rounded-lg sm:flex-row sm:items-center sm:justify-between">
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Current Plan</h3>
+        <div className="sub-card flex flex-col items-stretch gap-4 rounded-lg sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0 flex-1">
             <p className="font-semibold text-foreground">{planLabel}</p>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              {planDescription}
-            </p>
             {subscription?.is_signup_promo && (
               <div className={`mt-3 rounded-lg border px-3 py-2 text-xs leading-5 ${Number(subscription.days_remaining) <= 7 ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300" : "border-primary/20 bg-primary/5 text-primary"}`}>
                 <p className="font-semibold">
@@ -72,7 +63,6 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
                     ? "Your free Premium access ends within 24 hours."
                     : `${subscription.days_remaining} days remain in your free Premium access.`}
                 </p>
-                <p>You will move to Free automatically. No payment will be taken.</p>
               </div>
             )}
           </div>
@@ -84,14 +74,12 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
 
       
       <div className="dashboard-card">
-        <h3 className="mb-1 text-sm font-semibold text-foreground">Payment Method</h3>
-        <p className="mb-4 text-xs text-muted-foreground">Payments are securely handled by Razorpay Checkout.</p>
+        <h3 className="mb-4 text-sm font-semibold text-foreground">Payment Method</h3>
         <div className="sub-card flex items-center justify-between rounded-lg border-dashed">
           <div>
             <p className="text-sm font-medium text-foreground">
               {transactions.find((txn: any) => txn.status === "completed" || txn.status === "success")?.payment_method || "Razorpay Checkout"}
             </p>
-            <p className="text-xs text-muted-foreground">Card, UPI, and bank details stay inside Razorpay and are not stored by InterAI.</p>
           </div>
         </div>
       </div>
@@ -101,13 +89,11 @@ export function BillingTab({ user, onOpenMembership }: { user?: AuthUser | null;
         <h3 className="mb-4 text-sm font-semibold text-foreground">Billing History</h3>
         {loadingTxn ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-            <span className="ml-2 text-sm text-muted-foreground">Loading transactions...</span>
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" aria-label="Loading transactions" />
           </div>
         ) : transactions.length === 0 ? (
           <div className="sub-card flex flex-col items-center justify-center rounded-lg border-dashed py-12 text-center">
             <p className="text-sm font-medium text-foreground">No transactions yet</p>
-            <p className="mt-1 text-xs text-muted-foreground">Your billing history will appear here after your first purchase.</p>
           </div>
         ) : (
           <div className="overflow-x-auto">

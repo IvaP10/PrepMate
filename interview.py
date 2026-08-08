@@ -53,7 +53,7 @@ from ai_services import (
     transcribe_audio,
     generate_speech
 )
-from analysis_pipeline import enqueue_analysis, operator_retry_analysis
+from analysis_pipeline import ANALYSIS_STAGE_VERSION, enqueue_analysis, operator_retry_analysis
 from body_language import normalize_client_metrics
 from persona_generator import generate_persona
 from entitlements import enforce_interview_start, get_active_subscription_plan_type, is_technical_interview_type, normalize_technical_profile
@@ -68,6 +68,7 @@ from knowledge_map import (
     generate_contextual_followup
 )
 from interview_profiles import (
+    DEFAULT_PROFILE_TYPE,
     TECHNICAL_CODING_QUESTION_COUNT,
     TECHNICAL_MINUTES_PER_QUESTION,
     TECHNICAL_TOTAL_DURATION_MINUTES,
@@ -757,6 +758,16 @@ def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
             "assessment": assessment or None,
             "evaluator_version": row[18] if len(row) > 18 else None,
             "insufficient_evidence": bool(assessment.get("insufficient_evidence")) if assessment else True,
+            "question_id": row[19] if len(row) > 19 else None,
+            "question_order": row[20] if len(row) > 20 else None,
+            "expected_points": _json_load(row[21], []) if len(row) > 21 else [],
+            "rubric_json": _json_load(row[22], {}) if len(row) > 22 else {},
+            "question_spec_id": row[23] if len(row) > 23 else None,
+            "taxonomy_keys": _json_load(row[24], []) if len(row) > 24 else [],
+            "section_id": row[25] if len(row) > 25 else None,
+            "parent_question_id": row[26] if len(row) > 26 else None,
+            "provenance": _json_load(row[27], {}) if len(row) > 27 else {},
+            "created_at": row[28].isoformat() if len(row) > 28 and row[28] else None,
         })
     return turns
 
@@ -770,9 +781,18 @@ def _load_report_payload(cursor, interview_id: str) -> List[Dict[str, Any]]:
                ir.response_time_seconds, ir.nonverbal_metrics, ir.coaching_hint,
                ir.evaluation_json, ir.answer_quality_flags, ir.evidence_quotes,
                ir.retry_state, assessment.overall_score,
-               assessment.assessment_json, assessment.evaluator_version
-        FROM InterviewResponses ir
-        JOIN InterviewQuestions iq ON ir.question_id = iq.question_id
+               assessment.assessment_json, assessment.evaluator_version,
+               iq.question_id, iq.question_order, iq.expected_points, iq.rubric_json,
+               iq.question_spec_id, iq.taxonomy_keys, iq.blueprint_section_id,
+               iq.parent_question_id, iq.provenance, ir.created_at
+        FROM InterviewQuestions iq
+        LEFT JOIN LATERAL (
+            SELECT *
+            FROM InterviewResponses candidate_response
+            WHERE candidate_response.question_id = iq.question_id
+            ORDER BY candidate_response.created_at DESC
+            LIMIT 1
+        ) ir ON TRUE
         LEFT JOIN LATERAL (
             SELECT overall_score, assessment_json, evaluator_version
             FROM ResponseAssessments
@@ -780,8 +800,8 @@ def _load_report_payload(cursor, interview_id: str) -> List[Dict[str, Any]]:
             ORDER BY created_at DESC
             LIMIT 1
         ) assessment ON TRUE
-        WHERE ir.interview_id = %s
-        ORDER BY iq.question_order, ir.created_at
+        WHERE iq.interview_id = %s
+        ORDER BY iq.question_order, ir.created_at NULLS LAST
         """,
         (interview_id,)
     )
@@ -794,6 +814,28 @@ def _report_payload_ready(value: Any) -> bool:
 
 def _interview_report_ready(status_value: Any, report_json: Any) -> bool:
     return str(status_value or "").lower() in REPORT_READY_STATUSES and _report_payload_ready(report_json)
+
+
+async def _has_current_canonical_analysis(interview_id: str, user_id: str) -> bool:
+    row = await async_execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM SessionPerformanceAnalyses
+            WHERE interview_id = %s
+              AND user_id = %s
+              AND schema_version = 'session-performance-v4'
+              AND producer_version = %s
+              AND status = 'ready'
+              AND is_current = TRUE
+              AND analysis_json_encrypted IS NOT NULL
+              AND evidence_index_encrypted IS NOT NULL
+        )
+        """,
+        (interview_id, user_id, ANALYSIS_STAGE_VERSION),
+        fetchone=True,
+    )
+    return bool(row and row[0])
 
 
 async def _finalize_interview_for_analysis(
@@ -4463,17 +4505,23 @@ async def get_analysis_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
     current_status = row[0]
     stored_report = _decrypt_json_blob(row[11], None) or _json_load(row[3], None)
+    canonical_ready = await _has_current_canonical_analysis(interview_id, current_user["user_id"])
     retry_count = int(row[10] or 0) if row[10] is not None else 0
     should_have_job = (
         (current_status in ANALYSIS_ACTIVE_STATUSES and retry_count < 3)
         or (
             current_status in REPORT_READY_STATUSES
-            and not isinstance(stored_report, dict)
+            and (not isinstance(stored_report, dict) or not canonical_ready)
             and retry_count < 3
         )
     )
     if should_have_job:
-        job_id = await enqueue_analysis(interview_id, current_user["user_id"], "status_poll")
+        job_id = await enqueue_analysis(
+            interview_id,
+            current_user["user_id"],
+            "status_poll",
+            force_canonical_rebuild=not canonical_ready,
+        )
         if job_id:
             await async_execute(
                 """
@@ -4512,9 +4560,10 @@ async def get_analysis_status(
             fetchone=True,
         )
     stored_report = _decrypt_json_blob(row[11], None) or _json_load(row[3], None)
+    canonical_ready = await _has_current_canonical_analysis(interview_id, current_user["user_id"])
     manual_retry_count = int(row[13] or 0) if row[13] is not None else 0
     job_status = str(row[5] or "")
-    report_ready = row[0] in REPORT_READY_STATUSES and isinstance(stored_report, dict)
+    report_ready = row[0] in REPORT_READY_STATUSES and isinstance(stored_report, dict) and canonical_ready
     report_state = (
         str(stored_report.get("report_state") or ("partial" if row[0] == "partial" else "ready"))
         if report_ready
@@ -4636,7 +4685,7 @@ def _report_job_target(
     """Load the immutable role/JD used by a report and its reusable-save state."""
     cursor.execute(
         """
-        SELECT job_context_encrypted
+        SELECT profile_type, job_context_encrypted
         FROM AttemptContextSnapshots
         WHERE interview_id = %s AND user_id = %s
         LIMIT 1
@@ -4644,7 +4693,9 @@ def _report_job_target(
         (interview_id, user_id),
     )
     snapshot_row = cursor.fetchone()
-    snapshot = _decrypt_json_blob(snapshot_row[0], {}) if snapshot_row else {}
+    snapshot_profile_type = snapshot_row[0] if snapshot_row and len(snapshot_row) > 1 else None
+    snapshot_payload = snapshot_row[1] if snapshot_row and len(snapshot_row) > 1 else (snapshot_row[0] if snapshot_row else None)
+    snapshot = _decrypt_json_blob(snapshot_payload, {}) if snapshot_payload else {}
     if not isinstance(snapshot, dict):
         snapshot = {}
 
@@ -4654,6 +4705,19 @@ def _report_job_target(
     compact_context = settings_payload.get("job_context")
     if not isinstance(compact_context, dict):
         compact_context = {}
+
+    raw_profile_type = snapshot_profile_type or compact_context.get("profile_type") or settings_payload.get("profile_type")
+    profile_type = normalize_profile_type(str(raw_profile_type or DEFAULT_PROFILE_TYPE))
+    legacy_saved_target = bool(
+        not raw_profile_type
+        and (
+            job_profile_id
+            or snapshot.get("job_profile_id")
+            or str(settings_payload.get("job_context_source") or "").strip().lower() == "saved_profile"
+            or str(compact_context.get("source") or "").strip().lower() == "saved_profile"
+        )
+    )
+    is_custom = profile_type == "custom" or legacy_saved_target
 
     profile_row = None
     if job_profile_id:
@@ -4710,6 +4774,8 @@ def _report_job_target(
     )
     saved_row = cursor.fetchone()
     return {
+        "profile_type": "custom" if is_custom else profile_type,
+        "is_custom": is_custom,
         "role": role,
         "company": company or None,
         "job_description": job_description,
@@ -4740,7 +4806,8 @@ async def get_interview_report(
             """
             SELECT interview_mode, interview_type, job_title, strictness_level,
                    overall_score, feedback_summary, report_json, created_at, completed_at,
-                   status, report_json_encrypted, analysis_status, job_profile_id, settings
+                   status, report_json_encrypted, analysis_status, job_profile_id, settings,
+                   duration_seconds, started_at, deadline_at
             FROM Interviews
             WHERE interview_id = %s AND user_id = %s
             """,
@@ -4755,19 +4822,11 @@ async def get_interview_report(
                 detail="Interview not found"
             )
 
-        if row[9] in REPORT_READY_STATUSES and not await _has_persisted_candidate_evidence(
-            interview_id,
-            current_user["user_id"],
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This trial has no candidate evidence, so a report is not available.",
-            )
-
         turns = _load_report_payload(cursor, interview_id)
         detailed_responses = [
             {
                 "response_id": turn.get("response_id"),
+                "question_id": turn.get("question_id"),
                 "question": turn.get("question", ""),
                 "question_type": turn.get("question_type") or "main",
                 "is_followup": bool(turn.get("is_followup")),
@@ -4777,7 +4836,7 @@ async def get_interview_report(
                 "feedback": turn.get("feedback") or "",
                 "time_taken": turn.get("time_taken"),
                 "nonverbal_metrics": turn.get("nonverbal_metrics") or {},
-                "coaching_hint": turn.get("coaching_hint") or "",
+                "coaching_hint": None,
                 "evaluation_json": turn.get("evaluation_json") or {},
                 "answer_quality_flags": turn.get("answer_quality_flags") or [],
                 "evidence_quotes": turn.get("evidence_quotes") or [],
@@ -4785,6 +4844,9 @@ async def get_interview_report(
                 "assessment": turn.get("assessment"),
                 "evaluator_version": turn.get("evaluator_version"),
                 "insufficient_evidence": bool(turn.get("insufficient_evidence")),
+                "status": "Not Answered" if not turn.get("response") else (
+                    "Unable to Evaluate" if turn.get("insufficient_evidence") and not turn.get("assessment") else "Completed"
+                ),
             }
             for turn in turns
         ]
@@ -4796,14 +4858,21 @@ async def get_interview_report(
             except Exception:
                 stored_report = None
 
+        canonical_ready = await _has_current_canonical_analysis(interview_id, current_user["user_id"])
+        stale_report = isinstance(stored_report, dict) and not canonical_ready
         analysis_pending = row[9] in ANALYSIS_ACTIVE_STATUSES
         analysis_job_id = None
         if (
-            not isinstance(stored_report, dict)
+            (not isinstance(stored_report, dict) or stale_report)
             and row[9] not in {"in_progress", "cancelled", "failed"}
             and str(row[11] or "") != "failed"
         ):
-            analysis_job_id = await enqueue_analysis(interview_id, current_user["user_id"], "report_poll")
+            analysis_job_id = await enqueue_analysis(
+                interview_id,
+                current_user["user_id"],
+                "report_poll",
+                force_canonical_rebuild=stale_report,
+            )
             if analysis_job_id:
                 await async_execute(
                     """
@@ -4819,6 +4888,7 @@ async def get_interview_report(
                     (analysis_job_id, interview_id, current_user["user_id"]),
                 )
             analysis_pending = True
+            stored_report = None
 
         job_target = _report_job_target(
             cursor,
@@ -4827,6 +4897,26 @@ async def get_interview_report(
             job_profile_id=row[12],
             settings_value=row[13],
         )
+        settings_payload = _json_load(row[13], {})
+        if not isinstance(settings_payload, dict):
+            settings_payload = {}
+        duration_config = settings_payload.get("duration")
+        if not isinstance(duration_config, dict):
+            duration_config = {}
+        technical_config = settings_payload.get("technical")
+        if not isinstance(technical_config, dict):
+            technical_config = {}
+        duration_allowed_seconds = (
+            technical_config.get("duration_seconds")
+            or settings_payload.get("duration_allowed_seconds")
+            or settings_payload.get("duration_seconds")
+        )
+        if duration_allowed_seconds is None:
+            duration_minutes = duration_config.get("max_minutes") or duration_config.get("minutes") or settings_payload.get("duration_minutes")
+            if isinstance(duration_minutes, (int, float)):
+                duration_allowed_seconds = int(duration_minutes * 60)
+        if duration_allowed_seconds is None and row[15] and row[16]:
+            duration_allowed_seconds = max(0, int((row[16] - row[15]).total_seconds()))
 
         return {
             "interview_id": interview_id,
@@ -4839,6 +4929,10 @@ async def get_interview_report(
             "report_v2": stored_report,
             "created_at": row[7].isoformat() if row[7] else None,
             "completed_at": row[8].isoformat() if row[8] else None,
+            "duration_seconds": int(row[14]) if row[14] is not None else None,
+            "duration_allowed_seconds": int(duration_allowed_seconds) if duration_allowed_seconds is not None else None,
+            "started_at": row[15].isoformat() if row[15] else None,
+            "deadline_at": row[16].isoformat() if row[16] else None,
             "status": "analysis_pending" if analysis_pending and row[9] in {"completed", "partial", "uploading"} else row[9],
             "analysis_pending": analysis_pending,
             "analysis_job_id": analysis_job_id,

@@ -10,9 +10,12 @@ from workspace_api import (
     _canonical_performance_cohort,
     _canonical_performance_payloads,
     _canonical_project_explanation,
+    _cumulative_performance_analytics,
     _interview_performance_payload,
     _legacy_performance_history,
+    _merge_recorded_technical_analytics,
     _performance_payload_trend,
+    _recorded_technical_analytics,
 )
 
 
@@ -300,3 +303,148 @@ def test_recorded_interview_fallback_exposes_first_score_to_graph():
     }]
     trend_section = next(section for section in payload["sections"] if section["kind"] == "trend")
     assert trend_section["trend"] == payload["trend"]
+
+
+def test_cumulative_interview_analytics_requires_repeated_round_evidence():
+    sessions = [
+        {
+            "interview_id": "i-1",
+            "created_at": "2026-08-01T10:00:00",
+            "overall_score": 62,
+            "evidence_status": "sufficient",
+            "analysis": {
+                "dimension_scores": {"communication_clarity": 60},
+                "question_analyses": [
+                    {
+                        "response_id": "r-1",
+                        "question": "Explain your project architecture",
+                        "question_type": "project",
+                        "skill": "Project",
+                        "taxonomy_keys": ["system_design"],
+                        "overall_score": 62,
+                        "dimension_scores": {"communication_clarity": 60, "tradeoffs": 55},
+                        "answer_quality_flags": ["missing_tradeoffs"],
+                    },
+                    {
+                        "response_id": "r-2",
+                        "question": "Why did you choose that database?",
+                        "is_followup": True,
+                        "overall_score": 48,
+                        "dimension_scores": {"technical_accuracy": 48},
+                        "answer_quality_flags": ["missing_tradeoffs"],
+                    },
+                ],
+                "report": {"counts": {"questions_asked": 2, "questions_answered": 2}},
+            },
+        },
+        {
+            "interview_id": "i-2",
+            "created_at": "2026-08-07T10:00:00",
+            "overall_score": 78,
+            "evidence_status": "sufficient",
+            "analysis": {
+                "dimension_scores": {"communication_clarity": 76},
+                "question_analyses": [
+                    {
+                        "response_id": "r-3",
+                        "question": "Explain your project architecture",
+                        "question_type": "project",
+                        "skill": "Project",
+                        "taxonomy_keys": ["system_design"],
+                        "overall_score": 78,
+                        "dimension_scores": {"communication_clarity": 76, "tradeoffs": 74},
+                        "answer_quality_flags": ["missing_tradeoffs"],
+                    },
+                    {
+                        "response_id": "r-4",
+                        "question": "What breaks at scale?",
+                        "is_followup": True,
+                        "overall_score": 60,
+                        "dimension_scores": {"technical_accuracy": 60},
+                        "answer_quality_flags": ["missing_tradeoffs"],
+                    },
+                ],
+                "report": {"counts": {"questions_asked": 2, "questions_answered": 2}},
+            },
+        },
+    ]
+
+    analytics = _cumulative_performance_analytics(sessions, "interview")
+
+    assert analytics["summary"]["total_rounds"] == 2
+    assert any(item["label"] == "Communication" and item["evaluated_questions"] == 2 for item in analytics["skills"])
+    assert any(item["label"] == "System Design" and item["question_count"] == 2 for item in analytics["topics"])
+    assert analytics["follow_up"]["followups_evaluated"] == 2
+    assert any(item["label"] == "System-design answers omit trade-offs" and item["round_count"] == 2 for item in analytics["patterns"])
+
+
+def test_cumulative_technical_analytics_separates_attempts_from_unattempted_problems():
+    sessions = [
+        {
+            "interview_id": "t-1",
+            "created_at": "2026-08-02T10:00:00",
+            "overall_score": 50,
+            "evidence_status": "sufficient",
+            "analysis": {
+                "technical": {
+                    "test_matrix": [
+                        {"round_id": "p-1", "title": "Two Sum", "algorithm_pattern": "hashing", "evidence_state": "final_submission", "submission_id": "s-1", "final_pass_rate": 50, "final_verdict": "needs_work"},
+                        {"round_id": "p-2", "title": "Graph", "algorithm_pattern": "graphs", "evidence_state": "no_evidence", "final_verdict": "no_evidence"},
+                    ],
+                },
+            },
+        },
+    ]
+
+    analytics = _cumulative_performance_analytics(sessions, "technical")
+
+    assert analytics["submission"]["problems_attempted"] == 1
+    assert analytics["submission"]["never_attempted"] == 1
+    assert analytics["topics"][0]["label"] == "Hashing"
+
+
+def test_draft_technical_evidence_surfaces_unsubmitted_code_without_a_score():
+    recorded = _recorded_technical_analytics(
+        problem_rows=[{
+            "interview_id": "t-1",
+            "date": "2026-08-08T10:00:00",
+            "round_id": "p-1",
+            "problem": "Target-Sum Subarrays",
+            "evidence": "",
+            "failure_reason": "Incomplete implementation",
+            "run_count": 0,
+        }],
+        topic_rows=[{
+            "topic": "Hashing",
+            "attempts": 1,
+            "solved": 0,
+            "scores": [],
+            "round_count": 1,
+            "main_issue": "Incomplete implementation",
+        }],
+        round_history=[{"interview_id": "t-1"}],
+        attempted_count=1,
+        total_problems=2,
+        submitted_count=0,
+        solved_count=0,
+        run_counts=[],
+    )
+
+    assert recorded["submission"]["coded_not_submitted"] == 1
+    assert recorded["submission"]["problems"][0]["issue"] == "No final submission"
+    assert recorded["topics"][0]["round_count"] == 1
+    assert recorded["patterns"] == []
+
+    merged = _merge_recorded_technical_analytics(
+        {
+            "score_state": "run_only",
+            "analytics": {
+                "topics": [],
+                "submission": {"coded_not_submitted": 0, "problems": []},
+            },
+        },
+        {"has_data": True, "analytics": recorded},
+    )
+
+    assert merged["analytics"]["submission"]["coded_not_submitted"] == 1
+    assert merged["comparison_notice"].startswith("Saved coding evidence is shown")

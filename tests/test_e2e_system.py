@@ -366,8 +366,8 @@ class InterAIE2ESystemTests(unittest.IsolatedAsyncioTestCase):
                 start_data = start_response.json()
                 self.assertIsNotNone(start_data["interview_id"])
                 self.assertEqual(start_data["mode"], "mock")
-                self.assertEqual(start_data["settings"]["duration_minutes"], 50)
-                self.assertEqual(start_data["settings"]["duration"], {"min_minutes": 45, "target_minutes": 50, "max_minutes": 60})
+                self.assertEqual(start_data["settings"]["duration_minutes"], 80)
+                self.assertEqual(start_data["settings"]["duration"], {"min_minutes": 80, "target_minutes": 80, "max_minutes": 80})
                 self.assertEqual(start_data["settings"]["camera_mode"], "required")
 
             # 8. Prepare frozen typed technical rounds. A second read must
@@ -554,8 +554,8 @@ class InterAIE2ESystemTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(updated_credits, settings.FREE_CREDITS_ON_SIGNUP)
             if isinstance(saved_settings, str):
                 saved_settings = json.loads(saved_settings)
-            self.assertEqual(saved_settings["duration_policy"], "adaptive_target")
-            self.assertEqual(saved_settings["duration_minutes"], 50)
+            self.assertEqual(saved_settings["duration_policy"], "technical_fixed_per_question")
+            self.assertEqual(saved_settings["duration_minutes"], 80)
 
             # 10. Voluntary exit preserves evidence but permanently marks the
             # attempt incomplete and never creates an official score.

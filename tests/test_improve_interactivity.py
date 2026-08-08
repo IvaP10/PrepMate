@@ -22,6 +22,7 @@ from learning_engine import (
     _encrypted_json_bytes,
     _active_mission_payload,
     _phase_one_activity_definitions,
+    _technical_report_focus,
     _persist_mission_attempt_transaction,
     _public_checkpoint_material,
     _reassessment_is_compatible,
@@ -135,6 +136,46 @@ def test_technical_spoken_plan_recognizes_algorithm_complexity_and_edge_case():
 
     assert result["score"] == 100.0
     assert result["mastery_passed"] is True
+
+
+def test_technical_concept_focus_uses_the_reported_explanation_gap():
+    activities = _phase_one_activity_definitions(
+        "Technical Concept",
+        "Complete the technical explanation with the decision, complexity, and edge case that were missing.",
+        mode="technical",
+    )
+    titles = [activity["title"] for activity in activities]
+
+    assert titles[0] == "The Technical Explanation Gap from Your Last Round Is Identified"
+    assert "Explain the Concept with a Decision, Complexity, and Edge Case" in titles
+    assert "Give a 90-Second Technical Explanation Without Notes" in titles
+    assert "Explain Your Approach, Why It Failed, and What You Will Change" not in titles
+
+
+def test_technical_improve_focus_requires_round_evidence():
+    focus = _technical_report_focus([
+        {
+            "topic": "Technical Concept",
+            "round_ids": ["round-1"],
+            "evidence_state": "insufficient_evidence",
+            "repair_action": "Add the missing complexity and edge case.",
+        },
+        {
+            "topic": "Unattempted",
+            "round_ids": ["round-2"],
+            "evidence_state": "no_evidence",
+            "repair_action": "Complete the round.",
+        },
+    ])
+
+    assert focus["skill_key"] == "technical:technical-concept"
+    assert focus["round_id"] == "round-1"
+    assert _technical_report_focus([{
+        "topic": "Unattempted",
+        "round_ids": ["round-2"],
+        "evidence_state": "no_evidence",
+        "repair_action": "Complete the round.",
+    }]) is None
 
 
 @pytest.mark.parametrize("activity_index", [1, 2, 3, 4, 5])
