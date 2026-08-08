@@ -67,7 +67,13 @@ from knowledge_map import (
     generate_battleground_question,
     generate_contextual_followup
 )
-from interview_profiles import get_profile_config, normalize_profile_type
+from interview_profiles import (
+    TECHNICAL_CODING_QUESTION_COUNT,
+    TECHNICAL_MINUTES_PER_QUESTION,
+    TECHNICAL_TOTAL_DURATION_MINUTES,
+    get_profile_config,
+    normalize_profile_type,
+)
 from security_utils import redact_text, stable_hash, collect_profile_identifiers, redact_pii_text
 from security_utils import decrypt_data, encrypt_data
 from interview_blueprint import compile_interview_blueprint, validate_blueprint, weakness_label
@@ -2071,16 +2077,24 @@ async def start_interview(
         # Duration, difficulty, focus, and question count are product policy,
         # never candidate controls. The interviewer adapts naturally in this
         # 45-60 minute window based on the selected company profile and answers.
-        duration_config = profile_config["duration"]
-        duration_minutes = max(45, min(60, int(duration_config["target_minutes"])))
-        duration_config = {
-            "min_minutes": max(45, min(duration_minutes, int(duration_config.get("min_minutes") or 45))),
-            "target_minutes": duration_minutes,
-            "max_minutes": min(60, max(duration_minutes, int(duration_config.get("max_minutes") or 60))),
-        }
+        if is_technical_mode:
+            duration_minutes = TECHNICAL_TOTAL_DURATION_MINUTES
+            duration_config = {
+                "min_minutes": duration_minutes,
+                "target_minutes": duration_minutes,
+                "max_minutes": duration_minutes,
+            }
+        else:
+            duration_config = profile_config["duration"]
+            duration_minutes = max(45, min(60, int(duration_config["target_minutes"])))
+            duration_config = {
+                "min_minutes": max(45, min(duration_minutes, int(duration_config.get("min_minutes") or 45))),
+                "target_minutes": duration_minutes,
+                "max_minutes": min(60, max(duration_minutes, int(duration_config.get("max_minutes") or 60))),
+            }
         request.difficulty_level = "adaptive"
         request.focus = ["mixed"]
-        request.question_count = 2 if is_technical_mode and settings.TECHNICAL_CODING_ONLY else None
+        request.question_count = TECHNICAL_CODING_QUESTION_COUNT if is_technical_mode and settings.TECHNICAL_CODING_ONLY else None
         request.technical_topics = []
         request.technical_round_types = ["coding"] if is_technical_mode and settings.TECHNICAL_CODING_ONLY else []
         request.camera_mode = "required"
@@ -2134,7 +2148,7 @@ async def start_interview(
             "strictness_level": strictness_level,
             "duration": duration_config,
             "duration_minutes": duration_minutes,
-            "duration_policy": "adaptive_target",
+            "duration_policy": "technical_fixed_per_question" if is_technical_mode else "adaptive_target",
             "difficulty_level": "adaptive",
             "focus": ["mixed"],
             "experience_level": request.experience_level,
@@ -2148,7 +2162,7 @@ async def start_interview(
             "max_turns_per_battleground": 3 if request.interview_mode == "mock" else 2,
             "hints_enabled": False,
             "immediate_feedback": False,
-            "time_limit_per_question": 300,
+            "time_limit_per_question": TECHNICAL_MINUTES_PER_QUESTION * 60 if is_technical_mode else 300,
             "nonverbal_analysis": "browser_mediapipe",
             "technical_mode": is_technical_mode,
             "technical_rounds": (

@@ -43,7 +43,12 @@ from config import settings
 from database import async_execute, get_db_connection, return_db_connection
 from entitlements import is_technical_interview_type, normalize_technical_profile
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
-from interview_profiles import get_profile_config, normalize_profile_type
+from interview_profiles import (
+    TECHNICAL_MINUTES_PER_QUESTION,
+    TECHNICAL_TOTAL_DURATION_MINUTES,
+    get_profile_config,
+    normalize_profile_type,
+)
 from learning_engine import build_error_signature, ingest_technical_run
 from llm_router import LLMRoutingError, complete_json_async
 from prompt_security import data_block
@@ -174,10 +179,17 @@ CODEFORCES_RATING_TARGETS = {
     "custom": [1000, 1200],  # default; overridden dynamically via _custom_tier_difficulty()
 }
 DIFFICULTY_LABELS = {
-    "top_tier": ["Medium", "Hard"],
+    "top_tier": ["Hard", "Hard"],
     "mid_tier": ["Easy", "Medium"],
     "startup": ["Easy", "Medium"],
     "custom": ["Easy", "Medium"],  # default; overridden dynamically
+}
+TECHNICAL_TIER_SELECTION_VERSION = "technical-tier-selection-v2"
+TECHNICAL_TIER_CONTRACTS = {
+    "top_tier": {"difficulties": ("hard", "hard"), "rating_targets": (1800, 2000)},
+    "mid_tier": {"difficulties": ("easy", "medium"), "rating_targets": (1000, 1200)},
+    "startup": {"difficulties": ("easy", "medium"), "rating_targets": (800, 1000)},
+    "custom": {"difficulties": ("easy", "medium"), "rating_targets": (1000, 1200)},
 }
 HIDDEN_TEST_TAGS = [
     "empty_input",
@@ -228,6 +240,25 @@ def _custom_tier_difficulty(job_description: str, job_title: str) -> tuple:
     elif any(s in text for s in junior_signals):
         return [800, 1000], ["Easy", "Medium"]
     return [1000, 1400], ["Easy", "Medium"]
+
+
+def _expected_tier_difficulty(profile_type: str, round_number: int, context: Dict[str, Any]) -> str:
+    requested = str(context.get("difficulty_level") or "adaptive").strip().lower()
+    if requested in {"easy", "medium", "hard"}:
+        return requested
+    normalized = normalize_profile_type(profile_type)
+    if normalized == "custom" and context.get("custom_labels"):
+        labels = context["custom_labels"]
+    else:
+        labels = TECHNICAL_TIER_CONTRACTS[normalized]["difficulties"]
+    return str(labels[min(max(0, round_number - 1), len(labels) - 1)]).strip().lower()
+
+
+def _expected_tier_rating(profile_type: str, round_number: int, context: Dict[str, Any]) -> int:
+    normalized = normalize_profile_type(profile_type)
+    targets = context.get("custom_targets") if normalized == "custom" else None
+    targets = targets or TECHNICAL_TIER_CONTRACTS[normalized]["rating_targets"]
+    return int(targets[min(max(0, round_number - 1), len(targets) - 1)])
 
 
 TECHNICAL_PROBLEM_JSON_SCHEMA: Dict[str, Any] = {
@@ -787,7 +818,7 @@ async def _load_technical_generation_context(
             20,
         ),
         "question_count": max(1, min(12, int(settings_json.get("question_count") or 2))),
-        "duration_minutes": max(10, min(120, int(settings_json.get("duration_minutes") or 60))),
+        "duration_minutes": max(10, min(120, int(settings_json.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES))),
         "interview_mode": str(settings_json.get("interview_mode") or "mock").strip().lower(),
         "difficulty_level": str(settings_json.get("difficulty_level") or "adaptive").strip().lower(),
         "personalization_anchors": anchors,
@@ -1808,13 +1839,7 @@ def _bank_candidate_score(
     context: Dict[str, Any],
     round_number: int,
 ) -> tuple[int, str]:
-    requested = str(context.get("difficulty_level") or "adaptive").lower()
-    desired = requested if requested in {"easy", "medium", "hard"} else {
-        "top_tier": "hard",
-        "mid_tier": "medium",
-        "startup": "easy",
-        "custom": "medium",
-    }[profile_type]
+    desired = _expected_tier_difficulty(profile_type, round_number, context)
     score = 100 - abs(_difficulty_rank(item.get("difficulty")) - _difficulty_rank(desired)) * 30
     spec_json = item.get("spec_json") if isinstance(item.get("spec_json"), dict) else {}
     allowed_profiles = _string_list(
@@ -1994,12 +2019,14 @@ async def _round_templates_for_profile(
     authored_coding = await _authored_coding_specs(normalized, context)
     authored_index = 0
     templates: List[Dict[str, Any]] = []
-    total_duration = max(10, min(120, int(context.get("duration_minutes") or 60))) * 60
+    total_duration = max(10, min(120, int(context.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES))) * 60
     per_round_duration = max(300, total_duration // question_count)
     mode = "practice" if str(context.get("interview_mode") or "mock").lower() == "practice" else "mock"
     used_problem_ids: set[str] = set()
 
     for index, round_type in enumerate(requested_types, start=1):
+        expected_difficulty = _expected_tier_difficulty(normalized, index, context)
+        expected_rating = _expected_tier_rating(normalized, index, context)
         supported = [
             item for item in bank
             if item.get("round_type") == round_type
@@ -2007,6 +2034,7 @@ async def _round_templates_for_profile(
                 not item.get("supported_languages")
                 or selected_language in _string_list(item.get("supported_languages"), 20)
             )
+            and _difficulty_rank(item.get("difficulty")) == _difficulty_rank(expected_difficulty)
         ]
         if supported:
             supported.sort(
@@ -2035,7 +2063,7 @@ async def _round_templates_for_profile(
             if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Technical coding content is not ready. Please try again shortly.",
+                    detail=f"Technical {normalized.replace('_', ' ')} coding content is not ready for the required {expected_difficulty} tier.",
                 )
             spec = dict(authored_coding[authored_index % len(authored_coding)])
             authored_index += 1
@@ -2054,6 +2082,12 @@ async def _round_templates_for_profile(
                 )
             spec = _noncoding_authored_spec(round_type, context)
 
+        if _difficulty_rank(spec.get("difficulty")) != _difficulty_rank(expected_difficulty):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Technical {normalized.replace('_', ' ')} content did not satisfy the required {expected_difficulty} tier.",
+            )
+
         visible_tests = spec.get("visible_tests") if isinstance(spec.get("visible_tests"), list) else []
         hidden_tests = spec.get("hidden_tests") if isinstance(spec.get("hidden_tests"), list) else []
         expected_points = spec.get("expected_points") or (spec.get("spec_json") or {}).get("expected_points") or []
@@ -2066,6 +2100,16 @@ async def _round_templates_for_profile(
             "title": spec.get("title") or round_type.replace("_", " ").title(),
             "problem_title": spec.get("title") or round_type.replace("_", " ").title(),
             "difficulty": spec.get("difficulty") or context.get("difficulty_level") or "adaptive",
+            "tier_selection_version": TECHNICAL_TIER_SELECTION_VERSION,
+            "tier_target_rating": expected_rating,
+            "tier_expected_difficulty": expected_difficulty,
+            "tier_contract": {
+                "profile_type": normalized,
+                "profile_label": get_profile_config(normalized)["label"],
+                "expected_difficulty": expected_difficulty,
+                "target_rating": expected_rating,
+                "selection_version": TECHNICAL_TIER_SELECTION_VERSION,
+            },
             "statement": statement,
             "input_format": spec.get("input_format") or (spec.get("spec_json") or {}).get("input_format") or "",
             "output_format": spec.get("output_format") or (spec.get("spec_json") or {}).get("output_format") or "",
@@ -2258,6 +2302,10 @@ def _public_round_metadata(metadata: Dict[str, Any], *, include_hint: bool = Fal
         "title",
         "problem_title",
         "difficulty",
+        "tier_selection_version",
+        "tier_target_rating",
+        "tier_expected_difficulty",
+        "tier_contract",
         "cf_rating",
         "rating",
         "statement",
@@ -2381,7 +2429,7 @@ def _coerce_deadline_utc(value: Any) -> Optional[datetime]:
 
 
 def _technical_duration_seconds(profile_type: Optional[str]) -> int:
-    return 60 * 60
+    return TECHNICAL_MINUTES_PER_QUESTION * 60
 
 
 def _round_expiry_payload(
@@ -2588,7 +2636,7 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
     )
     target_duration_seconds = max(
         600,
-        min(7200, int(settings_json.get("duration_minutes") or 60) * 60),
+        min(7200, int(settings_json.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES) * 60),
     )
     stored_context = settings_json.get("job_context") if isinstance(settings_json.get("job_context"), dict) else {}
     job_context = {

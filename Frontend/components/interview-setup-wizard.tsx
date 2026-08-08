@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { Check, FileText, Loader2, Plus, Play, Trash2 } from "lucide-react"
+import { Check, FileText, Loader2, Pencil, Plus, Play, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
@@ -23,6 +23,7 @@ import {
   fetchResumeVersions,
   persistBrowserPreflight,
   selectJobProfile,
+  updateJobProfile,
   updateInterviewProfile,
   type InterviewBlueprint,
   type InterviewBlueprintRequest,
@@ -34,6 +35,7 @@ import {
   getTechnicalPermissionState,
   markPreflightCompleted,
   releaseTechnicalPermissions,
+  requestTechnicalFullscreen,
   requestTechnicalMedia,
   requestTechnicalScreenShare,
 } from "@/lib/technical-permissions"
@@ -41,9 +43,11 @@ import { requiresSavedJobProfile } from "@/lib/interview-setup-policy"
 import { rememberRecoveryGraceSeconds } from "@/lib/session-integrity"
 
 type SetupMode = "interview" | "technical"
-type CompileStage = "idle" | "camera" | "screen" | "blueprint" | "preflight" | "starting"
+type CompileStage = "idle" | "fullscreen" | "readiness" | "camera" | "screen" | "blueprint" | "preflight" | "starting"
 
 const compileStageLabels: Record<Exclude<CompileStage, "idle">, string> = {
+  fullscreen: "Opening full screen...",
+  readiness: "Checking service readiness...",
   camera: "Checking camera and microphone...",
   screen: "Waiting for full-screen sharing...",
   blueprint: "Building your interview...",
@@ -73,25 +77,25 @@ const profileChoices: {
     value: "top_tier",
     label: "Top Tier",
     interview: "High bar and deep follow-ups.",
-    technical: "Harder multi-step problems.",
+    technical: "Google, Microsoft, NVIDIA, Amazon, Adobe.",
   },
   {
     value: "mid_tier",
     label: "Mid Tier",
     interview: "Balanced execution and teamwork.",
-    technical: "Practical engineering problems.",
+    technical: "Oracle, Cisco, Dell, SAP, Qualcomm.",
   },
   {
     value: "startup",
     label: "Startup",
     interview: "Ownership, adaptability, and shipping.",
-    technical: "Fast, practical problem solving.",
+    technical: "Early-stage startups and fast-moving product teams.",
   },
   {
     value: "custom",
     label: "Custom",
     interview: "Use a saved role and full job description.",
-    technical: "Use a saved role and full job description.",
+    technical: "Match a saved role and its full job description.",
   },
 ]
 
@@ -117,6 +121,7 @@ export function InterviewSetupWizard({
   const [company, setCompany] = useState("")
   const [jobDescription, setJobDescription] = useState("")
   const [showProfileForm, setShowProfileForm] = useState(false)
+  const [editingProfileId, setEditingProfileId] = useState<number | null>(null)
   const [profileType, setProfileType] = useState<InterviewProfileType>("mid_tier")
   const [savingProfile, setSavingProfile] = useState(false)
   const [savingTarget, setSavingTarget] = useState(false)
@@ -130,37 +135,32 @@ export function InterviewSetupWizard({
   const [serviceReadiness, setServiceReadiness] = useState<"checking" | "ready" | "blocked">("checking")
   const [serviceReadinessMessage, setServiceReadinessMessage] = useState("")
   const [readinessRetry, setReadinessRetry] = useState(0)
+  const [readinessFeedbackVisible, setReadinessFeedbackVisible] = useState(false)
 
   useEffect(() => {
     let cancelled = false
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
     const flow = technical ? "technical" : "interview"
     const checkReadiness = async () => {
       if (cancelled) return
       setServiceReadiness("checking")
       setServiceReadinessMessage("")
       try {
-        const readiness = await fetchFlowPreflight(flow)
+        const readiness = await fetchFlowPreflight(flow, { force: readinessRetry > 0 })
         if (cancelled) return
         setServiceReadiness(readiness.ready ? "ready" : "blocked")
         setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
         if (readiness.ready) {
           rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
-          return
         }
       } catch (error: any) {
         if (cancelled) return
         setServiceReadiness("blocked")
         setServiceReadinessMessage(error?.message || "Service readiness could not be checked.")
       }
-      if (!cancelled) {
-        retryTimer = setTimeout(() => { void checkReadiness() }, 10_000)
-      }
     }
     void checkReadiness()
     return () => {
       cancelled = true
-      if (retryTimer) clearTimeout(retryTimer)
     }
   }, [readinessRetry, technical])
 
@@ -192,7 +192,14 @@ export function InterviewSetupWizard({
       if (failed.length) setAssetError(failed.map((result) => result.reason?.message || "Failed to load setup assets").join(" "))
       setLoadingAssets(false)
       void profilePromise.then((profile) => {
-        if (!cancelled) setProfileType(profile.profile_type)
+        if (cancelled) return
+        setProfileType(profile.profile_type)
+        if (profile.profile_type !== "custom") {
+          setJobProfileId("")
+          setRole("")
+          setCompany("")
+          setJobDescription("")
+        }
       }).catch(() => undefined)
     })()
     return () => { cancelled = true }
@@ -215,6 +222,12 @@ export function InterviewSetupWizard({
     }
     const previousProfile = profileType
     setProfileType(nextProfile)
+    if (nextProfile !== "custom") {
+      setJobProfileId("")
+      setRole("")
+      setCompany("")
+      setJobDescription("")
+    }
     setShowProfileForm(nextProfile === "custom" && jobs.length === 0)
     setProfileError("")
     setSavingProfile(true)
@@ -250,6 +263,7 @@ export function InterviewSetupWizard({
   }
 
   const startNewCustomTarget = () => {
+    setEditingProfileId(null)
     setJobProfileId("")
     setRole("")
     setCompany("")
@@ -258,6 +272,7 @@ export function InterviewSetupWizard({
   }
 
   const cancelNewCustomTarget = () => {
+    setEditingProfileId(null)
     setShowProfileForm(false)
     setRole(selectedJob?.role || "")
     setCompany(selectedJob?.company || "")
@@ -269,22 +284,29 @@ export function InterviewSetupWizard({
     setSavingTarget(true)
     setProfileError("")
     try {
-      const created = await createJobProfile({
+      const payload = {
         role: role.trim(),
         company: company.trim(),
         job_description: jobDescription.trim(),
+      }
+      const saved = editingProfileId !== null
+        ? await updateJobProfile(editingProfileId, payload)
+        : await createJobProfile(payload)
+      await selectJobProfile(saved.profile_id)
+      setJobs((current) => {
+        const next = current.map((item) => ({ ...item, is_selected: false }))
+        const selectedProfile = { ...saved, is_selected: true }
+        const existingIndex = next.findIndex((item) => item.profile_id === saved.profile_id)
+        if (existingIndex === -1) return [...next, selectedProfile]
+        next[existingIndex] = selectedProfile
+        return next
       })
-      await selectJobProfile(created.profile_id)
-      const selectedProfile = { ...created, is_selected: true }
-      setJobs((current) => [
-        ...current.filter((item) => item.profile_id !== created.profile_id).map((item) => ({ ...item, is_selected: false })),
-        selectedProfile,
-      ])
-      setJobProfileId(String(created.profile_id))
-      setRole(created.role || "")
-      setCompany(created.company || "")
-      setJobDescription(created.job_description || "")
+      setJobProfileId(String(saved.profile_id))
+      setRole(saved.role || "")
+      setCompany(saved.company || "")
+      setJobDescription(saved.job_description || "")
       setShowProfileForm(false)
+      setEditingProfileId(null)
       onProfilesChanged?.()
     } catch (error: any) {
       setProfileError(error?.message || "We could not save this profile. Please try again.")
@@ -329,10 +351,6 @@ export function InterviewSetupWizard({
 
   const compile = async () => {
     if (!resumeId) return
-    if (serviceReadiness !== "ready") {
-      setCompileError(serviceReadinessMessage || "The round is not ready yet. Wait for the service check and try again.")
-      return
-    }
     setCompiling(true)
     setCompileError("")
     try {
@@ -344,6 +362,19 @@ export function InterviewSetupWizard({
         throw new Error(`A network connection is required before the ${technical ? "Technical Round" : "Interview Round"} can start.`)
       }
       const flow = technical ? "technical" : "interview"
+      const fullscreenRequest = technical ? requestTechnicalFullscreen() : null
+      setReadinessFeedbackVisible(true)
+      if (technical) {
+        setCompileStage("fullscreen")
+        const fullscreen = await fullscreenRequest
+        if (!fullscreen?.ok) throw new Error(fullscreen?.message || "Fullscreen is required before the technical round can start.")
+      }
+      setCompileStage("readiness")
+      const readiness = await fetchFlowPreflight(flow, { force: serviceReadiness === "blocked" })
+      setServiceReadiness(readiness.ready ? "ready" : "blocked")
+      setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
+      if (!readiness.ready) throw new Error(readiness.message)
+      rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
       if (technical) {
         setCompileStage("screen")
         const screen = await requestTechnicalScreenShare()
@@ -356,7 +387,7 @@ export function InterviewSetupWizard({
       setCompileStage("blueprint")
       const payload: InterviewBlueprintRequest = {
         resume_id: resumeId,
-        job_profile_id: compiledJobProfileId,
+        job_profile_id: profileType === "custom" ? compiledJobProfileId : null,
         interview_mode: interviewMode,
         interview_type: technical ? "technical" : "behavioral",
         profile_type: profileType,
@@ -460,9 +491,27 @@ export function InterviewSetupWizard({
                           >
                             <span className="min-w-0">
                               <span className="block truncate text-sm font-semibold text-foreground">{job.role}{job.company ? ` at ${job.company}` : ""}</span>
-                              <span className="mt-1 line-clamp-2 block text-xs leading-5 text-muted-foreground">{job.job_description || "No job description saved"}</span>
+                              <span className="mt-1 block truncate text-xs leading-5 text-muted-foreground">{job.job_description ? "Full job description saved" : "No job description saved"}</span>
                             </span>
                           </button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="m-2 h-8 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground"
+                            disabled={savingProfile || deletingProfileId !== null}
+                            onClick={() => {
+                              setEditingProfileId(job.profile_id)
+                              setRole(job.role || "")
+                              setCompany(job.company || "")
+                              setJobDescription(job.job_description || "")
+                              setProfileError("")
+                              setShowProfileForm(true)
+                            }}
+                            aria-label={`Edit ${job.role} job target`}
+                          >
+                            <Pencil className="h-3.5 w-3.5" /> Edit
+                          </Button>
                           <Button
                             type="button"
                             variant="ghost"
@@ -488,17 +537,21 @@ export function InterviewSetupWizard({
 
                 {showProfileForm && (
                   <div className="grid gap-4 md:grid-cols-2">
+                    <div className="md:col-span-2">
+                      <p className="text-sm font-semibold text-foreground">{editingProfileId !== null ? "Edit saved role" : "Add saved role"}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">View and edit the complete job description here.</p>
+                    </div>
                     <Field label="Role title"><Input value={role} onChange={(event) => setRole(event.target.value)} placeholder="Backend Engineer" className="placeholder:text-muted-foreground/70" /></Field>
                     <Field label="Company"><Input value={company} onChange={(event) => setCompany(event.target.value)} placeholder="Company name" className="placeholder:text-muted-foreground/70" /></Field>
                     <div className="md:col-span-2">
                       <Field label="Job description">
-                        <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-28 placeholder:text-muted-foreground/70" />
+                        <Textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the complete responsibilities, requirements, and preferred skills." className="min-h-56 placeholder:text-muted-foreground/70" />
                       </Field>
                     </div>
                     <div className="flex justify-end gap-2 md:col-span-2">
                       <Button type="button" variant="ghost" disabled={savingTarget} onClick={cancelNewCustomTarget}>Cancel</Button>
                       <Button type="button" disabled={savingTarget || !role.trim() || !company.trim() || !jobDescription.trim()} onClick={() => void saveCustomTarget()}>
-                        {savingTarget ? <Loader2 className="h-4 w-4 animate-spin" /> : <SaveIcon />} Save job target
+                        {savingTarget ? <Loader2 className="h-4 w-4 animate-spin" /> : <SaveIcon />} {editingProfileId !== null ? "Save changes" : "Save job target"}
                       </Button>
                     </div>
                   </div>
@@ -509,24 +562,27 @@ export function InterviewSetupWizard({
 
         </>
       )}
-      {(assetError || compileError || profileError || serviceReadiness === "blocked") && (
+      {(assetError || compileError || profileError || (readinessFeedbackVisible && serviceReadiness === "blocked")) && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          <span>{compileError || profileError || serviceReadinessMessage || assetError}</span>
-          {serviceReadiness === "blocked" && (
-            <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => setReadinessRetry((attempt) => attempt + 1)}>
+          <span>{compileError || profileError || (readinessFeedbackVisible && serviceReadiness === "blocked" ? serviceReadinessMessage : "") || assetError}</span>
+          {readinessFeedbackVisible && serviceReadiness === "blocked" && (
+            <Button type="button" variant="outline" size="sm" className="shrink-0" onClick={() => {
+              setCompileError("")
+              setReadinessRetry((attempt) => attempt + 1)
+            }}>
               Retry
             </Button>
           )}
         </div>
       )}
-      {serviceReadiness === "checking" && (
+      {readinessFeedbackVisible && serviceReadiness === "checking" && !compiling && (
         <div className="flex items-center gap-2 rounded-lg border border-border/60 bg-secondary/20 px-3 py-2 text-sm text-muted-foreground">
           <Loader2 className="h-4 w-4 animate-spin" /> Checking service readiness...
         </div>
       )}
       {!loadingAssets && !resumes.length && <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300"><FileText className="mr-2 inline h-4 w-4" />Upload and activate a resume before starting.</div>}
       <div className="flex justify-end border-t border-border/60 pt-4">
-        <Button disabled={disabled || compiling || serviceReadiness !== "ready" || savingProfile || savingTarget || deletingProfileId !== null || showProfileForm || !resumeId || (requiresSavedJobProfile(profileType) && !jobProfileId)} onClick={() => void compile()}>
+        <Button disabled={disabled || compiling || savingProfile || savingTarget || deletingProfileId !== null || showProfileForm || !resumeId || (requiresSavedJobProfile(profileType) && !jobProfileId)} onClick={() => void compile()}>
           {compiling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />} {compiling && compileStage !== "idle" ? compileStageLabels[compileStage] : `Start ${technical ? "Technical Round" : "Interview Round"}`}
         </Button>
       </div>

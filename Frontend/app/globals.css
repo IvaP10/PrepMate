@@ -162,7 +162,7 @@ html.theme-transitioning *::after {
     box-shadow,
     outline-color,
     text-decoration-color !important;
-  transition-duration: 360ms !important;
+  transition-duration: 700ms !important;
   transition-delay: 0s !important;
   transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1) !important;
 }
@@ -172,10 +172,10 @@ html.theme-transitioning *::after {
 }
 
 .premium-background-frame {
-  --premium-orbit-color: rgba(92, 101, 126, 0.225);
-  --premium-dashed-color: rgba(99, 102, 241, 0.285);
-  --premium-sweep-color: rgba(99, 102, 241, 0.165);
-  --premium-construction-color: rgba(92, 101, 126, 0.15);
+  --premium-orbit-color: rgba(71, 85, 105, 0.30);
+  --premium-dashed-color: rgba(79, 70, 229, 0.36);
+  --premium-sweep-color: rgba(79, 70, 229, 0.22);
+  --premium-construction-color: rgba(71, 85, 105, 0.22);
   isolation: isolate;
   overflow: hidden;
 }
@@ -275,7 +275,7 @@ html.theme-transitioning *::after {
 
 html.theme-transitioning .premium-background-base {
   transition-property: background-color !important;
-  transition-duration: 1200ms !important;
+  transition-duration: 700ms !important;
   transition-delay: 0s !important;
   transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1) !important;
 }
@@ -287,7 +287,7 @@ html.theme-transitioning .premium-background-construction-lines {
   transition-property:
     transform,
     stroke !important;
-  transition-duration: 1200ms !important;
+  transition-duration: 700ms !important;
   transition-delay: 0s !important;
   transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1) !important;
 }

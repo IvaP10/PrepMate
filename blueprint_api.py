@@ -23,7 +23,11 @@ from interview_blueprint import (
     compile_interview_blueprint,
     validate_blueprint,
 )
-from interview_profiles import get_profile_duration
+from interview_profiles import (
+    TECHNICAL_CODING_QUESTION_COUNT,
+    TECHNICAL_TOTAL_DURATION_MINUTES,
+    get_profile_duration,
+)
 from security_utils import decrypt_data, decrypt_json, encrypt_data
 
 
@@ -41,15 +45,21 @@ class BlueprintCreateRequest(BaseModel):
     profile_type: Literal["top_tier", "mid_tier", "startup", "custom"] = "mid_tier"
 
 
-def server_owned_interview_policy(profile_type: str) -> Dict[str, Any]:
+def server_owned_interview_policy(profile_type: str, interview_type: str = "behavioral") -> Dict[str, Any]:
     """Return the immutable settings users are not allowed to shape."""
-    duration = get_profile_duration(profile_type)
-    target_minutes = max(45, min(60, int(duration["target_minutes"])))
+    technical = str(interview_type or "").strip().lower() in {"technical", "technical interview", "technical mode"}
+    if technical:
+        target_minutes = TECHNICAL_TOTAL_DURATION_MINUTES
+        question_count = TECHNICAL_CODING_QUESTION_COUNT
+    else:
+        duration = get_profile_duration(profile_type)
+        target_minutes = max(45, min(60, int(duration["target_minutes"])))
+        question_count = None
     return {
         "difficulty_level": "adaptive",
         "duration_minutes": target_minutes,
         "focus": ["mixed"],
-        "question_count": None,
+        "question_count": question_count,
         "round_config": {},
     }
 
@@ -268,7 +278,7 @@ async def create_interview_blueprint(
                 """,
                 (request.job_profile_id, current_user["user_id"]),
             )
-        else:
+        elif request.profile_type == "custom":
             cursor.execute(
                 """
                 SELECT profile_id, role, company, job_description_encrypted,
@@ -280,7 +290,10 @@ async def create_interview_blueprint(
                 """,
                 (current_user["user_id"],),
             )
-        job_row = cursor.fetchone()
+        else:
+            job_row = None
+        if request.profile_type == "custom" or request.job_profile_id:
+            job_row = cursor.fetchone()
         target = _resolve_blueprint_job_target(
             job_row=job_row,
             resume_payload=resume_payload,
@@ -293,7 +306,7 @@ async def create_interview_blueprint(
         job_description = target["job_description"]
         job_title = f"{role} at {company}" if company else role
         experience_level = target["experience_level"]
-        policy = server_owned_interview_policy(request.profile_type)
+        policy = server_owned_interview_policy(request.profile_type, request.interview_type)
 
         if request.request_idempotency_key:
             cursor.execute(

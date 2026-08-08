@@ -140,7 +140,6 @@ type RecoverableRun = {
 }
 
 type CodingWorkflowDraft = {
-  approach: string
   complexity: string
   explanation: string
 }
@@ -390,6 +389,12 @@ export default function TechnicalInterviewPage() {
   const submitsLeft = Math.max(0, maxSubmissions - submitsUsed)
   const activeRoundStatus = (activeRound?.status || "").toLowerCase()
   const activeRoundIsCoding = isCodingRound(activeRound)
+  const durationPerQuestionMinutes = Math.max(1, Math.round(targetDurationSeconds / Math.max(1, rounds.length) / 60))
+  const headerJobTitle = jobContext?.profile_type === "custom"
+    ? jobContext.job_title || jobContext.role || "Technical Round"
+    : jobContext?.company
+      ? `${jobContext.profile_label || "Technical"} Technical Round`
+      : jobContext?.role || `${jobContext?.profile_label || "Technical"} Technical Round`
   const activeRoundDeadlineMs = activeRound?.expires_at ? Date.parse(activeRound.expires_at) : Number.NaN
   const activeRoundExpired = Number.isFinite(activeRoundDeadlineMs) && Date.now() >= activeRoundDeadlineMs
   const roundActionLocked = reviewMode || activeRoundExpired || ["pending", "expired", "submitted", "submitting", "awaiting_explanation", "cancelled"].includes(activeRoundStatus)
@@ -807,7 +812,7 @@ export default function TechnicalInterviewPage() {
         languages[round.round_id] = round.language || "python"
         inputs[round.round_id] = visibleTests(round)[0]?.stdin || ""
         if (!isCodingRound(round)) writtenResponses[round.round_id] = ""
-        workflowDrafts[round.round_id] = { approach: "", complexity: "", explanation: "" }
+        workflowDrafts[round.round_id] = { complexity: "", explanation: "" }
         submitCounts[round.round_id] = Number(round.workflow_state?.final_submission?.submit_number || 0)
       })
       setCodeByRound(code)
@@ -940,7 +945,7 @@ export default function TechnicalInterviewPage() {
   }
 
   const submitWorkflowEvidence = async (
-    stage: "clarification" | "approach" | "complexity" | "explanation" | "followup",
+    stage: "clarification" | "complexity" | "explanation" | "followup",
     content: string,
     round: Round = activeRound as Round,
   ) => {
@@ -998,14 +1003,6 @@ export default function TechnicalInterviewPage() {
       return
     }
     const source = codeByRound[activeRound.round_id] || ""
-    if (action === "submit" && !activeRound.workflow_state?.approach) {
-      const approach = workflowDraftByRound[activeRound.round_id]?.approach || ""
-      if (!approach.trim()) {
-        toast.error("State and save your initial approach before the one-way final submission.")
-        return
-      }
-      if (!await submitWorkflowEvidence("approach", approach, activeRound)) return
-    }
     if (action === "test" || action === "submit") {
       noteNoClarificationBeforeCoding(activeRound.round_id)
     }
@@ -1107,7 +1104,7 @@ export default function TechnicalInterviewPage() {
     setWorkflowDraftByRound((current) => ({
       ...current,
       [activeRound.round_id]: {
-        ...(current[activeRound.round_id] || { approach: "", complexity: "", explanation: "" }),
+        ...(current[activeRound.round_id] || { complexity: "", explanation: "" }),
         [field]: value,
       },
     }))
@@ -1115,7 +1112,7 @@ export default function TechnicalInterviewPage() {
 
   const commitActiveFinalEvidence = async () => {
     if (!activeRound) return
-    const draft = workflowDraftByRound[activeRound.round_id] || { approach: "", complexity: "", explanation: "" }
+    const draft = workflowDraftByRound[activeRound.round_id] || { complexity: "", explanation: "" }
     if (!draft.complexity.trim() || !draft.explanation.trim()) {
       toast.error("Add both the complexity analysis and final explanation.")
       return
@@ -1310,7 +1307,7 @@ export default function TechnicalInterviewPage() {
   const commitPendingCodingEvidence = async (options: { keepalive?: boolean } = {}) => {
     for (const round of roundsRef.current) {
       if (!isCodingRound(round) || String(round.status || "").toLowerCase() !== "awaiting_explanation") continue
-      const draft = workflowDraftByRound[round.round_id] || { approach: "", complexity: "", explanation: "" }
+      const draft = workflowDraftByRound[round.round_id] || { complexity: "", explanation: "" }
       if (!draft.complexity.trim() || !draft.explanation.trim()) {
         if (!options.keepalive) {
           throw new Error("Complete the complexity and final explanation for every submitted coding round before finishing.")
@@ -1518,7 +1515,7 @@ export default function TechnicalInterviewPage() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="hidden min-w-0 sm:block">
-            <p className="truncate text-sm font-semibold text-foreground">{jobContext?.job_title || jobContext?.role || "Technical Round"}</p>
+            <p className="truncate text-sm font-semibold text-foreground">{headerJobTitle}</p>
             <p className="truncate text-xs text-muted-foreground">{jobContext?.profile_label || "Technical"}</p>
           </div>
           <select
@@ -1534,6 +1531,11 @@ export default function TechnicalInterviewPage() {
           </select>
         </div>
         <div className="flex items-center gap-3">
+          {rounds.length > 0 && (
+            <span className="hidden text-xs text-muted-foreground xl:inline">
+              {rounds.length} questions · {durationPerQuestionMinutes} min each
+            </span>
+          )}
           {!reviewMode && (() => {
             const parsedRoundDeadline = activeRound?.expires_at ? Date.parse(activeRound.expires_at) : Number.NaN
             const remainingSeconds = Number.isFinite(parsedRoundDeadline)
@@ -1639,12 +1641,11 @@ export default function TechnicalInterviewPage() {
             onRevealConstraints={() => activeRound && revealConstraints(activeRound.round_id)}
             onRevealHint={() => activeRound && revealHint(activeRound.round_id)}
             onToggleMic={micListening ? stopTechnicalMic : startTechnicalMic}
-            workflowDraft={activeRound ? workflowDraftByRound[activeRound.round_id] || { approach: "", complexity: "", explanation: "" } : { approach: "", complexity: "", explanation: "" }}
+            workflowDraft={activeRound ? workflowDraftByRound[activeRound.round_id] || { complexity: "", explanation: "" } : { complexity: "", explanation: "" }}
             workflowState={activeRound?.workflow_state || {}}
             workflowSaving={workflowSaving}
             actionLocked={roundActionLocked || sessionFlagged}
             onWorkflowChange={updateWorkflowDraft}
-            onSaveApproach={() => activeRound && void submitWorkflowEvidence("approach", workflowDraftByRound[activeRound.round_id]?.approach || "", activeRound)}
             onCommitFinalEvidence={() => void commitActiveFinalEvidence()}
           />
           <TestcasePanel
@@ -2025,7 +2026,6 @@ function ProblemPanel({
   workflowSaving,
   actionLocked,
   onWorkflowChange,
-  onSaveApproach,
   onCommitFinalEvidence,
 }: {
   round?: Round
@@ -2046,7 +2046,6 @@ function ProblemPanel({
   workflowSaving: boolean
   actionLocked: boolean
   onWorkflowChange: (field: keyof CodingWorkflowDraft, value: string) => void
-  onSaveApproach: () => void
   onCommitFinalEvidence: () => void
 }) {
   const difficulty = formatDifficulty(round?.metadata?.difficulty)
@@ -2118,7 +2117,7 @@ function ProblemPanel({
               <Button
                 size="sm"
                 variant="outline"
-                className="h-8 gap-1.5"
+                className="h-8 gap-1.5 border-sky-500/30 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 hover:text-sky-800 dark:text-sky-300 dark:hover:text-sky-200"
                 onClick={onRevealConstraints}
                 disabled={constraintsRevealed}
               >
@@ -2129,7 +2128,7 @@ function ProblemPanel({
                 <Button
                   size="sm"
                   variant="outline"
-                  className="h-8 gap-1.5"
+                  className="h-8 gap-1.5 border-violet-500/30 bg-violet-500/10 text-violet-700 hover:bg-violet-500/20 hover:text-violet-800 dark:text-violet-300 dark:hover:text-violet-200"
                   onClick={onRevealHint}
                   disabled={hintRevealed}
                 >
@@ -2140,35 +2139,13 @@ function ProblemPanel({
               <Button
                 size="sm"
                 variant="outline"
-                className="h-8 gap-1.5"
+                className="h-8 gap-1.5 border-emerald-500/30 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 hover:text-emerald-800 dark:text-emerald-300 dark:hover:text-emerald-200"
                 onClick={onToggleMic}
                 disabled={!micSupported}
               >
                 {micListening ? <MicOff className="h-3.5 w-3.5" /> : <Mic className="h-3.5 w-3.5" />}
                 {micListening ? "Stop voice notes" : "Use voice notes"}
               </Button>
-            </div>
-
-            <div className="rounded-md border border-border bg-secondary/45 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-foreground">Initial approach</p>
-                  <p className="mt-1 text-xs text-muted-foreground">State the baseline approach, chosen data structures, and expected complexity before final submit.</p>
-                </div>
-                {workflowState.approach && <span className="rounded bg-emerald-500/15 px-2 py-1 text-xs font-semibold text-emerald-700 dark:text-emerald-300">Committed</span>}
-              </div>
-              <textarea
-                value={workflowDraft.approach}
-                onChange={(event) => onWorkflowChange("approach", event.target.value)}
-                disabled={Boolean(workflowState.approach) || actionLocked || workflowSaving}
-                placeholder="I will start with…, maintain…, and validate…"
-                className="mt-3 h-28 w-full resize-none rounded-md border border-border bg-background p-3 text-sm leading-6 text-foreground outline-none focus:border-primary disabled:opacity-60"
-              />
-              <div className="mt-2 flex justify-end">
-                <Button size="sm" variant="outline" onClick={onSaveApproach} disabled={Boolean(workflowState.approach) || actionLocked || workflowSaving || !workflowDraft.approach.trim()}>
-                  {workflowSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />} Save approach
-                </Button>
-              </div>
             </div>
 
             {String(round?.status || "").toLowerCase() === "awaiting_explanation" && (
@@ -2473,7 +2450,7 @@ function ResultPanel({
           Test Result
         </div>
         <div className="flex gap-2">
-          <Button size="sm" className="h-7 gap-1.5 bg-primary px-3 text-primary-foreground hover:bg-primary/90" onClick={onRun} disabled={running || actionLocked}>
+          <Button size="sm" className="h-7 gap-1.5 bg-indigo-600 px-3 text-white hover:bg-indigo-700" onClick={onRun} disabled={running || actionLocked}>
             <Play className="h-3 w-3" />
             Run
           </Button>

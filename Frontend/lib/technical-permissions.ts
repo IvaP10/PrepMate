@@ -392,6 +392,9 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
 }
 
 export async function requestTechnicalPermissions(): Promise<TechnicalPermissionResult> {
+  const fullscreen = requestTechnicalFullscreen()
+  const fullscreenResult = await fullscreen
+  if (!fullscreenResult.ok) return fullscreenResult
   const screen = await requestTechnicalScreenShare()
   if (!screen.ok) return screen
   const media = await requestTechnicalMedia()

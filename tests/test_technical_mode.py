@@ -373,6 +373,47 @@ class TechnicalModePureTests(unittest.TestCase):
 
 
 class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_top_tier_rounds_require_hard_bank_content_and_fixed_round_timing(self):
+        first = _valid_problem("Hard Tree").copy()
+        first["difficulty"] = "hard"
+        second = _valid_problem("Hard Graph").copy()
+        second["difficulty"] = "hard"
+        bank = []
+        for index, problem in enumerate((first, second), start=1):
+            bank.append({
+                "problem_id": f"bank-{index}",
+                "problem_family_id": f"family-{index}",
+                "version": 1,
+                "round_type": "coding",
+                "taxonomy_keys": ["technical:trees"],
+                "prerequisite_keys": [],
+                "difficulty": "hard",
+                "title": problem["title"],
+                "statement": problem["statement"],
+                "spec_json": {"profile_types": ["top_tier"]},
+                "visible_tests": problem["visible_tests"],
+                "hidden_tests": problem["hidden_tests"],
+                "expected_time_complexity": problem["expected_time_complexity"],
+                "expected_space_complexity": problem["expected_space_complexity"],
+                "supported_languages": ["python"],
+                "validator_version": "test",
+                "validation_result": {"passed": True},
+                "source": "problem_bank",
+            })
+
+        with patch.object(technical_mode, "_load_active_problem_bank", new_callable=AsyncMock, return_value=bank):
+            templates = await technical_mode._round_templates_for_profile(
+                "top_tier",
+                "interview-1",
+                "user-1",
+                {"programming_language": "python", "question_count": 2, "duration_minutes": 80},
+            )
+
+        self.assertEqual([template["duration_seconds"] for template in templates], [2400, 2400])
+        self.assertEqual([template["metadata"]["tier_expected_difficulty"] for template in templates], ["hard", "hard"])
+        self.assertEqual([template["metadata"]["tier_target_rating"] for template in templates], [1800, 2000])
+        self.assertTrue(all(template["metadata"]["difficulty"] == "hard" for template in templates))
+
     async def test_duplicate_pending_noncoding_response_resumes_and_commits(self):
         round_row = (
             "round-1", "interview-1", "system_design", "Design a queue", {}, "active",

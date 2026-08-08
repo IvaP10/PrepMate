@@ -101,28 +101,54 @@ export type FlowPreflightStatus = {
   checks: Record<string, { healthy?: boolean; [key: string]: unknown }>
 }
 
-export async function fetchFlowPreflight(flow: 'interview' | 'technical'): Promise<FlowPreflightStatus> {
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), API_CONFIG.TIMEOUT)
+const FLOW_PREFLIGHT_CACHE_TTL_MS = 10_000
+const flowPreflightCache = new Map<'interview' | 'technical', { value: FlowPreflightStatus; expiresAt: number }>()
+const flowPreflightRequests = new Map<'interview' | 'technical', Promise<FlowPreflightStatus>>()
+
+export async function fetchFlowPreflight(
+  flow: 'interview' | 'technical',
+  options: { force?: boolean } = {},
+): Promise<FlowPreflightStatus> {
+  const activeRequest = flowPreflightRequests.get(flow)
+  if (activeRequest) return activeRequest
+
+  if (!options.force) {
+    const cached = flowPreflightCache.get(flow)
+    if (cached && cached.expiresAt > Date.now()) return cached.value
+  }
+
+  const request = (async () => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), API_CONFIG.TIMEOUT)
+    try {
+      const response = await fetch(`${API_CONFIG.BASE_URL}/preflight?flow=${flow}`, {
+        credentials: 'include',
+        headers: getAuthHeaders(),
+        signal: controller.signal,
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok && response.status !== 503) {
+        throw new Error(friendlyMessage(payload?.detail || payload?.message || `HTTP ${response.status}`))
+      }
+      if (!payload || typeof payload.ready !== 'boolean') {
+        throw new Error('The service readiness response was invalid.')
+      }
+      return payload as FlowPreflightStatus
+    } catch (error) {
+      if (error instanceof Error) throw new Error(friendlyMessage(error.message))
+      throw new Error('Service readiness could not be checked.')
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  })()
+
+  flowPreflightRequests.set(flow, request)
   try {
-    const response = await fetch(`${API_CONFIG.BASE_URL}/preflight?flow=${flow}`, {
-      credentials: 'include',
-      headers: getAuthHeaders(),
-      signal: controller.signal,
-    })
-    const payload = await response.json().catch(() => null)
-    if (!response.ok && response.status !== 503) {
-      throw new Error(friendlyMessage(payload?.detail || payload?.message || `HTTP ${response.status}`))
-    }
-    if (!payload || typeof payload.ready !== 'boolean') {
-      throw new Error('The service readiness response was invalid.')
-    }
-    return payload
-  } catch (error) {
-    if (error instanceof Error) throw new Error(friendlyMessage(error.message))
-    throw new Error('Service readiness could not be checked.')
+    const result = await request
+    flowPreflightCache.set(flow, { value: result, expiresAt: Date.now() + FLOW_PREFLIGHT_CACHE_TTL_MS })
+    return result
   } finally {
-    clearTimeout(timeoutId)
+    if (flowPreflightRequests.get(flow) === request) flowPreflightRequests.delete(flow)
   }
 }
 

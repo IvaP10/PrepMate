@@ -64,7 +64,7 @@ import {
   prepareTechnicalRounds,
   copyInterviewJobProfile,
 } from "@/lib/api"
-import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileType, LearningDashboard, TechnicalRoundSession } from "@/lib/api"
+import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileType, LearningDashboard, TechnicalRoundHistoryItem, TechnicalRoundSession } from "@/lib/api"
 import { useResume } from "@/context/resume-context"
 import type { ResumeData } from "@/types/resume"
 import { RESUME_MAX_FILE_BYTES } from "@/lib/config"
@@ -257,6 +257,29 @@ function createClientIdempotencyKey(prefix: string) {
     ? crypto.randomUUID()
     : `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
+
+function normalizeTechnicalSessions(data: {
+  rounds?: TechnicalRoundHistoryItem[]
+  sessions?: TechnicalRoundSession[]
+}): TechnicalRoundSession[] {
+  const sessions = (data.sessions || []).filter((session) => Boolean(session.rounds?.length))
+  if (sessions.length) return sessions
+
+  const grouped = new Map<string, TechnicalRoundSession>()
+  for (const round of data.rounds || []) {
+    if (!round.interview_id) continue
+    const session = grouped.get(round.interview_id) || {
+      interview_id: round.interview_id,
+      profile_type: round.profile_type || null,
+      job_title: round.title || null,
+      rounds: [],
+    }
+    session.rounds.push(round)
+    grouped.set(round.interview_id, session)
+  }
+  return Array.from(grouped.values())
+}
+
 export { InterviewContent, ResumeContent }
 
 function isPlanStartError(message: string) {
@@ -284,11 +307,13 @@ function InterviewContent({
   interviews = [],
   setActiveNav,
   mode = "interview",
+  refreshKey = 0,
   onProfilesChanged,
 }: {
   interviews?: PastInterview[]
   setActiveNav: (nav: ActiveNav) => void
   mode?: "interview" | "technical"
+  refreshKey?: number
   onProfilesChanged?: () => void
 }) {
   const router = useRouter()
@@ -316,7 +341,7 @@ function InterviewContent({
     setTechnicalHistoryError("")
     try {
       const data = await fetchTechnicalRoundHistory()
-      setTechnicalSessions(data.sessions || [])
+      setTechnicalSessions(normalizeTechnicalSessions(data))
     } catch (error: any) {
       setTechnicalHistoryError(error?.message || "Failed to load technical rounds.")
     } finally {
@@ -327,7 +352,7 @@ function InterviewContent({
   useEffect(() => {
     if (mode !== "technical") return
     void loadTechnicalRounds()
-  }, [loadTechnicalRounds, mode])
+  }, [loadTechnicalRounds, mode, refreshKey])
 
   const startMockInterview = async (preflightId: string, blueprint: InterviewBlueprint, runtime: BlueprintRuntimeChoice) => {
     if (!blueprint?.blueprint_id) {
@@ -461,6 +486,9 @@ function InterviewContent({
     onProfilesChanged?.()
   }
 
+  const hasTechnicalHistory = technicalSessions.some((session) => Boolean(session.rounds?.length))
+  const hasPastInterviews = interviews.length > 0
+
   const copyPastProfile = async (interview: PastInterview) => {
     setCopyingInterviewId(interview.id)
     try {
@@ -495,13 +523,13 @@ function InterviewContent({
 
       {mode === "technical" ? (
         <div className="dashboard-card overflow-hidden p-0">
-          <div className={!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
+          <div className={!loadingTechnicalRounds && !technicalHistoryError && !hasTechnicalHistory ? "p-5" : "border-b border-border/20 p-6"}>
             <h3 className="text-base font-semibold text-foreground">Technical Rounds</h3>
-            {!loadingTechnicalRounds && !technicalHistoryError && technicalSessions.length === 0 && (
+            {!loadingTechnicalRounds && !technicalHistoryError && !hasTechnicalHistory && (
               <p className="mt-1 text-sm text-muted-foreground">Your completed technical rounds will appear here.</p>
             )}
           </div>
-          {(loadingTechnicalRounds || Boolean(technicalHistoryError) || technicalSessions.length > 0) && <div className="max-w-full overflow-x-auto">
+          {(loadingTechnicalRounds || Boolean(technicalHistoryError) || hasTechnicalHistory) && <div className="max-w-full overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="border-b border-border">
@@ -624,7 +652,7 @@ function InterviewContent({
                             }}
                           >
                             <Eye className="h-3.5 w-3.5" />
-                            {session.cta?.label || "Report unavailable"}
+                            {session.cta?.nav === "unavailable" ? "Report not ready" : session.cta?.label || "Report not ready"}
                           </Button>
                         </td>
                       </tr>
@@ -637,13 +665,13 @@ function InterviewContent({
         </div>
       ) : (
       <div className="dashboard-card overflow-hidden p-0">
-        <div className={interviews.length === 0 ? "p-5" : "border-b border-border/20 p-6"}>
+        <div className={!hasPastInterviews ? "p-5" : "border-b border-border/20 p-6"}>
           <h3 className="text-base font-semibold text-foreground">Past Interviews</h3>
-          {interviews.length === 0 && (
+          {!hasPastInterviews && (
             <p className="mt-1 text-sm text-muted-foreground">Your completed interview rounds will appear here.</p>
           )}
         </div>
-        {interviews.length > 0 && <div className="max-w-full overflow-x-auto">
+        {hasPastInterviews && <div className="max-w-full overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr className="border-b border-border">
@@ -738,7 +766,7 @@ function InterviewContent({
                         ) : (
                           <Eye className="h-3.5 w-3.5" />
                         )}
-                        {interview.cta?.label || "View Full Report"}
+                        {interview.cta?.nav === "unavailable" ? "Report not ready" : interview.cta?.label || "View Full Report"}
                       </Button>
                     </td>
                   </tr>
@@ -1574,11 +1602,7 @@ function MembershipContent() {
       <div className="mb-6 rounded-xl card-elevated p-7">
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
-            <p className="text-xs font-semibold text-muted-foreground/70">Pricing</p>
             <h2 className="mt-2 text-2xl font-semibold tracking-tight text-foreground">Plans for every stage of prep.</h2>
-            <p className="mt-1.5 max-w-2xl text-sm leading-6 text-muted-foreground">
-              Free gives you one AI mock interview per week. Upgrade when you need technical assessments, custom JD-based rounds, and higher weekly limits.
-            </p>
             <p className="mt-3 text-sm font-medium text-primary">
               Early Bird: register by 31 August 2026 to get Premium free for 30 days.
             </p>
@@ -1612,15 +1636,12 @@ function MembershipContent() {
         <div className="flex flex-col rounded-xl card-elevated p-7">
           <div className="mb-5">
               <h3 className="text-lg font-semibold text-foreground">Free</h3>
-            <p className="mt-1 text-sm leading-6 text-muted-foreground">Explore the feedback system</p>
           </div>
           <div className="mb-3">
             <div className="flex items-baseline gap-1">
               <span className="text-3xl font-bold tracking-tight text-foreground">Free</span>
             </div>
           </div>
-          <p className="mb-5 text-sm text-muted-foreground">Perfect for getting started and exploring the feedback system.</p>
-
           <div className="flex-1 space-y-2.5">
             {starterFeatures.map((f) => (
               <div key={f.text} className="flex items-start gap-2.5 text-sm">
@@ -1651,7 +1672,6 @@ function MembershipContent() {
           <div className="mb-5 flex items-start justify-between gap-3">
             <div>
               <h3 className="text-lg font-semibold text-foreground">Pro</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">Master interviews and build perfect answers</p>
             </div>
             <span className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-bold text-primary">Most popular</span>
           </div>
@@ -1675,7 +1695,6 @@ function MembershipContent() {
             </div>
             {isAnnual && <p className="mt-1 text-xs font-medium text-muted-foreground">billed {fmt(proPricing.annualBilled)} / year</p>}
           </div>
-          <p className="mb-5 text-sm text-muted-foreground">Designed for serious candidates who want to master interviews and build perfect answers.</p>
           <div className="flex-1 space-y-2.5">
             {proFeatures.map((f) => (
               <div key={f.text} className="flex items-start gap-2.5 text-sm">
@@ -1706,7 +1725,6 @@ function MembershipContent() {
           <div className="mb-5 flex items-start justify-between gap-3">
             <div>
               <h3 className="text-lg font-semibold text-foreground">Premium</h3>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">Custom rounds for elite preparation</p>
             </div>
             <span className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-semibold text-primary">Full package</span>
           </div>
@@ -1730,7 +1748,6 @@ function MembershipContent() {
             </div>
             {isAnnual && <p className="mt-1 text-xs font-medium text-muted-foreground">billed {fmt(premiumPricing.annualBilled)} / year</p>}
           </div>
-          <p className="mb-5 text-sm text-muted-foreground">The ultimate solution with custom rounds for elite preparation.</p>
           <div className="mb-5 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-primary">
             Register by 31 August 2026 and your first 30 days of Premium are free.
           </div>
@@ -1854,6 +1871,7 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
         return null
     }
   }
+  const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [activeNav, _setActiveNav] = useState<ActiveNav>(() => {
     const normalizedInitial = normalizeNav(initialTab)
     if (normalizedInitial) return normalizedInitial
@@ -1863,8 +1881,13 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
     }
     return "interview"
   })
+  const activeNavRef = useRef<ActiveNav>(activeNav)
+  activeNavRef.current = activeNav
   const setActiveNav = (nav: ActiveNav) => {
+    if (nav === activeNavRef.current) return
+    activeNavRef.current = nav
     _setActiveNav(nav)
+    setRefreshTrigger((value) => value + 1)
     safeStorageSet("session", "dashboard_tab", nav)
   }
   const [showLogout, setShowLogout] = useState(false)
@@ -1891,7 +1914,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
   const learningReconcileAttemptedRef = useRef(false)
   const [interviews, setInterviews] = useState<PastInterview[]>([])
   const [streakDays, setStreakDays] = useState(0)
-  const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [improveTarget, setImproveTarget] = useState<ExactImproveTarget | null>(initialImproveTarget)
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -2327,9 +2349,11 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                 case "coding":
                   return (
                     <InterviewContent
+                      key={activeNav}
                       interviews={interviews}
                       setActiveNav={setActiveNav}
                       mode={activeNav === "coding" ? "technical" : "interview"}
+                      refreshKey={refreshTrigger}
                       onProfilesChanged={() => setRefreshTrigger((value) => value + 1)}
                     />
                   )

@@ -119,6 +119,14 @@ def test_blueprint_question_shape_is_server_owned_for_all_four_profiles():
             "round_config": {},
         }
 
+    assert blueprint_api.server_owned_interview_policy("top_tier", "technical") == {
+        "difficulty_level": "adaptive",
+        "duration_minutes": 80,
+        "focus": ["mixed"],
+        "question_count": 2,
+        "round_config": {},
+    }
+
 
 def test_preset_blueprint_uses_resume_context_without_a_saved_job_profile():
     target = blueprint_api._resolve_blueprint_job_target(
