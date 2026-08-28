@@ -8,7 +8,7 @@
 #   - build_premium_report() entry point
 #   - _build_technical_track() -> Track A (Technical Round)
 #   - _build_behavioral_track() -> Track B (Mock Interview)
-#   - Shared helpers: integrity, unknown-unknowns, executive summary
+#   - Shared helpers: self-review signals, unknown-unknowns, executive summary
 # CONSUMED BY: analysis_pipeline.py (report_generation stage)
 # DATA TABLES: none (returns dict merged into report_json)
 # ============================================================================
@@ -39,8 +39,8 @@ def build_premium_report(
     if _premium_evidence_is_limited(is_technical, stage_outputs, heuristic_report):
         return _evidence_limited_premium(is_technical, heuristic_report)
 
-    cheating = stage_outputs.get("cheating_risk", {})
-    integrity = _build_integrity_verdict(cheating, stage_outputs.get("video_features", {}))
+    self_review = stage_outputs.get("self_review_signals", {})
+    integrity = _build_self_review_verdict(self_review, stage_outputs.get("video_features", {}))
 
     if is_technical:
         track = _build_technical_track(stage_outputs, heuristic_report)
@@ -53,7 +53,7 @@ def build_premium_report(
     return {
         "track": "technical" if is_technical else "behavioral",
         "executive_summary": executive,
-        "session_integrity_verdict": integrity,
+        "self_review_verdict": integrity,
         "unknown_unknowns": unknowns,
         **track,
     }
@@ -83,7 +83,7 @@ def _evidence_limited_premium(is_technical: bool, report: Dict[str, Any]) -> Dic
     return {
         "track": "technical" if is_technical else "behavioral",
         "executive_summary": reason,
-        "session_integrity_verdict": {"grade": None, "label": "Not assessed", "risk_score": None, "high_severity_event_count": 0, "total_event_count": 0},
+        "self_review_verdict": {"label": "Self-review only", "signal_count": 0, "mode": "self_review"},
         "unknown_unknowns": [],
         "evidence_limited": True,
         "evidence_reason": reason,
@@ -449,13 +449,13 @@ def _build_behavioral_track(
     nlp = outputs.get("nlp_content", {})
     audio = outputs.get("audio_features", {})
     video = outputs.get("video_features", {})
-    cheating = outputs.get("cheating_risk", {})
+    self_review = outputs.get("self_review_signals", {})
     turns = nlp.get("turns") or []
 
     return {
         "content_accuracy": _content_accuracy(turns, report),
         "vocal_delivery": _vocal_delivery(audio, turns),
-        "proctoring_audit": _proctoring_audit(cheating, video),
+        "self_review_signals": _self_review_signals(self_review, video),
     }
 
 
@@ -665,127 +665,44 @@ def _vocal_delivery(
     }
 
 
-def _proctoring_audit(
-    cheating: Dict[str, Any],
+def _self_review_signals(
+    self_review: Dict[str, Any],
     video: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Proctoring & Anti-Cheat Audit."""
-    events = cheating.get("events") or []
-    risk_score = cheating.get("risk_score") or 0
-    risk_level = cheating.get("risk_level") or "Low"
-    media_flags = cheating.get("media_flags") or []
-    code_flags = cheating.get("code_flags") or []
-    eye_contact = video.get("eye_contact_percent") or 0
+    """Summarize optional coaching signals without judging the user."""
+    events = self_review.get("events") or []
     video_flags = video.get("flags") or []
-
     details: List[Dict[str, Any]] = []
-    severity = "info"
-
-    HIGH_SEVERITY_EVENTS = {
-        "paste", "large_paste", "clipboard_code", "large_code_jump",
-        "second_speaker", "multiple_faces", "multiple_people_detected",
-        "mobile_phone_detected", "identity_mismatch", "screen_not_monitor",
-        "suspicious_clipboard_pattern", "visible_output_hardcode",
-    }
-
-    MEDIUM_SEVERITY_EVENTS = {
-        "fullscreen_exit", "tab_switch", "window_blur", "paste_blocked",
-        "face_missing", "gaze_offscreen", "no_clarification_before_coding",
-    }
-
     for event in events:
-        event_type = event.get("event_type", "")
+        event_type = str(event.get("event_type") or "signal")
         count = int(event.get("count") or 0)
-        event_severity = event.get("severity") or "medium"
-
-        if event_type in HIGH_SEVERITY_EVENTS and count > 0:
-            severity = "critical"
+        if count > 0:
             details.append({
                 "event_type": event_type.replace("_", " ").title(),
                 "count": count,
-                "event_severity": "critical",
-                "explanation": (
-                    f"{event_type.replace('_', ' ').title()} detected {count} time(s). "
-                    "This is a high-severity integrity violation that would be flagged "
-                    "in a proctored interview environment."
-                ),
+                "event_severity": "info",
+                "explanation": "Optional coaching observed this signal for your private self-review. It is not a cheating or hiring decision.",
             })
-        elif event_type in MEDIUM_SEVERITY_EVENTS and count > 0:
-            severity = "warning" if severity == "info" else severity
-            details.append({
-                "event_type": event_type.replace("_", " ").title(),
-                "count": count,
-                "event_severity": "warning",
-                "explanation": (
-                    f"{event_type.replace('_', ' ').title()} detected {count} time(s). "
-                    "While not conclusive, repeated occurrences compromise session integrity."
-                ),
-            })
-
-    # Eye contact anomalies
-    if eye_contact < 40 and eye_contact > 0:
-        severity = "warning" if severity == "info" else severity
-        details.append({
-            "event_type": "Low Eye Contact",
-            "event_severity": "warning",
-            "explanation": (
-                f"Eye contact percentage: {eye_contact}% — significantly below the 60% threshold. "
-                "Persistent off-screen gaze in a proctored environment raises integrity concerns."
-            ),
-        })
-
     for flag in video_flags:
-        if isinstance(flag, dict) and flag.get("event_type") == "face_missing":
-            severity = "warning" if severity == "info" else severity
+        if isinstance(flag, dict) and int(flag.get("count") or 0) > 0:
             details.append({
-                "event_type": "Face Not Detected",
-                "count": flag.get("count", 0),
-                "event_severity": "warning",
-                "explanation": (
-                    f"Face was not detected {flag.get('count', 0)} times during the session. "
-                    "Ensure your camera is positioned correctly and your face remains visible."
-                ),
+                "event_type": str(flag.get("event_type") or "camera signal").replace("_", " ").title(),
+                "count": int(flag.get("count") or 0),
+                "event_severity": "info",
+                "explanation": "Optional camera coaching produced a self-review signal. The signal does not invalidate the session.",
             })
-
     if not details:
         details.append({
-            "event_type": "Clean Session",
+            "event_type": "No optional signals",
             "event_severity": "info",
-            "explanation": (
-                "No integrity anomalies detected. Session appears to have been conducted "
-                "in a clean, proctored-compatible environment."
-            ),
+            "explanation": "No optional coaching signals were recorded for this session.",
         })
-
-    # Integrity grade
-    if risk_score >= 60:
-        grade = "F"
-    elif risk_score >= 45:
-        grade = "D"
-    elif risk_score >= 30:
-        grade = "C"
-    elif risk_score >= 15:
-        grade = "B"
-    else:
-        grade = "A"
-
     return {
-        "title": "Proctoring & Anti-Cheat Audit",
-        "severity": severity,
-        "verdict": (
-            f"Session integrity: Grade {grade}. "
-            + (
-                "Severe violations detected — this session would be invalidated in a real proctored exam."
-                if severity == "critical" else
-                "Minor integrity concerns flagged."
-                if severity == "warning" else
-                "Session integrity is clean."
-            )
-        ),
+        "title": "Optional self-review signals",
+        "severity": "info",
+        "verdict": "These signals are private coaching context only; PrepMate does not score or label them as cheating.",
         "details": details,
-        "integrity_grade": grade,
-        "risk_score": risk_score,
-        "risk_level": risk_level,
+        "mode": "self_review",
     }
 
 
@@ -793,39 +710,15 @@ def _proctoring_audit(
 #  Shared Builders
 # ──────────────────────────────────────────
 
-def _build_integrity_verdict(
-    cheating: Dict[str, Any],
+def _build_self_review_verdict(
+    self_review: Dict[str, Any],
     video: Dict[str, Any],
 ) -> Dict[str, Any]:
-    risk_score = cheating.get("risk_score") or 0
-    events = cheating.get("events") or []
-    high_severity_count = sum(
-        1 for e in events
-        if e.get("severity") == "high" and int(e.get("count") or 0) > 0
-    )
-
-    if risk_score >= 60 or high_severity_count >= 3:
-        grade = "F"
-        label = "Compromised"
-    elif risk_score >= 40 or high_severity_count >= 2:
-        grade = "D"
-        label = "Suspect"
-    elif risk_score >= 25 or high_severity_count >= 1:
-        grade = "C"
-        label = "Caution"
-    elif risk_score >= 10:
-        grade = "B"
-        label = "Minor flags"
-    else:
-        grade = "A"
-        label = "Clean"
-
+    events = self_review.get("events") or []
     return {
-        "grade": grade,
-        "label": label,
-        "risk_score": risk_score,
-        "high_severity_event_count": high_severity_count,
-        "total_event_count": sum(int(e.get("count") or 0) for e in events),
+        "label": "Self-review only",
+        "signal_count": sum(int(e.get("count") or 0) for e in events),
+        "mode": "self_review",
     }
 
 
@@ -916,29 +809,8 @@ def _build_unknown_unknowns(
                     ),
                 })
 
-        # Proctoring unknowns
-        proctor = track.get("proctoring_audit", {})
-        if proctor.get("severity") in {"critical", "warning"}:
-            unknowns.append({
-                "title": "Your tab-switching behavior was logged",
-                "insight": (
-                    "Every time you switched tabs or lost window focus, it was recorded. "
-                    "In a real proctored interview, this data is reviewed by the hiring team. "
-                    "Even if you were just checking a syntax reference, the pattern creates "
-                    "a negative signal."
-                ),
-            })
-
-    # Integrity unknown (both tracks)
-    if integrity.get("grade") in {"C", "D", "F"}:
-        unknowns.append({
-            "title": "Your session integrity score is visible to reviewers",
-            "insight": (
-                f"Your session received an integrity grade of {integrity['grade']}. "
-                "In a real hiring pipeline, this grade is attached to your candidate profile "
-                "and visible to recruiters before they even read your answers."
-            ),
-        })
+        # Optional camera/screen observations remain private coaching context;
+        # they are deliberately excluded from performance unknowns.
 
     # Always add at least one insight
     if not unknowns:
@@ -974,14 +846,14 @@ def _build_executive_summary(
     """2-3 sentence brutally honest executive summary."""
     overall = report.get("overall_score") or 0
     readiness = report.get("readiness_label") or "Unknown"
-    grade = integrity.get("grade", "A")
+    review_note = "Optional coaching signals are private and are not used as a pass/fail judgment."
 
     if is_technical:
         logic = track.get("logic_teardown", {})
         logic_severity = logic.get("severity", "info")
         if logic_severity == "critical":
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 "Your code compiled and ran, but the underlying logic is fundamentally broken. "
                 "You passed visible test cases and likely left the session with false confidence — "
                 "the hidden test cases tell a different story. Fix your algorithmic approach "
@@ -989,14 +861,14 @@ def _build_executive_summary(
             )
         elif overall >= 80:
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 f"Readiness: {readiness}. Your technical submission is solid — correctness, "
                 "complexity, and edge-case handling are all within acceptable range. "
                 "Focus now on verbalizing your thought process during coding."
             )
         else:
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 f"Readiness: {readiness}. Your submission shows partial understanding but "
                 "falls short of the bar. Review the optimal approach for this problem class "
                 "and practice with tighter time constraints."
@@ -1009,27 +881,27 @@ def _build_executive_summary(
 
         if content_severity == "critical":
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 "Multiple answers lacked the technical depth and specificity expected "
                 "at this interview level. Your verbal delivery may feel confident to you, "
                 "but the substance behind it is thin. Prioritize depth over breadth."
             )
         elif vocal_severity == "critical":
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 "Your content knowledge is adequate, but your vocal delivery is actively "
                 "undermining it. High filler word frequency and pacing issues project "
                 "uncertainty regardless of what you actually say."
             )
         elif overall >= 80:
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 f"Readiness: {readiness}. Strong session — your answers showed structured "
                 "thinking with concrete examples. Polish consistency across all questions."
             )
         else:
             return (
-                f"Overall score: {overall:.0f}/100. Session integrity: Grade {grade}. "
+                f"Overall score: {overall:.0f}/100. {review_note} "
                 f"Readiness: {readiness}. Your session shows promise but needs focused "
                 "work on answer depth, evidence quality, and delivery composure."
             )

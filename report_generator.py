@@ -20,6 +20,28 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _self_review_summary(value: Any) -> Dict[str, Any]:
+    """Expose optional coaching observations without punitive scoring."""
+    source = _as_dict(value)
+    events = []
+    for event in _as_list(source.get("events")):
+        if not isinstance(event, dict):
+            continue
+        count = int(event.get("count") or 0)
+        if count <= 0:
+            continue
+        events.append({
+            "event_type": _text(event.get("event_type") or "signal"),
+            "count": count,
+        })
+    return {
+        "mode": "self_review",
+        "signals": events,
+        "signal_count": sum(item["count"] for item in events),
+        "message": "Optional coaching signals are private context and are not a cheating, hiring, or pass/fail score.",
+    }
+
+
 def _number(value: Any) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
@@ -95,20 +117,20 @@ def _turn_status(turn: Dict[str, Any]) -> str:
         return "Not Answered"
     score = _number(turn.get("overall_score"))
     assessment = turn.get("assessment")
-    if not isinstance(assessment, dict) and score is None:
-        return "Unable to Evaluate"
     if turn.get("insufficient_evidence") or _as_dict(assessment).get("evidence_status") == "insufficient_evidence":
         return "Incomplete"
+    if score is None:
+        return "Unable to Evaluate"
     return "Completed"
 
 
 def _turn_score(turn: Dict[str, Any], status: str) -> float | None:
     if status == "Not Answered":
         return 0.0
-    if status == "Unable to Evaluate":
+    if status in {"Incomplete", "Unable to Evaluate"}:
         return None
     score = _number(turn.get("overall_score"))
-    return round(max(0.0, min(100.0, score)), 1) if score is not None else 0.0
+    return round(max(0.0, min(100.0, score)), 1) if score is not None else None
 
 
 def _structure_status(turn: Dict[str, Any]) -> Dict[str, str]:
@@ -223,7 +245,7 @@ def _interview_score_breakdown(turns: List[Dict[str, Any]]) -> List[Dict[str, An
     for key, label, source_keys in mappings:
         values: List[float] = []
         for turn in turns:
-            if _turn_status(turn) in {"Not Answered", "Unable to Evaluate"}:
+            if _turn_status(turn) != "Completed":
                 continue
             scores = _as_dict(turn.get("rubric_scores"))
             values.extend(score for name, score in scores.items() if name in source_keys and _number(score) is not None)
@@ -279,19 +301,40 @@ def build_async_behavioral_report(
     nlp_output: Dict[str, Any],
     audio_output: Dict[str, Any],
     video_output: Dict[str, Any],
-    cheating_output: Dict[str, Any],
+    self_review_output: Dict[str, Any],
 ) -> Dict[str, Any]:
-    raw_turns = [turn for turn in _as_list(nlp_output.get("turns")) if isinstance(turn, dict)]
+    raw_turns = [
+        turn
+        for turn in _as_list(nlp_output.get("turns"))
+        if isinstance(turn, dict)
+        and not turn.get("scoring_excluded")
+        and str(turn.get("question_type") or "").strip().lower() not in {"warmup", "introduction"}
+    ]
     questions = [_question_analysis(turn, index + 1) for index, turn in enumerate(raw_turns)]
-    eligible_scores = [item["score"] for item in questions if item["status"] != "Unable to Evaluate" and item["score"] is not None]
+    gradable = [
+        item
+        for item in questions
+        if item["status"] == "Completed" and item["score"] is not None
+    ]
+    eligible_scores = [
+        item["score"]
+        for item in questions
+        if item["status"] in {"Completed", "Not Answered"} and item["score"] is not None
+    ]
     overall_score = _average(eligible_scores)
-    if overall_score is None and questions and all(item["status"] == "Not Answered" for item in questions):
+    all_not_answered = bool(questions) and all(item["status"] == "Not Answered" for item in questions)
+    no_candidate_evidence = not questions or all_not_answered
+    if all_not_answered:
         overall_score = 0.0
+    elif not gradable:
+        overall_score = None
     answered = [item for item in questions if item["status"] not in {"Not Answered", "Unable to Evaluate"}]
     fully = [item for item in questions if item["fully_answered"]]
     partial = [item for item in questions if item["partially_answered"]]
     not_answered = [item for item in questions if item["status"] == "Not Answered"]
+    incomplete = [item for item in questions if item["status"] == "Incomplete"]
     unable = [item for item in questions if item["status"] == "Unable to Evaluate"]
+    ungradable = [*incomplete, *unable]
     covered_strengths = _unique_strings(
         point
         for item in questions
@@ -299,7 +342,7 @@ def build_async_behavioral_report(
     )
     round_analysis = _interview_round_analysis(raw_turns, questions)
     score_breakdown = _interview_score_breakdown(raw_turns)
-    status = "sufficient" if answered else ("no_candidate_evidence" if not unable else "insufficient_evidence")
+    status = "sufficient" if gradable else ("no_candidate_evidence" if no_candidate_evidence else "insufficient_evidence")
     summary = f"{len(answered)} of {len(questions)} questions answered; {len(fully)} fully answered, {len(partial)} partially answered, {len(not_answered)} not answered."
     return {
         "version": "evidence-report-v1",
@@ -325,9 +368,9 @@ def build_async_behavioral_report(
             "reason": "Scores use persisted question responses and append-only evaluator evidence.",
         },
         "evidence_summary": {
-            "turns_scored": len(answered),
+            "turns_scored": len(gradable),
             "turns_with_evidence": sum(1 for item in questions if item["what_was_good"] or item["what_reduced_score"]),
-            "insufficient_evidence_turns": len(unable),
+            "insufficient_evidence_turns": len(ungradable),
         },
         "behavioral_metrics": {
             "average_response_time_seconds": _average(item.get("time_used_seconds") for item in questions),
@@ -340,9 +383,9 @@ def build_async_behavioral_report(
         "per_turn_feedback": questions,
         "round_analysis": round_analysis,
         "timeline": _timeline_from_turns(raw_turns),
-        "integrity_summary": _as_dict(cheating_output),
-        "candidate_visible_integrity": _as_dict(cheating_output),
-        "report_state": "ready",
+        "self_review_summary": _self_review_summary(self_review_output),
+        "candidate_visible_self_review": _self_review_summary(self_review_output),
+        "report_state": "ready" if overall_score is not None else "ungradable",
         "ai_enhanced": False,
         "ai_provider_policy": "disabled_for_candidate_report",
         "ai_fallback_reason": None,
@@ -589,7 +632,7 @@ def build_async_technical_report(
     profile_type: str,
     nlp_output: Dict[str, Any],
     technical_output: Dict[str, Any],
-    cheating_output: Dict[str, Any],
+    self_review_output: Dict[str, Any],
 ) -> Dict[str, Any]:
     rows = _technical_rows(technical_output)
     activity_events = [item for item in _as_list(technical_output.get("activity_events")) if isinstance(item, dict)]
@@ -604,9 +647,14 @@ def build_async_technical_report(
         ]
     max_points = sum(item["max_points"] for item in problems if item["status"] != "Unable to Evaluate")
     earned_points = sum(item["score_points"] or 0.0 for item in problems if item["status"] != "Unable to Evaluate")
-    overall_score = round((earned_points / max_points) * 100, 1) if max_points else None
     attempted = [item for item in problems if item["status"] != "Not Attempted"]
     submitted = [item for item in problems if item["final_submission"]]
+    assessed_responses = [item for item in problems if item["status"] == "Completed" and item["score"] is not None]
+    overall_score = (
+        round((earned_points / max_points) * 100, 1)
+        if max_points and (submitted or assessed_responses)
+        else None
+    )
     solved = [
         item for item in submitted
         if item["final_run"] and item["final_run"]["total"] > 0 and item["final_run"]["passed"] == item["final_run"]["total"]
@@ -682,8 +730,8 @@ def build_async_technical_report(
         "round_analysis": _technical_round_analysis(problems),
         "timeline": activity_events,
         "strengths": [],
-        "integrity_summary": _as_dict(cheating_output),
-        "candidate_visible_integrity": _as_dict(cheating_output),
+        "self_review_summary": _self_review_summary(self_review_output),
+        "candidate_visible_self_review": _self_review_summary(self_review_output),
         "report_state": "ready",
         "ai_enhanced": False,
         "ai_provider_policy": "disabled_for_candidate_report",

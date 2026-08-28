@@ -1,0 +1,772 @@
+{
+  "lockfile": "requirements-ocr.lock.txt",
+  "packages": [
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/aistudio-sdk/0.3.9/json",
+      "name": "aistudio-sdk",
+      "normalized_name": "aistudio-sdk",
+      "requirement": "aistudio-sdk==0.3.9",
+      "version": "0.3.9"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/annotated-doc/0.0.5/json",
+      "name": "annotated-doc",
+      "normalized_name": "annotated-doc",
+      "requirement": "annotated-doc==0.0.5",
+      "version": "0.0.5"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/annotated-types/0.8.0/json",
+      "name": "annotated-types",
+      "normalized_name": "annotated-types",
+      "requirement": "annotated-types==0.8.0",
+      "version": "0.8.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/anyio/4.14.2/json",
+      "name": "anyio",
+      "normalized_name": "anyio",
+      "requirement": "anyio==4.14.2",
+      "version": "4.14.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/attrs/26.1.0/json",
+      "name": "attrs",
+      "normalized_name": "attrs",
+      "requirement": "attrs==26.1.0",
+      "version": "26.1.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache License 2.0",
+      "metadata_url": "https://pypi.org/pypi/bce-python-sdk/0.9.76/json",
+      "name": "bce-python-sdk",
+      "normalized_name": "bce-python-sdk",
+      "requirement": "bce-python-sdk==0.9.76",
+      "version": "0.9.76"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MPL-2.0",
+      "metadata_url": "https://pypi.org/pypi/certifi/2026.7.22/json",
+      "name": "certifi",
+      "normalized_name": "certifi",
+      "requirement": "certifi==2026.7.22",
+      "version": "2026.7.22"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT-0",
+      "metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+      "name": "cffi",
+      "normalized_name": "cffi",
+      "requirement": "cffi==2.1.1",
+      "version": "2.1.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "0BSD",
+      "metadata_url": "https://pypi.org/pypi/chardet/7.6.0/json",
+      "name": "chardet",
+      "normalized_name": "chardet",
+      "requirement": "chardet==7.6.0",
+      "version": "7.6.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/charset-normalizer/3.5.1/json",
+      "name": "charset-normalizer",
+      "normalized_name": "charset-normalizer",
+      "requirement": "charset-normalizer==3.5.1",
+      "version": "3.5.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/click/8.4.2/json",
+      "name": "click",
+      "normalized_name": "click",
+      "requirement": "click==8.4.2",
+      "version": "8.4.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT License",
+      "metadata_url": "https://pypi.org/pypi/colorlog/6.12.0/json",
+      "name": "colorlog",
+      "normalized_name": "colorlog",
+      "requirement": "colorlog==6.12.0",
+      "version": "6.12.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "LGPL-2.1-or-later",
+      "metadata_url": "https://pypi.org/pypi/crc32c/2.8/json",
+      "name": "crc32c",
+      "normalized_name": "crc32c",
+      "requirement": "crc32c==2.8",
+      "version": "2.8"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/cryptography/50.0.0/json",
+      "name": "cryptography",
+      "normalized_name": "cryptography",
+      "requirement": "cryptography==50.0.0",
+      "version": "50.0.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache License, Version 2.0",
+      "metadata_url": "https://pypi.org/pypi/distro/1.9.0/json",
+      "name": "distro",
+      "normalized_name": "distro",
+      "requirement": "distro==1.9.0",
+      "version": "1.9.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/fastapi/0.141.1/json",
+      "name": "fastapi",
+      "normalized_name": "fastapi",
+      "requirement": "fastapi==0.141.1",
+      "version": "0.141.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/filelock/3.32.3/json",
+      "name": "filelock",
+      "normalized_name": "filelock",
+      "requirement": "filelock==3.32.3",
+      "version": "3.32.3"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "license_source": "https://raw.githubusercontent.com/fsspec/filesystem_spec/9e22b60ea6e96fbe8635e88cc71909bdd2850e60/LICENSE",
+      "metadata_url": "https://pypi.org/pypi/fsspec/2026.7.0/json",
+      "name": "fsspec",
+      "normalized_name": "fsspec",
+      "requirement": "fsspec==2026.7.0",
+      "version": "2026.7.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/future/1.0.0/json",
+      "name": "future",
+      "normalized_name": "future",
+      "requirement": "future==1.0.0",
+      "version": "1.0.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/h11/0.16.0/json",
+      "name": "h11",
+      "normalized_name": "h11",
+      "requirement": "h11==0.16.0",
+      "version": "0.16.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/hf-xet/1.6.0/json",
+      "name": "hf-xet",
+      "normalized_name": "hf-xet",
+      "requirement": "hf-xet==1.6.0",
+      "version": "1.6.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/httpcore/1.0.9/json",
+      "name": "httpcore",
+      "normalized_name": "httpcore",
+      "requirement": "httpcore==1.0.9",
+      "version": "1.0.9"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/httptools/0.8.0/json",
+      "name": "httptools",
+      "normalized_name": "httptools",
+      "requirement": "httptools==0.8.0",
+      "version": "0.8.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/httpx/0.28.1/json",
+      "name": "httpx",
+      "normalized_name": "httpx",
+      "requirement": "httpx==0.28.1",
+      "version": "0.28.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/huggingface-hub/1.28.0/json",
+      "name": "huggingface-hub",
+      "normalized_name": "huggingface-hub",
+      "requirement": "huggingface-hub==1.28.0",
+      "version": "1.28.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/idna/3.19/json",
+      "name": "idna",
+      "normalized_name": "idna",
+      "requirement": "idna==3.19",
+      "version": "3.19"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/imagesize/2.0.0/json",
+      "name": "imagesize",
+      "normalized_name": "imagesize",
+      "requirement": "imagesize==2.0.0",
+      "version": "2.0.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT License",
+      "metadata_url": "https://pypi.org/pypi/jaraco-classes/3.4.0/json",
+      "name": "jaraco.classes",
+      "normalized_name": "jaraco-classes",
+      "requirement": "jaraco-classes==3.4.0",
+      "version": "3.4.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/jaraco-context/6.1.2/json",
+      "name": "jaraco.context",
+      "normalized_name": "jaraco-context",
+      "requirement": "jaraco-context==6.1.2",
+      "version": "6.1.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/jaraco-functools/4.6.0/json",
+      "name": "jaraco.functools",
+      "normalized_name": "jaraco-functools",
+      "requirement": "jaraco-functools==4.6.0",
+      "version": "4.6.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/jiter/0.16.0/json",
+      "name": "jiter",
+      "normalized_name": "jiter",
+      "requirement": "jiter==0.16.0",
+      "version": "0.16.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/jsonschema/4.26.0/json",
+      "name": "jsonschema",
+      "normalized_name": "jsonschema",
+      "requirement": "jsonschema==4.26.0",
+      "version": "4.26.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/jsonschema-specifications/2025.9.1/json",
+      "name": "jsonschema-specifications",
+      "normalized_name": "jsonschema-specifications",
+      "requirement": "jsonschema-specifications==2025.9.1",
+      "version": "2025.9.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/keyring/25.7.0/json",
+      "name": "keyring",
+      "normalized_name": "keyring",
+      "requirement": "keyring==25.7.0",
+      "version": "25.7.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/lxml/6.1.2/json",
+      "name": "lxml",
+      "normalized_name": "lxml",
+      "requirement": "lxml==6.1.2",
+      "version": "6.1.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/modelscope/1.39.1/json",
+      "name": "modelscope",
+      "normalized_name": "modelscope",
+      "requirement": "modelscope==1.39.1",
+      "version": "1.39.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/modelscope-hub/0.2.0/json",
+      "name": "modelscope-hub",
+      "normalized_name": "modelscope-hub",
+      "requirement": "modelscope-hub==0.2.0",
+      "version": "0.2.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/more-itertools/11.1.0/json",
+      "name": "more-itertools",
+      "normalized_name": "more-itertools",
+      "requirement": "more-itertools==11.1.0",
+      "version": "11.1.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/networkx/3.6.1/json",
+      "name": "networkx",
+      "normalized_name": "networkx",
+      "requirement": "networkx==3.6.1",
+      "version": "3.6.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "metadata_url": "https://pypi.org/pypi/numpy/2.5.2/json",
+      "name": "numpy",
+      "normalized_name": "numpy",
+      "requirement": "numpy==2.5.2",
+      "version": "2.5.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/openai/2.15.0/json",
+      "name": "openai",
+      "normalized_name": "openai",
+      "requirement": "openai==2.15.0",
+      "version": "2.15.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache 2.0",
+      "metadata_url": "https://pypi.org/pypi/opencv-contrib-python/4.10.0.84/json",
+      "name": "opencv-contrib-python",
+      "normalized_name": "opencv-contrib-python",
+      "requirement": "opencv-contrib-python==4.10.0.84",
+      "version": "4.10.0.84"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/opt-einsum/3.3.0/json",
+      "name": "opt-einsum",
+      "normalized_name": "opt-einsum",
+      "requirement": "opt-einsum==3.3.0",
+      "version": "3.3.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0 OR BSD-2-Clause",
+      "metadata_url": "https://pypi.org/pypi/packaging/26.3/json",
+      "name": "packaging",
+      "normalized_name": "packaging",
+      "requirement": "packaging==26.3",
+      "version": "26.3"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache License 2.0",
+      "metadata_url": "https://pypi.org/pypi/paddleocr/3.3.3/json",
+      "name": "paddleocr",
+      "normalized_name": "paddleocr",
+      "requirement": "paddleocr==3.3.3",
+      "version": "3.3.3"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache Software License",
+      "metadata_url": "https://pypi.org/pypi/paddlepaddle/3.2.2/json",
+      "name": "paddlepaddle",
+      "normalized_name": "paddlepaddle",
+      "requirement": "paddlepaddle==3.2.2 ; python_version < \"3.14\"",
+      "version": "3.2.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/paddlex/3.3.13/json",
+      "name": "paddlex",
+      "normalized_name": "paddlex",
+      "requirement": "paddlex==3.3.13",
+      "version": "3.3.13"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD 3-Clause License Copyright (c) 2008-2011, AQR Capital Management, LLC, Lambda Foundry, Inc. and PyData Development Team All rights reserved. Copyright (c) 2011-2026, Open source contributors. Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met: * Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer. * Redistributions in binary form m",
+      "metadata_url": "https://pypi.org/pypi/pandas/3.0.5/json",
+      "name": "pandas",
+      "normalized_name": "pandas",
+      "requirement": "pandas==3.0.5",
+      "version": "3.0.5"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT-CMU",
+      "metadata_url": "https://pypi.org/pypi/pillow/12.3.0/json",
+      "name": "pillow",
+      "normalized_name": "pillow",
+      "requirement": "pillow==12.3.0",
+      "version": "12.3.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/prettytable/3.18.0/json",
+      "name": "prettytable",
+      "normalized_name": "prettytable",
+      "requirement": "prettytable==3.18.0",
+      "version": "3.18.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "3-Clause BSD License",
+      "metadata_url": "https://pypi.org/pypi/protobuf/7.35.1/json",
+      "name": "protobuf",
+      "normalized_name": "protobuf",
+      "requirement": "protobuf==7.35.1",
+      "version": "7.35.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/psutil/7.2.2/json",
+      "name": "psutil",
+      "normalized_name": "psutil",
+      "requirement": "psutil==7.2.2",
+      "version": "7.2.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/py-cpuinfo/9.0.0/json",
+      "name": "py-cpuinfo",
+      "normalized_name": "py-cpuinfo",
+      "requirement": "py-cpuinfo==9.0.0",
+      "version": "9.0.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/pyclipper/1.4.0/json",
+      "name": "pyclipper",
+      "normalized_name": "pyclipper",
+      "requirement": "pyclipper==1.4.0",
+      "version": "1.4.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/pycparser/3.0/json",
+      "name": "pycparser",
+      "normalized_name": "pycparser",
+      "requirement": "pycparser==3.0",
+      "version": "3.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD, Public Domain",
+      "metadata_url": "https://pypi.org/pypi/pycryptodome/3.23.0/json",
+      "name": "pycryptodome",
+      "normalized_name": "pycryptodome",
+      "requirement": "pycryptodome==3.23.0",
+      "version": "3.23.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/pydantic/2.11.7/json",
+      "name": "pydantic",
+      "normalized_name": "pydantic",
+      "requirement": "pydantic==2.11.7",
+      "version": "2.11.7"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/pydantic-core/2.33.2/json",
+      "name": "pydantic_core",
+      "normalized_name": "pydantic-core",
+      "requirement": "pydantic-core==2.33.2",
+      "version": "2.33.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "(Apache-2.0 OR BSD-3-Clause) AND LicenseRef-PdfiumThirdParty",
+      "metadata_url": "https://pypi.org/pypi/pypdfium2/4.30.0/json",
+      "name": "pypdfium2",
+      "normalized_name": "pypdfium2",
+      "requirement": "pypdfium2==4.30.0",
+      "version": "4.30.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "GNU Library or Lesser General Public License (LGPL)",
+      "metadata_url": "https://pypi.org/pypi/python-bidi/0.6.11/json",
+      "name": "python-bidi",
+      "normalized_name": "python-bidi",
+      "requirement": "python-bidi==0.6.11",
+      "version": "0.6.11"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Dual License",
+      "metadata_url": "https://pypi.org/pypi/python-dateutil/2.9.0.post0/json",
+      "name": "python-dateutil",
+      "normalized_name": "python-dateutil",
+      "requirement": "python-dateutil==2.9.0.post0",
+      "version": "2.9.0.post0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/python-docx/1.2.0/json",
+      "name": "python-docx",
+      "normalized_name": "python-docx",
+      "requirement": "python-docx==1.2.0",
+      "version": "1.2.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/python-dotenv/1.2.3/json",
+      "name": "python-dotenv",
+      "normalized_name": "python-dotenv",
+      "requirement": "python-dotenv==1.2.3",
+      "version": "1.2.3"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/python-multipart/0.0.32/json",
+      "name": "python-multipart",
+      "normalized_name": "python-multipart",
+      "requirement": "python-multipart==0.0.32",
+      "version": "0.0.32"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/pyyaml/6.0.2/json",
+      "name": "PyYAML",
+      "normalized_name": "pyyaml",
+      "requirement": "pyyaml==6.0.2",
+      "version": "6.0.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/referencing/0.37.0/json",
+      "name": "referencing",
+      "normalized_name": "referencing",
+      "requirement": "referencing==0.37.0",
+      "version": "0.37.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/requests/2.34.2/json",
+      "name": "requests",
+      "normalized_name": "requests",
+      "requirement": "requests==2.34.2",
+      "version": "2.34.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/rpds-py/2026.6.3/json",
+      "name": "rpds-py",
+      "normalized_name": "rpds-py",
+      "requirement": "rpds-py==2026.6.3",
+      "version": "2026.6.3"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/ruamel-yaml/0.19.1/json",
+      "name": "ruamel.yaml",
+      "normalized_name": "ruamel-yaml",
+      "requirement": "ruamel-yaml==0.19.1",
+      "version": "0.19.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "Apache Software License",
+      "metadata_url": "https://pypi.org/pypi/safetensors/0.8.0/json",
+      "name": "safetensors",
+      "normalized_name": "safetensors",
+      "requirement": "safetensors==0.8.0",
+      "version": "0.8.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/setuptools/84.0.0/json",
+      "name": "setuptools",
+      "normalized_name": "setuptools",
+      "requirement": "setuptools==84.0.0",
+      "version": "84.0.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD 3-Clause",
+      "metadata_url": "https://pypi.org/pypi/shapely/2.1.2/json",
+      "name": "shapely",
+      "normalized_name": "shapely",
+      "requirement": "shapely==2.1.2",
+      "version": "2.1.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/six/1.17.0/json",
+      "name": "six",
+      "normalized_name": "six",
+      "requirement": "six==1.17.0",
+      "version": "1.17.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT OR Apache-2.0",
+      "metadata_url": "https://pypi.org/pypi/sniffio/1.3.1/json",
+      "name": "sniffio",
+      "normalized_name": "sniffio",
+      "requirement": "sniffio==1.3.1",
+      "version": "1.3.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/starlette/1.6.0/json",
+      "name": "starlette",
+      "normalized_name": "starlette",
+      "requirement": "starlette==1.6.0",
+      "version": "1.6.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MPL-2.0 AND MIT",
+      "metadata_url": "https://pypi.org/pypi/tqdm/4.70.0/json",
+      "name": "tqdm",
+      "normalized_name": "tqdm",
+      "requirement": "tqdm==4.70.0",
+      "version": "4.70.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "PSF-2.0",
+      "metadata_url": "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+      "name": "typing-extensions",
+      "normalized_name": "typing-extensions",
+      "requirement": "typing-extensions==4.16.0",
+      "version": "4.16.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/typing-inspection/0.4.4/json",
+      "name": "typing-inspection",
+      "normalized_name": "typing-inspection",
+      "requirement": "typing-inspection==0.4.4",
+      "version": "0.4.4"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause AND TCL",
+      "metadata_url": "https://pypi.org/pypi/ujson/5.13.0/json",
+      "name": "ujson",
+      "normalized_name": "ujson",
+      "requirement": "ujson==5.13.0",
+      "version": "5.13.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/urllib3/2.7.0/json",
+      "name": "urllib3",
+      "normalized_name": "urllib3",
+      "requirement": "urllib3==2.7.0",
+      "version": "2.7.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/uvicorn/0.35.0/json",
+      "name": "uvicorn",
+      "normalized_name": "uvicorn",
+      "requirement": "uvicorn==0.35.0",
+      "version": "0.35.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT License",
+      "metadata_url": "https://pypi.org/pypi/uvloop/0.22.1/json",
+      "name": "uvloop",
+      "normalized_name": "uvloop",
+      "requirement": "uvloop==0.22.1",
+      "version": "0.22.1"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/watchfiles/1.2.0/json",
+      "name": "watchfiles",
+      "normalized_name": "watchfiles",
+      "requirement": "watchfiles==1.2.0",
+      "version": "1.2.0"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "MIT",
+      "metadata_url": "https://pypi.org/pypi/wcwidth/0.8.2/json",
+      "name": "wcwidth",
+      "normalized_name": "wcwidth",
+      "requirement": "wcwidth==0.8.2",
+      "version": "0.8.2"
+    },
+    {
+      "ecosystem": "python-optional",
+      "license": "BSD-3-Clause",
+      "metadata_url": "https://pypi.org/pypi/websockets/17.0.1/json",
+      "name": "websockets",
+      "normalized_name": "websockets",
+      "requirement": "websockets==17.0.1",
+      "version": "17.0.1"
+    }
+  ],
+  "schema": "python-lock-license-inventory-v1"
+}

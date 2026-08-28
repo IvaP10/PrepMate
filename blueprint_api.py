@@ -15,7 +15,7 @@ from typing import Any, Dict, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from auth import get_current_user
+from local_runtime import local_user
 from database import get_db_connection, return_db_connection
 from interview_blueprint import (
     BLUEPRINT_COMPILER_VERSION,
@@ -145,7 +145,9 @@ def _resolve_blueprint_job_target(
         if isinstance(encrypted_jd, bytes):
             encrypted_jd = encrypted_jd.decode("utf-8")
         job_description = decrypt_data(encrypted_jd) if isinstance(encrypted_jd, str) else ""
-        requirements = _json_value(job_row[4], {})
+        requirements = _decrypt_blob(job_row[5] if len(job_row) > 5 else None, None)
+        if not isinstance(requirements, dict):
+            requirements = _json_value(job_row[4], {})
         has_full_job_description = bool(str(job_description or "").strip())
         if not job_description and isinstance(requirements, dict):
             job_description = "\n".join(str(item) for item in requirements.get("requirements") or [])
@@ -161,7 +163,7 @@ def _resolve_blueprint_job_target(
             "role": role or "General Interview",
             "company": company,
             "job_description": job_description,
-            "experience_level": job_row[5],
+            "experience_level": job_row[6] if len(job_row) > 6 else None,
             "source": "saved_profile",
         }
 
@@ -225,7 +227,7 @@ def _preview_response(
 @router.post("/blueprints", status_code=status.HTTP_201_CREATED)
 async def create_interview_blueprint(
     request: BlueprintCreateRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -236,7 +238,7 @@ async def create_interview_blueprint(
                 SELECT resume_id, resume_payload_encrypted, resume_json,
                        facts_encrypted, confirmation_status
                 FROM ResumeVersions
-                WHERE resume_id = %s AND user_id = %s
+                WHERE resume_id = ? AND user_id = ?
                 """,
                 (request.resume_id, current_user["user_id"]),
             )
@@ -246,7 +248,7 @@ async def create_interview_blueprint(
                 SELECT resume_id, resume_payload_encrypted, resume_json,
                        facts_encrypted, confirmation_status
                 FROM ResumeVersions
-                WHERE user_id = %s AND is_active = TRUE
+                WHERE user_id = ? AND is_active = TRUE
                 ORDER BY version_number DESC
                 LIMIT 1
                 """,
@@ -272,9 +274,10 @@ async def create_interview_blueprint(
             cursor.execute(
                 """
                 SELECT profile_id, role, company, job_description_encrypted,
-                       normalized_requirements, experience_level
+                       normalized_requirements, normalized_requirements_encrypted,
+                       experience_level
                 FROM JobProfiles
-                WHERE profile_id = %s AND user_id = %s
+                WHERE profile_id = ? AND user_id = ?
                 """,
                 (request.job_profile_id, current_user["user_id"]),
             )
@@ -282,9 +285,10 @@ async def create_interview_blueprint(
             cursor.execute(
                 """
                 SELECT profile_id, role, company, job_description_encrypted,
-                       normalized_requirements, experience_level
+                       normalized_requirements, normalized_requirements_encrypted,
+                       experience_level
                 FROM JobProfiles
-                WHERE user_id = %s AND is_selected = TRUE
+                WHERE user_id = ? AND is_selected = TRUE
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
@@ -314,7 +318,7 @@ async def create_interview_blueprint(
                 SELECT blueprint_id, status, expires_at, created_at, blueprint_json,
                        blueprint_json_encrypted, resume_id, job_profile_id
                 FROM InterviewBlueprints
-                WHERE user_id = %s AND request_idempotency_key = %s
+                WHERE user_id = ? AND request_idempotency_key = ?
                 """,
                 (current_user["user_id"], request.request_idempotency_key),
             )
@@ -336,7 +340,7 @@ async def create_interview_blueprint(
             SELECT skill_key, mastery_score, confidence_score, evidence_count,
                    last_evidence_at
             FROM LearnerSkillStates
-            WHERE user_id = %s AND evidence_count > 0 AND mastery_score < 70
+            WHERE user_id = ? AND evidence_count > 0 AND mastery_score < 70
             ORDER BY confidence_score DESC, mastery_score ASC, last_evidence_at DESC NULLS LAST
             LIMIT 5
             """,
@@ -385,10 +389,10 @@ async def create_interview_blueprint(
             SELECT blueprint_id, status, expires_at, created_at, blueprint_json,
                    blueprint_json_encrypted
             FROM InterviewBlueprints
-            WHERE user_id = %s AND resume_id = %s
-              AND job_profile_id IS NOT DISTINCT FROM %s
-              AND blueprint_hash = %s AND status = 'ready'
-              AND (expires_at IS NULL OR expires_at > NOW())
+            WHERE user_id = ? AND resume_id = ?
+              AND job_profile_id IS ?
+              AND blueprint_hash = ? AND status = 'ready'
+              AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -420,8 +424,8 @@ async def create_interview_blueprint(
                 status, expires_at, created_at
             )
             VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, 'ready', NOW() + INTERVAL '24 hours', NOW()
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, 'ready', datetime(CURRENT_TIMESTAMP, '+24 hours'), CURRENT_TIMESTAMP
             )
             RETURNING expires_at, created_at
             """,
@@ -473,7 +477,7 @@ async def create_interview_blueprint(
 @router.get("/blueprints/{blueprint_id}")
 async def get_interview_blueprint(
     blueprint_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -482,9 +486,9 @@ async def get_interview_blueprint(
             """
             SELECT blueprint_id, resume_id, job_profile_id, status,
                    expires_at, created_at, blueprint_json, blueprint_json_encrypted,
-                   (expires_at IS NULL OR expires_at > NOW()) AS is_unexpired
+                   (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) AS is_unexpired
             FROM InterviewBlueprints
-            WHERE blueprint_id = %s AND user_id = %s
+            WHERE blueprint_id = ? AND user_id = ?
             """,
             (blueprint_id, current_user["user_id"]),
         )

@@ -7,7 +7,7 @@ import { safeStorageGet, safeStorageSet } from "@/lib/safe-storage"
 
 type Theme = "light" | "dark"
 
-const STORAGE_KEY = "interai-theme"
+const STORAGE_KEY = "prepmate-theme"
 const THEME_TRANSITION_MS = 700
 
 export function useTheme() {

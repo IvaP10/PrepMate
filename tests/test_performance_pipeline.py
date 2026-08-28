@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 os.environ.setdefault("ENVIRONMENT", "test")
 
 import analysis_pipeline
-import background_tasks
+import local_maintenance
 import technical_worker
 
 
@@ -63,7 +63,7 @@ def test_deferred_technical_finalization_commits_completed_analysis_lifecycle():
     update_sql = next(query for query, _ in cursor.calls if query.startswith("UPDATE Interviews"))
     round_update_sql = next(
         query for query, _ in cursor.calls
-        if query.startswith("UPDATE TechnicalInterviewRounds round")
+        if query.startswith("UPDATE TechnicalInterviewRounds AS round")
     )
     assert user_id == "user-1"
     assert connection.committed is True
@@ -125,7 +125,7 @@ def test_orphaned_completed_attempt_is_requeued_without_touching_failed_jobs():
         patch.object(current_analysis_pipeline, "enqueue_analysis_result", enqueue),
         patch.object(current_database, "async_execute", execute),
     ):
-        asyncio.run(background_tasks._recover_orphaned_analysis_attempts())
+        asyncio.run(local_maintenance.recover_orphaned_analysis_attempts())
 
     enqueue.assert_awaited_once_with(
         "interview-1",
@@ -134,7 +134,10 @@ def test_orphaned_completed_attempt_is_requeued_without_touching_failed_jobs():
         force_canonical_rebuild=True,
     )
     selection_sql = execute.await_args_list[0].args[0]
-    assert "job.producer_version = %s" in selection_sql
+    assert "job.producer_version = ?" in selection_sql
+    assert "job.status IN ('queued', 'running')" in selection_sql
+    assert "FROM ReportArtifacts artifact" in selection_sql
+    assert "FROM ReportSideEffectOutbox side_effect" in selection_sql
     assert "job.status = 'failed'" not in selection_sql
     assert execute.await_args_list[1].args[1][0] == "analysis-job-1"
 

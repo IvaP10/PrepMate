@@ -2,7 +2,7 @@
 # MODULE: interview.py
 # PURPOSE: Live interview engine — WebSocket video/audio loop, persona, opening
 #          statement, knowledge-map driven battlegrounds, follow-ups, evaluation,
-#          coaching hints, anti-cheat/malpractice logging, async report queueing.
+#          coaching hints, optional self-review signals, async report queueing.
 #          Mounted under /api/interview.
 # STRUCTURE:
 #   - Pydantic request/response models (~lines 50-100)
@@ -11,26 +11,26 @@
 #   - WebSocket handler (lines 644-1374)
 #   - GET status / report + DELETE cancel (lines 1376-1576)
 # ENDPOINTS (prefix /api/interview):
-#   - POST   /ws-ticket           -> short-lived WS auth token (line 301)
 #   - POST   /start               -> create Interviews row + persona (317)
-#   - WS     /ws/video/{ticket}   -> live streaming interview loop (644)
+#   - WS     /ws/video            -> local live interview loop
 #   - GET    /status/{id}         -> in-progress / completed state (1376)
 #   - GET    /report/{id}         -> final report_json (1411)
 #   - DELETE /cancel/{id}         -> mark cancelled (1521)
-# DEPENDS ON: auth, database, config, redis_client, ai_services, body_language,
+# DEPENDS ON: database, config, local_cache, ai_services, body_language,
 #             persona_generator, strictness_config, analysis_pipeline, coach,
 #             learning_engine, knowledge_map, interview_profiles, security_utils
 # CONSUMED BY: app.py, Frontend/app/interview/[id]/page.tsx (WS),
 #              Frontend/lib/api.ts (startInterviewSession, fetchInterviewStatus,
 #              fetchInterviewReport)
 # DATA TABLES: Interviews, InterviewQuestions, InterviewResponses,
-#              ClientBodyLanguageMetrics, AntiCheatEvents, MalpracticeEvents,
+#              ClientBodyLanguageMetrics, optional self-review signal storage,
 #              SkillEvidenceEvents (via learning_engine)
 #              (Phase 2 merges *Events into InterviewEvents; Phase 2 drops 5
 #               redundant scoring columns on InterviewResponses)
 # ============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, Dict, List, Literal, Optional
 from collections import deque
@@ -41,22 +41,31 @@ import re
 import uuid
 import logging
 import asyncio
-import jwt
 import hashlib
 import math
+from local_runtime import (
+    LOCAL_USER_ID,
+    api_token_matches,
+    configured_api_token,
+    has_provider_api_key,
+    is_allowed_local_origin,
+    is_loopback_host,
+)
 
-from auth import get_current_user
+from local_runtime import local_user
 from database import get_db_connection, return_db_connection, async_execute
 from config import settings
-from redis_client import get_redis_client
-from ai_services import (
-    transcribe_audio,
-    generate_speech
+from local_cache import get_local_cache
+from ai_services import transcribe_audio
+from analysis_pipeline import (
+    ANALYSIS_STAGE_VERSION,
+    _safe_report_payload,
+    enqueue_analysis,
+    operator_retry_analysis,
 )
-from analysis_pipeline import ANALYSIS_STAGE_VERSION, enqueue_analysis, operator_retry_analysis
 from body_language import normalize_client_metrics
 from persona_generator import generate_persona
-from entitlements import enforce_interview_start, get_active_subscription_plan_type, is_technical_interview_type, normalize_technical_profile
+from interview_capabilities import is_technical_interview_type, normalize_technical_profile
 from knowledge_map import (
     build_knowledge_map,
     get_next_battleground,
@@ -76,7 +85,7 @@ from interview_profiles import (
     normalize_profile_type,
 )
 from security_utils import redact_text, stable_hash, collect_profile_identifiers, redact_pii_text
-from security_utils import decrypt_data, encrypt_data
+from security_utils import decrypt_data, decrypt_json_field, encrypt_data
 from interview_blueprint import compile_interview_blueprint, validate_blueprint, weakness_label
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
 from learning_engine import ensure_mission_from_response_assessment
@@ -102,8 +111,6 @@ MIN_LIVE_ANSWER_WORDS = 2
 MIN_LIVE_ANSWER_CHARS = 6
 MIN_LIVE_AUDIO_DURATION_MS = 650
 MAX_LIVE_ANSWER_QUALITY_FAILURES = 3
-
-
 def _is_usable_live_answer(answer: str) -> bool:
     cleaned = re.sub(r"\s+", " ", str(answer or "")).strip()
     words = re.findall(r"\b[\w']+\b", cleaned)
@@ -201,24 +208,24 @@ async def _has_persisted_candidate_evidence(interview_id: str, user_id: str) -> 
                 SELECT 1
                 FROM InterviewResponses response
                 JOIN Interviews owner ON owner.interview_id = response.interview_id
-                WHERE response.interview_id = %s AND owner.user_id = %s
+                WHERE response.interview_id = ? AND owner.user_id = ?
             )
             OR EXISTS (
                 SELECT 1 FROM TechnicalSubmissions
-                WHERE interview_id = %s AND user_id = %s
+                WHERE interview_id = ? AND user_id = ?
             )
             OR EXISTS (
                 SELECT 1 FROM TechnicalRunEvents event
                 JOIN TechnicalInterviewRounds round ON round.round_id = event.round_id
-                WHERE round.interview_id = %s AND event.user_id = %s
+                WHERE round.interview_id = ? AND event.user_id = ?
             )
             OR EXISTS (
                 SELECT 1 FROM TechnicalCodeSnapshots
-                WHERE interview_id = %s AND user_id = %s AND source_chars > 0
+                WHERE interview_id = ? AND user_id = ? AND source_chars > 0
             )
             OR EXISTS (
                 SELECT 1 FROM TechnicalExecutionJobs
-                WHERE interview_id = %s AND user_id = %s
+                WHERE interview_id = ? AND user_id = ?
                   AND status IN ('queued', 'leased', 'running', 'completed')
             )
         )
@@ -233,8 +240,6 @@ async def _has_persisted_candidate_evidence(interview_id: str, user_id: str) -> 
         fetchone=True,
     )
     return bool(row and row[0])
-WS_TICKET_REDIS_PREFIX = "ws_ticket:"
-WS_TICKET_PURPOSE = "interview_ws"
 _INTERVIEW_RECOVERY_TASKS: Dict[str, asyncio.Task] = {}
 
 
@@ -253,7 +258,7 @@ async def _record_server_integrity_event(
             event_id, interview_id, user_id, client_session_id, sequence,
             event_type, severity, source, observed_at, received_at,
             payload_encrypted, payload_hash, idempotency_key
-        ) VALUES (%s, %s, %s, %s, 1, %s, 'warning', 'server', NOW(), NOW(), %s, %s, %s)
+        ) VALUES (?, ?, ?, ?, 1, ?, 'info', 'server', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, ?, ?)
         ON CONFLICT DO NOTHING
         """,
         (
@@ -271,13 +276,14 @@ async def _mark_interview_recovering(interview_id: str, user_id: str) -> None:
         UPDATE Interviews
         SET status = 'recovering',
             attempt_status = 'recovering',
-            recovery_deadline_at = %s,
+            recovery_deadline_at = ?,
             lifecycle_revision = lifecycle_revision + 1,
-            settings = jsonb_set(
-                jsonb_set(COALESCE(settings, '{}'::jsonb), '{recovery_deadline}', to_jsonb(%s::text), true),
-                '{recovery_reason}', to_jsonb('connection_interrupted'::text), true
+            settings = json_set(
+                COALESCE(settings, '{}'),
+                '$.recovery_deadline', ?,
+                '$.recovery_reason', 'connection_interrupted'
             )
-        WHERE interview_id = %s AND user_id = %s AND status IN ('in_progress', 'uploading')
+        WHERE interview_id = ? AND user_id = ? AND status IN ('in_progress', 'uploading')
         RETURNING interview_id
         """,
         (recovery_deadline, recovery_deadline.isoformat(), interview_id, user_id),
@@ -293,8 +299,8 @@ async def _mark_interview_recovering(interview_id: str, user_id: str) -> None:
     )
     await async_execute(
         """
-        INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
-        VALUES (%s, %s, 'connection_interrupted', %s)
+        INSERT INTO SelfReviewEvents (interview_id, user_id, event_type, payload)
+        VALUES (?, ?, 'connection_interrupted', ?)
         """,
         (interview_id, user_id, json.dumps({"recovery_deadline": recovery_deadline.isoformat()})),
     )
@@ -305,38 +311,42 @@ async def _abandon_interview_after_recovery(interview_id: str, user_id: str) -> 
         await asyncio.sleep(settings.SESSION_RECOVERY_GRACE_SECONDS)
         expired = await async_execute(
             """
-            WITH expired_interview AS (
-                UPDATE Interviews
-                SET status = 'cancelled', completed_at = COALESCE(completed_at, NOW()),
-                    attempt_status = 'incomplete', analysis_status = 'not_requested',
-                    completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
-                    lifecycle_revision = lifecycle_revision + 1,
-                    overall_score = NULL,
-                    duration_seconds = CASE
-                        WHEN started_at IS NULL THEN duration_seconds
-                        ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
-                    END,
-                    feedback_summary = 'Attempt incomplete because connection recovery expired.',
-                    settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
-                        || jsonb_build_object('abandonment_reason', 'recovery_timeout')
-                WHERE interview_id = %s AND user_id = %s AND status = 'recovering'
-                RETURNING interview_id, user_id, completed_at
-            ),
-            closed_rounds AS (
-                UPDATE TechnicalInterviewRounds round
-                SET status = 'cancelled',
-                    completed_at = COALESCE(round.completed_at, expired.completed_at, NOW())
-                FROM expired_interview expired
-                WHERE round.interview_id = expired.interview_id
-                  AND round.user_id = expired.user_id
-                  AND round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
-                RETURNING round.round_id
-            )
-            SELECT interview_id FROM expired_interview
+            UPDATE Interviews
+            SET status = 'cancelled', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                attempt_status = 'incomplete', analysis_status = 'not_requested',
+                completion_kind = 'recovery_expired', recovery_deadline_at = NULL,
+                lifecycle_revision = lifecycle_revision + 1,
+                overall_score = NULL,
+                duration_seconds = CASE
+                    WHEN started_at IS NULL THEN duration_seconds
+                    ELSE MAX(0, CAST(
+                        (julianday(CURRENT_TIMESTAMP) - julianday(started_at)) * 86400
+                        AS INTEGER
+                    ))
+                END,
+                feedback_summary = 'Attempt incomplete because connection recovery expired.',
+                settings = json_patch(
+                    json_remove(COALESCE(settings, '{}'), '$.recovery_deadline', '$.recovery_reason'),
+                    json_object('abandonment_reason', 'recovery_timeout')
+                )
+            WHERE interview_id = ? AND user_id = ? AND status = 'recovering'
+            RETURNING interview_id, user_id, completed_at
             """,
             (interview_id, user_id),
             fetchone=True,
         )
+        if expired:
+            await async_execute(
+                """
+                UPDATE TechnicalInterviewRounds
+                SET status = 'cancelled',
+                    completed_at = COALESCE(completed_at, ?, CURRENT_TIMESTAMP)
+                WHERE interview_id = ?
+                  AND user_id = ?
+                  AND status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
+                """,
+                (expired[2], interview_id, user_id),
+            )
         if expired:
             await _record_server_integrity_event(interview_id, user_id, "recovery_expired")
     finally:
@@ -356,35 +366,6 @@ def _cancel_interview_recovery(interview_id: str) -> None:
     task = _INTERVIEW_RECOVERY_TASKS.pop(interview_id, None)
     if task:
         task.cancel()
-
-
-def _create_signed_ws_ticket(user_id: str) -> str:
-    issued_at = datetime.now(timezone.utc)
-    token = jwt.encode(
-        {
-            "user_id": user_id,
-            "purpose": WS_TICKET_PURPOSE,
-            "iat": issued_at,
-            "exp": issued_at + timedelta(seconds=settings.WS_TICKET_TTL_SECONDS),
-        },
-        settings.JWT_SECRET,
-        algorithm=settings.JWT_ALGORITHM,
-    )
-    return token.decode("utf-8") if isinstance(token, bytes) else token
-
-
-def _decode_signed_ws_ticket(ticket: str) -> Optional[str]:
-    try:
-        payload = jwt.decode(ticket, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
-
-    if payload.get("purpose") != WS_TICKET_PURPOSE:
-        return None
-    user_id = payload.get("user_id")
-    return str(user_id) if user_id else None
 
 
 def _quick_live_score(answer: str, response_seconds: float) -> Dict[str, Any]:
@@ -437,8 +418,8 @@ class StartInterviewRequest(BaseModel):
     technical_topics: List[str] = Field(default_factory=list, max_length=12)
     technical_round_types: List[str] = Field(default_factory=list, max_length=12)
     question_count: Optional[int] = Field(default=None, ge=1, le=12)
-    input_mode: str = Field(default="voice", pattern="^(voice|text|voice_or_text)$")
-    camera_mode: str = Field(default="optional", pattern="^(off|optional|required)$")
+    input_mode: str = Field(default="text", pattern="^(voice|text|voice_or_text)$")
+    camera_mode: str = Field(default="optional", pattern="^(off|optional)$")
 
     @field_validator("profile_type")
     @classmethod
@@ -492,18 +473,6 @@ class StartInterviewRequest(BaseModel):
                 normalized.append(mapped)
         return normalized
 
-    @model_validator(mode="after")
-    def require_voice_for_interview_round(self):
-        # A ready server-owned blueprint supplies the authoritative interview
-        # type inside start_interview(). Do not reject a typed Technical Round
-        # before that frozen type has been loaded.
-        if self.blueprint_id:
-            return self
-        if not is_technical_interview_type(self.interview_type) and self.input_mode != "voice":
-            raise ValueError("The Interview Round requires voice input")
-        return self
-
-
 class CreateInterviewBlueprintRequest(BaseModel):
     interview_mode: str = Field(default="mock", pattern="^mock$")
     interview_type: str = Field(default="Mock Interview", min_length=2, max_length=50)
@@ -523,7 +492,7 @@ class CreateInterviewBlueprintRequest(BaseModel):
     technical_round_types: List[str] = Field(default_factory=list, max_length=12)
     question_count: Optional[int] = Field(default=None, ge=1, le=12)
     input_mode: str = Field(default="voice_or_text", pattern="^(voice|text|voice_or_text)$")
-    camera_mode: str = Field(default="optional", pattern="^(off|optional|required)$")
+    camera_mode: str = Field(default="optional", pattern="^(off|optional)$")
 
     @field_validator("profile_type")
     @classmethod
@@ -552,7 +521,6 @@ class InterviewResponse(BaseModel):
     message: str
     persona: Dict
     settings: Dict
-    interviews_remaining: int
     attempt_status: str = "active"
     analysis_status: str = "not_requested"
     integrity_status: str = "clean"
@@ -565,22 +533,22 @@ class InterviewResponse(BaseModel):
 
 class MediaUploadUrlRequest(BaseModel):
     media_kind: str
-    content_type: Optional[str] = None
-    chunk_index: Optional[int] = None
-    chunk_count: Optional[int] = None
-    byte_size: Optional[int] = None
+    content_type: Optional[str] = Field(default=None, max_length=80)
+    chunk_index: Optional[int] = Field(default=None, ge=0, le=10000)
+    chunk_count: Optional[int] = Field(default=None, ge=1, le=10000)
+    byte_size: Optional[int] = Field(default=None, ge=0, le=25 * 1024 * 1024)
 
 
 class MediaChunkCompleteRequest(BaseModel):
-    asset_id: Optional[str] = None
+    asset_id: str = Field(min_length=1, max_length=64)
     media_kind: str
-    object_key: str
-    content_type: Optional[str] = None
-    byte_size: int = 0
-    chunk_index: Optional[int] = None
-    chunk_count: Optional[int] = None
-    checksum: Optional[str] = None
-    metadata: Dict[str, Any] = {}
+    object_key: str = Field(min_length=1, max_length=512)
+    content_type: Optional[str] = Field(default=None, max_length=80)
+    byte_size: int = Field(default=0, ge=0, le=25 * 1024 * 1024)
+    chunk_index: Optional[int] = Field(default=None, ge=0, le=10000)
+    chunk_count: Optional[int] = Field(default=None, ge=1, le=10000)
+    checksum: Optional[str] = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _raw_media_retention_enabled(media_kind: str) -> bool:
@@ -590,6 +558,20 @@ def _raw_media_retention_enabled(media_kind: str) -> bool:
     if kind == "audio":
         return settings.AUDIO_RETENTION_DAYS > 0
     return False
+
+
+def _validated_media_content_type(media_kind: str, content_type: Optional[str]) -> str:
+    normalized = str(content_type or "").split(";", 1)[0].strip().lower()
+    allowed = {
+        "video": {"video/webm"},
+        "audio": {"audio/webm", "audio/ogg"},
+    }
+    if normalized not in allowed.get(media_kind, set()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Unsupported interview media content type.",
+        )
+    return normalized
 
 
 def _require_raw_media_retention(media_kind: str) -> str:
@@ -698,11 +680,11 @@ def _load_previous_weaknesses(cursor: Any, user_id: str, limit: int = 5) -> List
         """
         SELECT skill_key, mastery_score, confidence_score, evidence_count, last_evidence_at
         FROM LearnerSkillStates
-        WHERE user_id = %s
+        WHERE user_id = ?
           AND evidence_count > 0
           AND mastery_score < 70
         ORDER BY confidence_score DESC, mastery_score ASC, last_evidence_at DESC NULLS LAST
-        LIMIT %s
+        LIMIT ?
         """,
         (user_id, limit),
     )
@@ -730,6 +712,8 @@ def _load_previous_weaknesses(cursor: Any, user_id: str, limit: int = 5) -> List
 def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
     turns: List[Dict[str, Any]] = []
     for row in rows or []:
+        encrypted_assessment_layout = len(row) >= 30
+        assessment_offset = 1 if encrypted_assessment_layout else 0
         encrypted_answer = row[5]
         if isinstance(encrypted_answer, memoryview):
             encrypted_answer = encrypted_answer.tobytes()
@@ -737,7 +721,11 @@ def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
             encrypted_answer = bytes(encrypted_answer).decode("utf-8", errors="strict")
         answer = decrypt_data(encrypted_answer) if encrypted_answer else ""
         legacy_answer = "" if row[6] == "[encrypted]" else str(row[6] or "")
-        assessment = _json_load(row[17], {}) if len(row) > 17 else {}
+        assessment = (
+            decrypt_json_field(row[17], row[18], {})
+            if encrypted_assessment_layout
+            else _json_load(row[17], {}) if len(row) > 17 else {}
+        )
         assessment_score = row[16] if len(row) > 16 else None
         turns.append({
             "response_id": row[0],
@@ -756,18 +744,18 @@ def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
             "evidence_quotes": _json_load(row[14], []),
             "retry_state": _json_load(row[15], {}),
             "assessment": assessment or None,
-            "evaluator_version": row[18] if len(row) > 18 else None,
+            "evaluator_version": row[18 + assessment_offset] if len(row) > 18 + assessment_offset else None,
             "insufficient_evidence": bool(assessment.get("insufficient_evidence")) if assessment else True,
-            "question_id": row[19] if len(row) > 19 else None,
-            "question_order": row[20] if len(row) > 20 else None,
-            "expected_points": _json_load(row[21], []) if len(row) > 21 else [],
-            "rubric_json": _json_load(row[22], {}) if len(row) > 22 else {},
-            "question_spec_id": row[23] if len(row) > 23 else None,
-            "taxonomy_keys": _json_load(row[24], []) if len(row) > 24 else [],
-            "section_id": row[25] if len(row) > 25 else None,
-            "parent_question_id": row[26] if len(row) > 26 else None,
-            "provenance": _json_load(row[27], {}) if len(row) > 27 else {},
-            "created_at": row[28].isoformat() if len(row) > 28 and row[28] else None,
+            "question_id": row[19 + assessment_offset] if len(row) > 19 + assessment_offset else None,
+            "question_order": row[20 + assessment_offset] if len(row) > 20 + assessment_offset else None,
+            "expected_points": _json_load(row[21 + assessment_offset], []) if len(row) > 21 + assessment_offset else [],
+            "rubric_json": _json_load(row[22 + assessment_offset], {}) if len(row) > 22 + assessment_offset else {},
+            "question_spec_id": row[23 + assessment_offset] if len(row) > 23 + assessment_offset else None,
+            "taxonomy_keys": _json_load(row[24 + assessment_offset], []) if len(row) > 24 + assessment_offset else [],
+            "section_id": row[25 + assessment_offset] if len(row) > 25 + assessment_offset else None,
+            "parent_question_id": row[26 + assessment_offset] if len(row) > 26 + assessment_offset else None,
+            "provenance": _json_load(row[27 + assessment_offset], {}) if len(row) > 27 + assessment_offset else {},
+            "created_at": row[28 + assessment_offset].isoformat() if len(row) > 28 + assessment_offset and row[28 + assessment_offset] else None,
         })
     return turns
 
@@ -775,32 +763,39 @@ def _rows_to_turns(rows: List[Any]) -> List[Dict[str, Any]]:
 def _load_report_payload(cursor, interview_id: str) -> List[Dict[str, Any]]:
     cursor.execute(
         """
+        WITH latest_responses AS (
+            SELECT candidate_response.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY candidate_response.question_id
+                       ORDER BY candidate_response.created_at DESC
+                   ) AS response_rank
+            FROM InterviewResponses candidate_response
+        ), latest_assessments AS (
+            SELECT response_id, overall_score, assessment_json_encrypted,
+                   assessment_json, evaluator_version,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY response_id
+                       ORDER BY created_at DESC
+                   ) AS assessment_rank
+            FROM ResponseAssessments
+        )
         SELECT ir.response_id,
                iq.question_text, iq.question_type, iq.is_followup,
                iq.topic_label, ir.answer_text_encrypted, ir.user_response, ir.score, ir.ai_feedback,
                ir.response_time_seconds, ir.nonverbal_metrics, ir.coaching_hint,
                ir.evaluation_json, ir.answer_quality_flags, ir.evidence_quotes,
                ir.retry_state, assessment.overall_score,
-               assessment.assessment_json, assessment.evaluator_version,
+               assessment.assessment_json_encrypted, assessment.assessment_json,
+               assessment.evaluator_version,
                iq.question_id, iq.question_order, iq.expected_points, iq.rubric_json,
                iq.question_spec_id, iq.taxonomy_keys, iq.blueprint_section_id,
                iq.parent_question_id, iq.provenance, ir.created_at
         FROM InterviewQuestions iq
-        LEFT JOIN LATERAL (
-            SELECT *
-            FROM InterviewResponses candidate_response
-            WHERE candidate_response.question_id = iq.question_id
-            ORDER BY candidate_response.created_at DESC
-            LIMIT 1
-        ) ir ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT overall_score, assessment_json, evaluator_version
-            FROM ResponseAssessments
-            WHERE response_id = ir.response_id
-            ORDER BY created_at DESC
-            LIMIT 1
-        ) assessment ON TRUE
-        WHERE iq.interview_id = %s
+        LEFT JOIN latest_responses ir
+          ON ir.question_id = iq.question_id AND ir.response_rank = 1
+        LEFT JOIN latest_assessments assessment
+          ON assessment.response_id = ir.response_id AND assessment.assessment_rank = 1
+        WHERE iq.interview_id = ?
         ORDER BY iq.question_order, ir.created_at NULLS LAST
         """,
         (interview_id,)
@@ -816,20 +811,90 @@ def _interview_report_ready(status_value: Any, report_json: Any) -> bool:
     return str(status_value or "").lower() in REPORT_READY_STATUSES and _report_payload_ready(report_json)
 
 
+def _detailed_response_status(turn: Dict[str, Any]) -> str:
+    if not str(turn.get("response") or "").strip():
+        return "Not Answered"
+    if bool(turn.get("insufficient_evidence")):
+        return "Incomplete"
+    if not isinstance(turn.get("assessment"), dict) or turn.get("score") is None:
+        return "Unable to Evaluate"
+    return "Completed"
+
+
+def _stored_report_question_status(question: Dict[str, Any]) -> str:
+    """Normalize legacy canonical question rows before returning the report."""
+    response = str(
+        question.get("response")
+        or question.get("transcript")
+        or question.get("user_answer")
+        or ""
+    ).strip()
+    explicit = str(question.get("status") or "").strip()
+    if explicit == "Not Answered" and response:
+        if question.get("insufficient_evidence") or question.get("evidence_status") == "insufficient_evidence":
+            return "Incomplete"
+        return "Completed" if question.get("score") is not None or question.get("overall_score") is not None else "Unable to Evaluate"
+    if explicit in {"Completed", "Incomplete", "Unable to Evaluate", "Not Answered"}:
+        return explicit
+    if not response:
+        return "Not Answered"
+    if question.get("insufficient_evidence") or question.get("evidence_status") == "insufficient_evidence":
+        return "Incomplete"
+    return "Completed" if question.get("score") is not None or question.get("overall_score") is not None else "Unable to Evaluate"
+
+
+def _analysis_report_state(
+    *,
+    interview_status: Any,
+    attempt_status: Any,
+    report_ready: bool,
+    stored_report: Any,
+    job_status: Any,
+    manual_retry_count: int,
+) -> str:
+    normalized_status = str(interview_status or "").lower()
+    normalized_attempt = str(attempt_status or "").lower()
+    normalized_job = str(job_status or "").lower()
+    if normalized_attempt == "incomplete" or normalized_status == "cancelled":
+        return "unavailable"
+    if normalized_attempt == "recovering" or normalized_status == "recovering":
+        return "recovering"
+    if report_ready and isinstance(stored_report, dict):
+        return str(
+            stored_report.get("report_state")
+            or ("partial" if normalized_status == "partial" else "ready")
+        )
+    if normalized_job == "failed":
+        return "failed"
+    if manual_retry_count > 0 and normalized_job in {"queued", "running"}:
+        return "retrying"
+    return "generating"
+
+
 async def _has_current_canonical_analysis(interview_id: str, user_id: str) -> bool:
     row = await async_execute(
         """
         SELECT EXISTS (
             SELECT 1
-            FROM SessionPerformanceAnalyses
-            WHERE interview_id = %s
-              AND user_id = %s
-              AND schema_version = 'session-performance-v4'
-              AND producer_version = %s
-              AND status = 'ready'
-              AND is_current = TRUE
-              AND analysis_json_encrypted IS NOT NULL
-              AND evidence_index_encrypted IS NOT NULL
+            FROM SessionPerformanceAnalyses analysis
+            WHERE analysis.interview_id = ?
+              AND analysis.user_id = ?
+              AND analysis.schema_version = 'session-performance-v4'
+              AND analysis.producer_version = ?
+              AND analysis.status = 'ready'
+              AND analysis.is_current = TRUE
+              AND analysis.analysis_json_encrypted IS NOT NULL
+              AND analysis.evidence_index_encrypted IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM ReportArtifacts artifact
+                  WHERE artifact.analysis_id = analysis.analysis_id
+                    AND artifact.interview_id = analysis.interview_id
+                    AND artifact.user_id = analysis.user_id
+                    AND artifact.audience = 'candidate'
+                    AND artifact.status IN ('completed', 'partial')
+                    AND artifact.payload_encrypted IS NOT NULL
+              )
         )
         """,
         (interview_id, user_id, ANALYSIS_STAGE_VERSION),
@@ -846,6 +911,7 @@ async def _finalize_interview_for_analysis(
     transcript: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     transcript_json = json.dumps(transcript) if transcript is not None else None
+    canonical_report_ready = await _has_current_canonical_analysis(interview_id, user_id)
 
     def _mark_finalized() -> Dict[str, Any]:
         conn = get_db_connection()
@@ -856,8 +922,7 @@ async def _finalize_interview_for_analysis(
                 SELECT status, report_json, analysis_job_id, completed_at,
                        report_json_encrypted, interview_type, settings
                 FROM Interviews
-                WHERE interview_id = %s AND user_id = %s
-                FOR UPDATE
+                WHERE interview_id = ? AND user_id = ?
                 """,
                 (interview_id, user_id),
             )
@@ -868,7 +933,11 @@ async def _finalize_interview_for_analysis(
 
             current_status = str(row[0] or "").lower()
             report_payload = _decrypt_json_blob(row[4], None) or _json_load(row[1], None)
-            report_ready = current_status in REPORT_READY_STATUSES and isinstance(report_payload, dict)
+            report_ready = (
+                current_status in REPORT_READY_STATUSES
+                and isinstance(report_payload, dict)
+                and canonical_report_ready
+            )
             technical_interview = is_technical_interview_type(str(row[5] or ""))
             if current_status == "cancelled":
                 conn.commit()
@@ -897,7 +966,7 @@ async def _finalize_interview_for_analysis(
                     """
                     SELECT COUNT(*)
                     FROM TechnicalExecutionJobs
-                    WHERE interview_id = %s AND user_id = %s
+                    WHERE interview_id = ? AND user_id = ?
                       AND status IN ('queued', 'leased', 'running')
                     """,
                     (interview_id, user_id),
@@ -913,7 +982,7 @@ async def _finalize_interview_for_analysis(
                     if transcript_json is not None:
                         settings_payload["pending_transcript_encrypted"] = encrypt_data(transcript_json)
                     cursor.execute(
-                        "UPDATE Interviews SET settings = %s WHERE interview_id = %s AND user_id = %s",
+                        "UPDATE Interviews SET settings = ? WHERE interview_id = ? AND user_id = ?",
                         (json.dumps(settings_payload), interview_id, user_id),
                     )
                     conn.commit()
@@ -943,28 +1012,28 @@ async def _finalize_interview_for_analysis(
                     UPDATE Interviews
                     SET status = 'analysis_pending',
                         attempt_status = 'completed', analysis_status = 'queued',
-                        completion_kind = CASE WHEN deadline_at IS NOT NULL AND NOW() >= deadline_at THEN 'deadline' ELSE 'natural' END,
+                        completion_kind = CASE WHEN deadline_at IS NOT NULL AND CURRENT_TIMESTAMP >= deadline_at THEN 'deadline' ELSE 'natural' END,
                         recovery_deadline_at = NULL,
                         lifecycle_revision = lifecycle_revision + 1,
-                        completed_at = COALESCE(completed_at, NOW()),
+                        completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
                         duration_seconds = CASE
                             WHEN started_at IS NULL THEN duration_seconds
-                            ELSE GREATEST(
-                                0,
-                                EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - started_at))::integer
-                            )
+                            ELSE MAX(0, CAST(
+                                (julianday(COALESCE(completed_at, CURRENT_TIMESTAMP)) - julianday(started_at)) * 86400
+                                AS INTEGER
+                            ))
                         END,
                         full_transcript = CASE
-                            WHEN %s IS NULL THEN full_transcript
-                            ELSE %s::jsonb
+                            WHEN ? IS NULL THEN full_transcript
+                            ELSE ?
                         END,
                         transcript_encrypted = CASE
-                            WHEN %s IS NULL THEN transcript_encrypted
-                            ELSE %s
+                            WHEN ? IS NULL THEN transcript_encrypted
+                            ELSE ?
                         END,
                         feedback_summary = 'Interview complete. Async analysis is queued.'
-                    WHERE interview_id = %s
-                      AND user_id = %s
+                    WHERE interview_id = ?
+                      AND user_id = ?
                       AND status <> 'cancelled'
                     RETURNING status, analysis_job_id, completed_at
                     """,
@@ -982,7 +1051,7 @@ async def _finalize_interview_for_analysis(
                     if technical_interview:
                         cursor.execute(
                             """
-                            UPDATE TechnicalInterviewRounds round
+                            UPDATE TechnicalInterviewRounds AS round
                             SET status = CASE
                                     WHEN interview.completion_kind = 'deadline' THEN 'expired'
                                     ELSE 'completed'
@@ -990,13 +1059,13 @@ async def _finalize_interview_for_analysis(
                                 completed_at = COALESCE(
                                     round.completed_at,
                                     interview.completed_at,
-                                    NOW()
+                                    CURRENT_TIMESTAMP
                                 )
                             FROM Interviews interview
                             WHERE round.interview_id = interview.interview_id
                               AND round.user_id = interview.user_id
-                              AND interview.interview_id = %s
-                              AND interview.user_id = %s
+                              AND interview.interview_id = ?
+                              AND interview.user_id = ?
                               AND round.status NOT IN (
                                   'submitted', 'completed', 'expired', 'cancelled'
                               )
@@ -1047,7 +1116,7 @@ async def _finalize_interview_for_analysis(
             UPDATE Interviews
             SET analysis_status = 'failed',
                 feedback_summary = 'Interview complete, but analysis could not be queued. It will be retried automatically.'
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
               AND attempt_status = 'completed'
             """,
             (interview_id, user_id),
@@ -1058,9 +1127,9 @@ async def _finalize_interview_for_analysis(
         await async_execute(
             """
             UPDATE Interviews
-            SET analysis_job_id = %s
-            WHERE interview_id = %s
-              AND user_id = %s
+            SET analysis_job_id = ?
+            WHERE interview_id = ?
+              AND user_id = ?
               AND status IN ('analysis_pending', 'analysis_running')
             """,
             (job_id, interview_id, user_id),
@@ -1072,7 +1141,7 @@ async def _finalize_interview_for_analysis(
             UPDATE Interviews
             SET analysis_status = 'failed',
                 feedback_summary = 'Interview complete, but analysis could not be queued. It will be retried automatically.'
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
               AND attempt_status = 'completed'
             """,
             (interview_id, user_id),
@@ -1101,12 +1170,69 @@ def _build_retry_prompt(original_question: str, evaluation: Dict) -> str:
     return f"Let's retry that. {instruction} Same question: {original_question}"
 
 def _build_personalized_opening(persona: Dict, profile: Dict, signals: Dict, interview_mode: str) -> str:
-    name = (profile.get("name") or "").split(" ")[0] or "there"
+    name = re.sub(r"\s+", " ", str(profile.get("name") or "")).strip() or "there"
     role = profile.get("target_role") or persona.get("job_title") or "this role"
+    interviewer = persona.get("name", "your interviewer")
+
+    projects = profile.get("projects") if isinstance(profile.get("projects"), list) else []
+    for project in projects:
+        project_name = (
+            project.get("name") or project.get("title")
+            if isinstance(project, dict)
+            else project
+        )
+        project_name = re.sub(r"\s+", " ", str(project_name or "")).strip()[:100]
+        if project_name:
+            return (
+                f"Hi {name}, I am {interviewer}. What was the hardest decision you personally owned "
+                f"in {project_name} that best demonstrates your fit for the {role} role?"
+            )
+
+    experience = profile.get("experience") or profile.get("experiences") or []
+    if not isinstance(experience, list):
+        experience = [experience]
+    for item in experience:
+        if isinstance(item, dict):
+            title = item.get("title") or item.get("position") or item.get("role")
+            company = item.get("company") or item.get("organization")
+            experience_anchor = " at ".join(
+                value for value in (str(title or "").strip(), str(company or "").strip()) if value
+            )
+        else:
+            experience_anchor = str(item or "").strip()
+        experience_anchor = re.sub(r"\s+", " ", experience_anchor).strip()[:120]
+        if experience_anchor:
+            return (
+                f"Hi {name}, I am {interviewer}. Which decision you personally owned during your "
+                f"{experience_anchor} experience best demonstrates your fit for the {role} role?"
+            )
+
     return (
-        f"Hi {name}, I am {persona.get('name', 'your interviewer')}. "
+        f"Hi {name}, I am {interviewer}. "
         f"What should I know about your background and interest in the {role} role?"
     )
+
+
+def _build_opening_script(persona: Dict, profile: Dict) -> Dict[str, str]:
+    """Return the non-scored greeting and the short context prompt separately."""
+    name = re.sub(
+        r"\s+",
+        " ",
+        str(profile.get("name") or profile.get("full_name") or ""),
+    ).strip() or "there"
+    role = profile.get("target_role") or persona.get("job_title") or "this role"
+    interviewer = persona.get("name", "your interviewer")
+    return {
+        "greeting": (
+            f"Hi {name}, I'm {interviewer}, your interviewer for the {role} role. "
+            "We'll start with a brief introduction, then move through evidence-based "
+            "questions from your background and the role. I'll explain each step, and "
+            "your introduction is context only; scoring starts with the first round question."
+        ),
+        "intro_question": (
+            f"Could you give me a brief introduction and tell me what interests you about the {role} role?"
+        ),
+    }
 
 
 def _candidate_job_context(
@@ -1118,17 +1244,18 @@ def _candidate_job_context(
     profile_label: Any,
     blueprint: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Return only non-sensitive labels that are safe in plaintext settings.
+
+    The full description and its derived requirements stay in the encrypted
+    attempt snapshot.  Runtime code that needs them must decrypt that snapshot
+    in memory instead of copying excerpts into ``Interviews.settings``.
+    """
     clean_role = re.sub(r"\s+", " ", str(role or "General Interview")).strip()[:180]
     clean_company = re.sub(r"\s+", " ", str(company or "")).strip()[:120]
-    clean_jd = re.sub(r"\s+", " ", str(job_description or "")).strip()
-    summary = clean_jd[:220].rsplit(" ", 1)[0] if len(clean_jd) > 220 else clean_jd
-    source_tokens = ((blueprint or {}).get("source_summary") or {}).get("source_tokens") or []
     return {
         "role": clean_role,
         "company": clean_company or None,
         "job_title": f"{clean_role} at {clean_company}" if clean_company else clean_role,
-        "jd_summary": summary or None,
-        "key_skills": [str(value)[:60] for value in source_tokens[:8] if str(value).strip()],
         "profile_type": str(profile_type or "mid_tier"),
         "profile_label": str(profile_label or profile_type or "Mid Tier"),
     }
@@ -1148,7 +1275,7 @@ def _load_resume_version(
         SELECT resume_id, resume_payload_encrypted, resume_json, confirmation_status,
                facts_encrypted
         FROM ResumeVersions
-        WHERE resume_id = %s AND user_id = %s
+        WHERE resume_id = ? AND user_id = ?
         """,
         (resume_id, user_id),
     )
@@ -1196,9 +1323,9 @@ def _blueprint_preview(blueprint: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 async def _legacy_create_interview_blueprint_unused(
     request: CreateInterviewBlueprintRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
-    """Compile and freeze a previewable blueprint without consuming entitlement."""
+    """Compile and freeze a previewable blueprint for the local user."""
 
     def _compile_and_store() -> Dict[str, Any]:
         connection = get_db_connection()
@@ -1208,7 +1335,7 @@ async def _legacy_create_interview_blueprint_unused(
                 """
                 SELECT profile_json, resume_json, job_id, interview_profile_type
                 FROM UserInfo
-                WHERE user_id = %s
+                WHERE user_id = ?
                 """,
                 (current_user["user_id"],),
             )
@@ -1235,20 +1362,25 @@ async def _legacy_create_interview_blueprint_unused(
             if job_profile_id:
                 cursor.execute(
                     """
-                    SELECT role, company, tech_stack, normalized_requirements
+                    SELECT role, company, tech_stack, normalized_requirements,
+                           normalized_requirements_encrypted
                     FROM JobProfiles
-                    WHERE profile_id = %s AND user_id = %s
+                    WHERE profile_id = ? AND user_id = ?
                     """,
                     (job_profile_id, current_user["user_id"]),
                 )
                 job_row = cursor.fetchone()
                 if not job_row:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job profile not found")
-                role, company, tech_stack, normalized_requirements = job_row
+                role, company, tech_stack, normalized_requirements, normalized_requirements_encrypted = job_row
+                requirements_payload = _decrypt_json_blob(
+                    normalized_requirements_encrypted,
+                    _json_load(normalized_requirements, {}),
+                )
                 job_title = f"{role} at {company}" if company else str(role)
                 job_description = json.dumps({
                     "tech_stack": _json_load(tech_stack, []),
-                    "requirements": _json_load(normalized_requirements, {}),
+                    "requirements": requirements_payload,
                 })
             elif request.custom_job_title or request.custom_job_description:
                 role = (request.custom_job_title or "Custom Role").strip()
@@ -1258,7 +1390,7 @@ async def _legacy_create_interview_blueprint_unused(
             else:
                 job_id = request.job_id or user_row[2]
                 if job_id:
-                    cursor.execute("SELECT title, description FROM Jobs WHERE job_id = %s", (job_id,))
+                    cursor.execute("SELECT title, description FROM Jobs WHERE job_id = ?", (job_id,))
                     job_row = cursor.fetchone()
                     if not job_row:
                         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -1308,7 +1440,7 @@ async def _legacy_create_interview_blueprint_unused(
                     resume_id, job_profile_id, blueprint_json, settings_json,
                     blueprint_hash, expires_at, created_at
                 )
-                VALUES (%s, %s, 'ready', %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     blueprint_id,
@@ -1348,14 +1480,14 @@ async def _legacy_create_interview_blueprint_unused(
 
 async def _legacy_get_interview_blueprint_unused(
     blueprint_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     row = await async_execute(
         """
         SELECT status, interview_mode, interview_type, blueprint_json, settings_json,
                blueprint_hash, expires_at, consumed_by_interview_id
         FROM InterviewBlueprints
-        WHERE blueprint_id = %s AND user_id = %s
+        WHERE blueprint_id = ? AND user_id = ?
         """,
         (blueprint_id, current_user["user_id"]),
         fetchone=True,
@@ -1397,7 +1529,7 @@ def _existing_start_response(cursor: Any, user_id: str, key: Optional[str]) -> O
         """
         SELECT interview_id, session_id, interview_mode, persona_data, settings
         FROM Interviews
-        WHERE user_id = %s AND start_idempotency_key = %s
+        WHERE user_id = ? AND start_idempotency_key = ?
         """,
         (user_id, key),
     )
@@ -1411,7 +1543,6 @@ def _existing_start_response(cursor: Any, user_id: str, key: Optional[str]) -> O
         message="Interview already started for this request.",
         persona=_json_load(row[3], {}),
         settings=_json_load(row[4], {}),
-        interviews_remaining=-1,
     )
 
 
@@ -1460,7 +1591,7 @@ def _persist_raw_answer(
                 answer_text_encrypted, transcript_encrypted, raw_answer_hash,
                 input_mode, timing_json, nonverbal_metrics, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (interview_id, idempotency_key) DO NOTHING
             RETURNING response_id
             """,
@@ -1493,16 +1624,29 @@ def _persist_raw_answer(
         cursor.execute(
             """
             SELECT ir.response_id, ir.question_id, ir.raw_answer_hash,
-                   ra.assessment_id, ra.assessment_json
+                   (
+                       SELECT assessment_id
+                       FROM ResponseAssessments
+                       WHERE response_id = ir.response_id
+                       ORDER BY created_at DESC
+                       LIMIT 1
+                   ) AS assessment_id,
+                   (
+                       SELECT assessment_json_encrypted
+                       FROM ResponseAssessments
+                       WHERE response_id = ir.response_id
+                       ORDER BY created_at DESC
+                       LIMIT 1
+                   ) AS assessment_json_encrypted,
+                   (
+                       SELECT assessment_json
+                       FROM ResponseAssessments
+                       WHERE response_id = ir.response_id
+                       ORDER BY created_at DESC
+                       LIMIT 1
+                   ) AS assessment_json
             FROM InterviewResponses ir
-            LEFT JOIN LATERAL (
-                SELECT assessment_id, assessment_json
-                FROM ResponseAssessments
-                WHERE response_id = ir.response_id
-                ORDER BY created_at DESC
-                LIMIT 1
-            ) ra ON TRUE
-            WHERE ir.interview_id = %s AND ir.idempotency_key = %s
+            WHERE ir.interview_id = ? AND ir.idempotency_key = ?
             """,
             (interview_id, idempotency_key),
         )
@@ -1520,7 +1664,7 @@ def _persist_raw_answer(
             "inserted": False,
             "raw_answer_hash": raw_hash,
             "assessment_id": existing[3],
-            "assessment": _json_load(existing[4], None),
+            "assessment": decrypt_json_field(existing[4], existing[5], None),
         }
     except Exception:
         connection.rollback()
@@ -1641,9 +1785,10 @@ def _commit_live_assessment(
             """
             INSERT INTO ResponseAssessments (
                 assessment_id, response_id, interview_id, evaluator_version,
-                evidence_hash, overall_score, assessment_json, created_at
+                evidence_hash, overall_score, assessment_json,
+                assessment_json_encrypted, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (response_id, evaluator_version, evidence_hash) DO NOTHING
             RETURNING assessment_id
             """,
@@ -1654,16 +1799,17 @@ def _commit_live_assessment(
                 EVALUATION_VERSION,
                 evidence_hash,
                 assessment.get("overall_score"),
-                json.dumps(assessment, default=str),
+                json.dumps({"encrypted": True}),
+                encrypt_data(json.dumps(assessment, default=str)).encode("utf-8"),
             ),
         )
         inserted = cursor.fetchone()
         if not inserted:
             cursor.execute(
                 """
-                SELECT assessment_id, assessment_json
+                SELECT assessment_id, assessment_json_encrypted, assessment_json
                 FROM ResponseAssessments
-                WHERE response_id = %s AND evaluator_version = %s AND evidence_hash = %s
+                WHERE response_id = ? AND evaluator_version = ? AND evidence_hash = ?
                 """,
                 (response_id, EVALUATION_VERSION, evidence_hash),
             )
@@ -1671,13 +1817,13 @@ def _commit_live_assessment(
             connection.commit()
             return {
                 "assessment_id": existing[0] if existing else None,
-                "assessment": _json_load(existing[1], assessment) if existing else assessment,
+                "assessment": decrypt_json_field(existing[1], existing[2], assessment) if existing else assessment,
                 "duplicate": True,
             }
 
         if next_question:
             cursor.execute(
-                "SELECT COALESCE(MAX(question_order), -1) + 1 FROM InterviewQuestions WHERE interview_id = %s",
+                "SELECT COALESCE(MAX(question_order), -1) + 1 FROM InterviewQuestions WHERE interview_id = ?",
                 (interview_id,),
             )
             question_order = int((cursor.fetchone() or [0])[0] or 0)
@@ -1692,9 +1838,9 @@ def _commit_live_assessment(
                     blueprint_section_id, provenance, question_spec_id,
                     max_followups, time_budget_seconds, expected_point_ids
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'deterministic_policy',
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'deterministic_policy',
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?)
                 ON CONFLICT (question_id) DO NOTHING
                 """,
                 (
@@ -1728,8 +1874,16 @@ def _commit_live_assessment(
                 ),
             )
         cursor.execute(
-            "UPDATE Interviews SET questions_data = %s WHERE interview_id = %s",
-            (json.dumps(knowledge_map), interview_id),
+            """
+            UPDATE Interviews
+            SET questions_data = ?, questions_data_encrypted = ?
+            WHERE interview_id = ?
+            """,
+            (
+                json.dumps({"encrypted": True}),
+                encrypt_data(json.dumps(knowledge_map, default=str)).encode("utf-8"),
+                interview_id,
+            ),
         )
         connection.commit()
         return {"assessment_id": assessment_id, "assessment": assessment, "duplicate": False}
@@ -1751,27 +1905,10 @@ def _followup_template(action: str, topic: str) -> str:
     }
     return templates.get(action, f"What specific example supports your point about {topic}?")
 
-@router.post("/ws-ticket")
-async def create_ws_ticket(current_user: Dict = Depends(get_current_user)):
-    redis_client = get_redis_client()
-    ticket = str(uuid.uuid4())
-    if redis_client:
-        try:
-            redis_client.setex(
-                f"{WS_TICKET_REDIS_PREFIX}{ticket}",
-                settings.WS_TICKET_TTL_SECONDS,
-                current_user["user_id"],
-            )
-            return {"ticket": ticket}
-        except Exception:
-            logger.warning("Redis WebSocket ticket write failed; using signed fallback ticket")
-
-    return {"ticket": _create_signed_ws_ticket(current_user["user_id"])}
-
 @router.post("/start", response_model=InterviewResponse)
 async def start_interview(
     request: StartInterviewRequest,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -1780,11 +1917,9 @@ async def start_interview(
         cursor.execute(
             """
             SELECT profile_completed, job_id, profile_json, resume_json,
-                   interviews_remaining, is_unlimited, external_profile_signals, plan_type,
                    interview_profile_type
             FROM UserInfo
-            WHERE user_id = %s
-            FOR UPDATE
+            WHERE user_id = ?
             """,
             (current_user["user_id"],)
         )
@@ -1817,10 +1952,9 @@ async def start_interview(
                        job_profile_id, blueprint_json, settings_json, status,
                        expires_at, consumed_by_interview_id, round_config,
                        blueprint_json_encrypted,
-                       (expires_at IS NULL OR expires_at > NOW()) AS is_unexpired
+                       (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP) AS is_unexpired
                 FROM InterviewBlueprints
-                WHERE blueprint_id = %s AND user_id = %s
-                FOR UPDATE
+                WHERE blueprint_id = ? AND user_id = ?
                 """,
                 (request.blueprint_id, current_user["user_id"]),
             )
@@ -1833,7 +1967,7 @@ async def start_interview(
                     """
                     SELECT interview_id, session_id, interview_mode, persona_data, settings
                     FROM Interviews
-                    WHERE interview_id = %s AND user_id = %s
+                    WHERE interview_id = ? AND user_id = ?
                     """,
                     (blueprint_row[9], current_user["user_id"]),
                 )
@@ -1847,13 +1981,12 @@ async def start_interview(
                         message="This blueprint was already consumed by the committed interview.",
                         persona=_json_load(consumed_interview[3], {}),
                         settings=_json_load(consumed_interview[4], {}),
-                        interviews_remaining=-1,
                     )
             if blueprint_status != "ready":
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Interview blueprint is not ready")
             if not bool(blueprint_row[12]):
                 cursor.execute(
-                    "UPDATE InterviewBlueprints SET status = 'expired' WHERE blueprint_id = %s AND status = 'ready'",
+                    "UPDATE InterviewBlueprints SET status = 'expired' WHERE blueprint_id = ? AND status = 'ready'",
                     (request.blueprint_id,),
                 )
                 raise HTTPException(status_code=status.HTTP_410_GONE, detail="Interview blueprint has expired")
@@ -1876,8 +2009,6 @@ async def start_interview(
                 "duration_minutes",
                 "programming_language",
                 "question_count",
-                "input_mode",
-                "camera_mode",
             ):
                 if frozen_settings.get(field_name) is not None:
                     setattr(request, field_name, frozen_settings[field_name])
@@ -1911,25 +2042,12 @@ async def start_interview(
             fallback_resume=legacy_resume_json,
         )
         profile_json = _best_available_profile(profile_json, resume_json)
-        interviews_remaining = row[4] or 0
-        is_unlimited = row[5] or False
-        external_profile_signals = _json_load(row[6], {})
-        plan_type = get_active_subscription_plan_type(cursor, current_user["user_id"]) or "starter"
+        external_profile_signals = {}
         is_technical_mode = is_technical_interview_type(request.interview_type)
-        if not is_technical_mode and request.input_mode != "voice":
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="The Interview Round requires voice input",
-            )
-        profile_type = normalize_profile_type(request.profile_type or row[8])
+        request.input_mode = "voice" if request.input_mode == "voice" else "text"
+        profile_type = normalize_profile_type(request.profile_type or row[4])
         if is_technical_mode:
             profile_type = normalize_technical_profile(profile_type)
-        uses_custom_jd = bool(
-            profile_type == "custom"
-            or (request.custom_job_title or "").strip()
-            or (request.custom_job_description or "").strip()
-            or (request.company_name or "").strip()
-        )
         profile_config = get_profile_config(profile_type)
         strictness_level = profile_config["strictness_level"]
 
@@ -1942,29 +2060,24 @@ async def start_interview(
             expected_flow = "technical" if is_technical_mode else "interview"
             cursor.execute(
                 """
-                SELECT flow, camera_ready, microphone_ready, microphone_level_detected,
-                       screen_share_ready, network_ready, backend_ready, openai_ready,
+                SELECT flow, input_mode, camera_ready, microphone_ready, microphone_level_detected,
+                       screen_share_ready, network_ready, backend_ready, provider_ready,
                        sandbox_ready, worker_ready, expires_at, consumed_at,
-                       (expires_at > NOW()) AS is_unexpired
+                       (expires_at > CURRENT_TIMESTAMP) AS is_unexpired
                 FROM AttemptPreflightChecks
-                WHERE preflight_id = %s AND user_id = %s AND blueprint_id = %s
-                FOR UPDATE
+                WHERE preflight_id = ? AND user_id = ? AND blueprint_id = ?
                 """,
                 (request.preflight_id, current_user["user_id"], request.blueprint_id),
             )
             preflight = cursor.fetchone()
             if not preflight:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preflight check not found")
-            required_ready = (
-                all(bool(value) for value in preflight[1:4])
-                and (expected_flow != "technical" or bool(preflight[4]))
-                and all(bool(value) for value in (preflight[5], preflight[6], preflight[7], preflight[9]))
-            )
-            if expected_flow == "technical":
-                required_ready = required_ready and bool(preflight[8])
-            if str(preflight[0]) != expected_flow or preflight[11] is not None:
+            required_ready = all(bool(value) for value in (preflight[6], preflight[7], preflight[8], preflight[10]))
+            if request.input_mode == "voice":
+                required_ready = required_ready and bool(preflight[3]) and bool(preflight[4])
+            if str(preflight[0]) != expected_flow or str(preflight[1]) != request.input_mode or preflight[12] is not None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight does not match this attempt or was already consumed")
-            if not bool(preflight[12]):
+            if not bool(preflight[13]):
                 raise HTTPException(status_code=status.HTTP_410_GONE, detail="Preflight expired. Run the environment check again")
             if not required_ready:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight requirements are not ready")
@@ -1974,9 +2087,10 @@ async def start_interview(
             cursor.execute(
                 """
                 SELECT profile_id, role, company, tech_stack,
-                       job_description_encrypted, normalized_requirements
+                       job_description_encrypted, normalized_requirements,
+                       normalized_requirements_encrypted
                 FROM JobProfiles
-                WHERE profile_id = %s AND user_id = %s
+                WHERE profile_id = ? AND user_id = ?
                 """,
                 (frozen_job_profile_id, current_user["user_id"])
             )
@@ -1999,35 +2113,6 @@ async def start_interview(
                 detail=f"Please complete your profile: missing {', '.join(missing)}"
             )
 
-        entitlement_snapshot = enforce_interview_start(
-            cursor,
-            user_id=current_user["user_id"],
-            plan_type=plan_type,
-            is_technical=is_technical_mode,
-            uses_custom_jd=uses_custom_jd,
-        )
-
-        uses_legacy_credits = bool(entitlement_snapshot.get("entitlements", {}).get("uses_legacy_credits"))
-        if uses_legacy_credits and not is_unlimited:
-            cursor.execute(
-                """
-                UPDATE UserInfo
-                SET interviews_remaining = interviews_remaining - 1
-                WHERE user_id = %s AND interviews_remaining > 0
-                RETURNING interviews_remaining
-                """,
-                (current_user["user_id"],)
-            )
-            deducted = cursor.fetchone()
-            if not deducted:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="No interviews remaining. Please purchase a plan to continue."
-                )
-            interviews_remaining = deducted[0]
-        elif not uses_legacy_credits:
-            interviews_remaining = -1
-
         job_id = request.job_id or row[1]
 
         role = ""
@@ -2048,7 +2133,10 @@ async def start_interview(
             if isinstance(encrypted_jd, bytes):
                 encrypted_jd = encrypted_jd.decode("utf-8")
             job_description = decrypt_data(encrypted_jd) if encrypted_jd else ""
-            normalized_requirements = _json_load(selected_job_profile[5], {})
+            normalized_requirements = _decrypt_json_blob(
+                selected_job_profile[6],
+                _json_load(selected_job_profile[5], {}),
+            )
             if not job_description and isinstance(normalized_requirements, dict):
                 job_description = "\n".join(
                     str(item) for item in normalized_requirements.get("requirements") or []
@@ -2072,7 +2160,7 @@ async def start_interview(
             }
         elif job_id:
             cursor.execute(
-                "SELECT title, description FROM Jobs WHERE job_id = %s",
+                "SELECT title, description FROM Jobs WHERE job_id = ?",
                 (job_id,)
             )
             job_row = cursor.fetchone()
@@ -2139,9 +2227,7 @@ async def start_interview(
         request.question_count = TECHNICAL_CODING_QUESTION_COUNT if is_technical_mode and settings.TECHNICAL_CODING_ONLY else None
         request.technical_topics = []
         request.technical_round_types = ["coding"] if is_technical_mode and settings.TECHNICAL_CODING_ONLY else []
-        request.camera_mode = "required"
-        if not is_technical_mode:
-            request.input_mode = "voice"
+        request.camera_mode = "optional"
 
         planner_profile = dict(profile_json or resume_json or {})
         planner_profile["external_profile_signals"] = external_profile_signals
@@ -2205,8 +2291,9 @@ async def start_interview(
             "hints_enabled": False,
             "immediate_feedback": False,
             "time_limit_per_question": TECHNICAL_MINUTES_PER_QUESTION * 60 if is_technical_mode else 300,
-            "nonverbal_analysis": "browser_mediapipe",
+            "nonverbal_analysis": "browser_local_camera_coaching",
             "technical_mode": is_technical_mode,
+            "technical_activation_required": is_technical_mode,
             "technical_rounds": (
                 ["coding"]
                 if is_technical_mode and settings.TECHNICAL_CODING_ONLY
@@ -2214,39 +2301,47 @@ async def start_interview(
             ) if is_technical_mode else [],
             "blueprint_id": request.blueprint_id,
             "blueprint_hash": knowledge_map.get("blueprint_hash"),
-            "entitlement_snapshot": entitlement_snapshot,
             # The immutable interview snapshot owns the full JD used by the
             # Technical compiler. Only its hash remains queryable in plaintext.
             "job_description_encrypted": encrypt_data(job_description or "") if job_description else None,
             "job_description_hash": hashlib.sha256((job_description or "").encode("utf-8")).hexdigest(),
         }
 
-        started_at = datetime.now(timezone.utc)
-        deadline_at = started_at + timedelta(minutes=int(duration_config["max_minutes"]))
+        # Technical rounds are prepared before activation.  Their server-owned
+        # clock starts only from POST /api/technical/sessions/{id}/activate.
+        created_at = datetime.now(timezone.utc)
+        started_at = None if is_technical_mode else created_at
+        deadline_at = (
+            None
+            if is_technical_mode
+            else started_at + timedelta(minutes=int(duration_config["max_minutes"]))
+        )
         cursor.execute(
             """
             INSERT INTO Interviews (
                 interview_id, user_id, interview_mode, interview_type,
                 job_title, strictness_level, status, session_id,
-                persona_data, questions_data, settings, resume_id, job_profile_id,
+                persona_data, questions_data, questions_data_encrypted,
+                settings, resume_id, job_profile_id,
                 blueprint_id, start_idempotency_key, started_at, deadline_at,
                 duration_seconds, created_at, attempt_status, analysis_status,
                 integrity_status, lifecycle_revision
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, 'active',
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, 'active',
                     'not_requested', 'clean', 1)
             """,
             (
                 interview_id, current_user["user_id"], request.interview_mode,
                 request.interview_type, job_title, strictness_level, "in_progress",
-                session_id, json.dumps(persona), json.dumps(knowledge_map),
+                session_id, json.dumps(persona), json.dumps({"encrypted": True}),
+                encrypt_data(json.dumps(knowledge_map, default=str)).encode("utf-8"),
                 json.dumps(interview_settings), selected_resume_id, frozen_job_profile_id,
                 request.blueprint_id, request.start_idempotency_key,
                 started_at,
                 deadline_at,
                 duration_minutes * 60,
-                started_at,
+                created_at,
             )
         )
 
@@ -2279,7 +2374,7 @@ async def start_interview(
             interview_settings["context_snapshot_id"] = snapshot_id
             interview_settings["context_hash"] = context_hash
             cursor.execute(
-                "UPDATE Interviews SET settings = %s WHERE interview_id = %s",
+                "UPDATE Interviews SET settings = ? WHERE interview_id = ?",
                 (json.dumps(interview_settings), interview_id),
             )
         elif settings.ENVIRONMENT != "test":
@@ -2292,8 +2387,8 @@ async def start_interview(
             cursor.execute(
                 """
                 UPDATE InterviewBlueprints
-                SET status = 'consumed', consumed_at = NOW(), consumed_by_interview_id = %s
-                WHERE blueprint_id = %s AND user_id = %s
+                SET status = 'consumed', consumed_at = CURRENT_TIMESTAMP, consumed_by_interview_id = ?
+                WHERE blueprint_id = ? AND user_id = ?
                   AND status = 'ready' AND consumed_by_interview_id IS NULL
                 RETURNING blueprint_id
                 """,
@@ -2306,8 +2401,8 @@ async def start_interview(
             cursor.execute(
                 """
                 UPDATE AttemptPreflightChecks
-                SET consumed_at = NOW(), consumed_by_interview_id = %s
-                WHERE preflight_id = %s AND consumed_at IS NULL
+                SET consumed_at = CURRENT_TIMESTAMP, consumed_by_interview_id = ?
+                WHERE preflight_id = ? AND consumed_at IS NULL
                 RETURNING preflight_id
                 """,
                 (interview_id, request.preflight_id),
@@ -2316,7 +2411,7 @@ async def start_interview(
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Preflight was already consumed")
 
         cursor.execute(
-            "UPDATE UserInfo SET interview_profile_type = %s, updated_at = NOW() WHERE user_id = %s",
+            "UPDATE UserInfo SET interview_profile_type = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
             (profile_type, current_user["user_id"])
         )
 
@@ -2324,22 +2419,21 @@ async def start_interview(
             pass
         elif request.interview_mode == "mock":
             cursor.execute(
-                "UPDATE UserInfo SET mock_interview_count = mock_interview_count + 1 WHERE user_id = %s",
+                "UPDATE UserInfo SET mock_interview_count = mock_interview_count + 1 WHERE user_id = ?",
                 (current_user["user_id"],)
             )
         else:
             cursor.execute(
-                "UPDATE UserInfo SET practice_interview_count = practice_interview_count + 1 WHERE user_id = %s",
+                "UPDATE UserInfo SET practice_interview_count = practice_interview_count + 1 WHERE user_id = ?",
                 (current_user["user_id"],)
             )
 
         connection.commit()
 
         logger.info(
-            "%s interview started: %s, interviews_remaining=%s",
+            "%s interview started: %s",
             request.interview_mode.upper(),
             stable_hash(interview_id, "interview"),
-            "plan-limited" if not uses_legacy_credits else ("unlimited" if is_unlimited else interviews_remaining),
         )
 
         return InterviewResponse(**{
@@ -2352,7 +2446,6 @@ async def start_interview(
             ),
             "persona": persona,
             "settings": interview_settings,
-            "interviews_remaining": -1 if (is_unlimited or not uses_legacy_credits) else interviews_remaining,
             "attempt_status": "active",
             "analysis_status": "not_requested",
             "integrity_status": "clean",
@@ -2380,10 +2473,22 @@ async def start_interview(
         cursor.close()
         return_db_connection(connection)
 
-@router.websocket("/ws/video/{ticket}")
-async def websocket_video_interview(websocket: WebSocket, ticket: str):
-    redis_client = get_redis_client()
-    user_id = None
+@router.websocket("/ws/video")
+async def websocket_video_interview(websocket: WebSocket):
+    origin = websocket.headers.get("origin")
+    token = websocket.headers.get("x-prepmate-token") or websocket.headers.get("x-interai-token") or websocket.query_params.get("desktop_token")
+    host = websocket.url.hostname or websocket.headers.get("host", "")
+    authorized = (
+        is_loopback_host(host)
+        and (is_allowed_local_origin(origin) or (configured_api_token() and api_token_matches(token)))
+        and api_token_matches(token)
+    )
+    if not authorized:
+        await websocket.close(code=1008, reason="Local desktop authorization failed")
+        return
+
+    user_id = LOCAL_USER_ID
+    coordination_store = get_local_cache()
     ws_connection_id = str(uuid.uuid4())
     active_session_key: Optional[str] = None
     controller_lease_task: Optional[asyncio.Task] = None
@@ -2392,22 +2497,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
     background_tasks = set()
     interview_id: Optional[str] = None
     completion_sent = False
-
-    if redis_client:
-        try:
-            ticket_key = f"{WS_TICKET_REDIS_PREFIX}{ticket}"
-            user_id = redis_client.get(ticket_key)
-            if user_id:
-                redis_client.delete(ticket_key)
-        except Exception:
-            logger.warning("Redis WebSocket ticket lookup failed; checking signed fallback ticket")
-
-    if not user_id:
-        user_id = _decode_signed_ws_ticket(ticket)
-
-    if not user_id:
-        await websocket.close(code=4001, reason="Invalid or expired ticket")
-        return
 
     try:
         await websocket.accept()
@@ -2428,6 +2517,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
         current_question_type: str = "main"
         current_parent_question_id: Optional[str] = None
         warmup_pending: bool = False
+        opening_intro_delivered: bool = False
         # Pipeline removed — monitoring managed client-side
         resume_context: str = ""
         report_profile_context: Dict[str, Any] = {}
@@ -2479,7 +2569,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 if ws_closing or not active_session_key:
                     return
                 try:
-                    renewed = renew_controller_lease(redis_client, active_session_key, ws_connection_id)
+                    renewed = renew_controller_lease(coordination_store, active_session_key, ws_connection_id)
                 except Exception:
                     renewed = False
                 if renewed:
@@ -2530,34 +2620,19 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     event_id, interview_id, user_id, client_session_id, sequence,
                     event_type, severity, source, observed_at, received_at,
                     payload_encrypted, payload_hash, idempotency_key
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
                 ON CONFLICT DO NOTHING
                 RETURNING event_id
                 """,
                 (
                     resolved_event_id, interview_id, user_id, resolved_client_session,
                     sequence, canonical_type,
-                    "severe" if canonical_type in {"camera_stopped", "microphone_stopped", "screen_share_stopped", "paste", "paste_blocked"} else "warning",
+                    "info",
                     source, observed_at, encrypt_data(encoded_payload).encode("utf-8"),
                     payload_hash, resolved_event_id,
                 ),
                 fetchone=True,
             )
-            if inserted:
-                await async_execute(
-                    """
-                    UPDATE Interviews
-                    SET integrity_status = 'flagged',
-                        lifecycle_revision = lifecycle_revision + 1
-                    WHERE interview_id = %s AND user_id = %s
-                      AND integrity_status = 'clean'
-                      AND (
-                        SELECT COUNT(*) FROM AttemptIntegrityEvents
-                        WHERE interview_id = %s AND severity = 'severe'
-                      ) >= 3
-                    """,
-                    (interview_id, user_id, interview_id),
-                )
             return bool(inserted)
 
         async def update_question_delivery_metadata(question_id: str, metadata: Dict[str, Any]):
@@ -2567,8 +2642,8 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 _db_execute,
                 """
                 UPDATE InterviewQuestions
-                SET generation_metadata = COALESCE(generation_metadata, '{}'::jsonb) || %s::jsonb
-                WHERE question_id = %s
+                SET generation_metadata = json_patch(COALESCE(generation_metadata, '{}'), ?)
+                WHERE question_id = ?
                 """,
                 (json.dumps(metadata), question_id),
                 commit=True,
@@ -2627,12 +2702,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     }
                 },
             )
-            question_text = str(enriched.get("question_text") or "").strip()
-            if question_text and not enriched.get("question_audio"):
-                enriched["audio_pending"] = True
             await send_ws_message(enriched)
-            if question_text and not enriched.get("question_audio"):
-                track_ws_task(send_speech_chunk(question_text, str(question_id)))
             track_ws_task(retry_question_if_unacked(question_id, enriched))
 
         def get_topic_number(battleground_id: Any) -> int:
@@ -2649,24 +2719,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 "speaking": False,
                 "processing": False,
             })
-
-        async def send_speech_chunk(text: str, question_id: Optional[str] = None):
-            if ws_closing:
-                return
-            audio = await generate_speech(text)
-            if audio and not ws_closing:
-                await send_ws_message({
-                    "type": "audio_chunk",
-                    "audio": audio,
-                    "audio_mime_type": "audio/wav",
-                    "question_id": question_id,
-                })
-            elif not ws_closing:
-                await send_ws_message({
-                    "type": "speech_unavailable",
-                    "question_id": question_id,
-                    "message": "Interviewer voice is temporarily unavailable. The question remains on screen.",
-                })
 
         def configured_duration_seconds(key: str, fallback_minutes: int) -> int:
             duration = ws_settings.get("duration") if isinstance(ws_settings, dict) else {}
@@ -2707,10 +2759,14 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 _db_execute,
                 """
                 UPDATE Interviews
-                SET questions_data = %s
-                WHERE interview_id = %s
+                SET questions_data = ?, questions_data_encrypted = ?
+                WHERE interview_id = ?
                 """,
-                (json.dumps(knowledge_map), interview_id),
+                (
+                    json.dumps({"encrypted": True}),
+                    encrypt_data(json.dumps(knowledge_map, default=str)).encode("utf-8"),
+                    interview_id,
+                ),
                 commit=True,
             )
 
@@ -2721,9 +2777,11 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
             await async_execute(
                 """
                 UPDATE Interviews
-                SET settings = COALESCE(settings, '{}'::jsonb)
-                    || jsonb_build_object('answer_quality_failure_streak', %s)
-                WHERE interview_id = %s AND user_id = %s
+                SET settings = json_patch(
+                    COALESCE(settings, '{}'),
+                    json_object('answer_quality_failure_streak', ?)
+                )
+                WHERE interview_id = ? AND user_id = ?
                 """,
                 (max(0, int(value)), interview_id, user_id),
             )
@@ -2747,6 +2805,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 "profile_label": ws_settings.get("profile_label"),
                 "job_title": ws_settings.get("job_title"),
                 "source": "live_ai",
+                "scoring_excluded": question_type in {"warmup", "introduction"},
                 **(generation_metadata or {}),
             }
             section_id = str(battleground.get("section_id") or "").strip() or None
@@ -2775,8 +2834,8 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     selection_reason, blueprint_section_id, provenance,
                     question_spec_id, max_followups, time_budget_seconds,
                     expected_point_ids
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (question_id) DO NOTHING
                 """,
                 (
@@ -2866,8 +2925,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     "and your detailed report will appear when processing finishes."
                 )
                 payload["closing_text"] = closing_text
-                payload["closing_audio"] = await generate_speech(closing_text)
-                payload["audio_mime_type"] = "audio/wav"
 
             await send_ws_message(payload)
 
@@ -2939,6 +2996,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                 job_title=ws_settings.get("job_title", ""),
                 resume_context=resume_context,
+                job_context=ws_settings.get("job_context"),
                 question_id=followup_question_id,
                 parent_question_id=parent_question_id,
                 user_id=user_id,
@@ -3028,7 +3086,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     })
                     return
 
-                if not _is_usable_live_answer(cleaned_response):
+                if not warmup_pending and not _is_usable_live_answer(cleaned_response):
                     await register_live_quality_failure(
                         "answer_too_short",
                         "I need a complete answer. Please finish your thought and answer the question directly.",
@@ -3063,7 +3121,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "label": "Warm-up",
                         "kind": "behavioral",
                         "taxonomy_keys": ["behavioral:introduction"],
-                        "expected_points": ["direct background summary", "role motivation"],
+                        "expected_points": ["personal ownership", "role relevance"],
                         "rubric": {
                             "version": "warmup_v1",
                             "weights": {"relevance": 0.5, "communication": 0.5},
@@ -3138,22 +3196,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "recovering": True,
                     })
 
-                semantic_count_row = await async_execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM ResponseAssessments
-                    WHERE interview_id = %s
-                      AND assessment_json->'semantic_status'->>'attempted' = 'true'
-                    """,
-                    (interview_id,),
-                    fetchone=True,
-                )
-                semantic_count = int(semantic_count_row[0] or 0) if semantic_count_row else 0
-                live_budget = min(
-                    settings.MODEL_MAX_LIVE_EVALUATIONS_PER_INTERVIEW,
-                    max(1, math.ceil(int(ws_settings.get("duration_minutes") or 30) / 5)),
-                    12,
-                )
                 point_contract = _expected_point_contract(question_spec, question_id)
                 rubric = {
                     **(question_spec.get("rubric") or {}),
@@ -3168,7 +3210,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     "question_type": question_spec.get("kind") or question_kind,
                     "taxonomy_keys": question_spec.get("taxonomy_keys") or [],
                     "source_anchors": question_spec.get("source_anchors") or [],
-                    "semantic_budget_available": semantic_count < live_budget,
                     "semantic_analysis_enabled": True,
                 }
                 try:
@@ -3210,7 +3251,23 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     question_id=question_id,
                 )
 
-                answer_is_relevant, quality_reason = _live_answer_quality(evaluation)
+                if warmup_pending:
+                    # The introduction helps the interviewer orient follow-up
+                    # wording only.  It is persisted as context evidence, but
+                    # can never contribute a score, quality failure, or
+                    # learning signal.
+                    evaluation.update({
+                        "overall_score": None,
+                        "provisional_score": None,
+                        "authoritative": False,
+                        "insufficient_evidence": True,
+                        "evidence_status": "context_only",
+                        "scoring_excluded": True,
+                        "answer_quality_flags": [],
+                    })
+                    answer_is_relevant, quality_reason = True, "context_only"
+                else:
+                    answer_is_relevant, quality_reason = _live_answer_quality(evaluation)
                 quality_retry = False
                 quality_end = False
                 quality_feedback = ""
@@ -3331,6 +3388,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                                 job_title=ws_settings.get("job_title", ""),
                                 resume_context=resume_context,
+                                job_context=ws_settings.get("job_context"),
                                 followup_action=decision_action,
                                 question_id=next_question_id,
                                 parent_question_id=question_id,
@@ -3354,6 +3412,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                                 job_title=ws_settings.get("job_title", ""),
                                 resume_context=resume_context,
+                                job_context=ws_settings.get("job_context"),
                                 followup_action=decision_action,
                                 question_id=next_question_id,
                                 parent_question_id=question_id,
@@ -3556,7 +3615,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     allow_legacy=settings.ENVIRONMENT == "test",
                 )
                 if not client_event.legacy:
-                    if redis_client is None:
+                    if coordination_store is None:
                         await send_ws_message({
                             "type": "error",
                             "code": "event_dedup_unavailable",
@@ -3572,7 +3631,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         })
                         continue
                     try:
-                        claim_status = claim_event_sequence(redis_client, client_event)
+                        claim_status = claim_event_sequence(coordination_store, client_event)
                     except Exception:
                         await send_ws_message({
                             "type": "error",
@@ -3631,9 +3690,10 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         _db_execute,
                         """
                         SELECT persona_data, questions_data, strictness_level, interview_mode, settings,
-                               status, report_json, started_at, deadline_at, report_json_encrypted
+                               status, report_json, started_at, deadline_at, report_json_encrypted,
+                               questions_data_encrypted
                         FROM Interviews
-                        WHERE interview_id = %s AND user_id = %s
+                        WHERE interview_id = ? AND user_id = ?
                         """,
                         (interview_id, user_id),
                         fetchone=True
@@ -3678,26 +3738,28 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                                 attempt_status = 'active',
                                 recovery_deadline_at = NULL,
                                 lifecycle_revision = lifecycle_revision + 1,
-                                settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
-                                    || jsonb_build_object(
+                                settings = json_patch(
+                                    json_remove(COALESCE(settings, '{}'), '$.recovery_deadline', '$.recovery_reason'),
+                                    json_object(
                                         'reconnection_count',
-                                        COALESCE((settings->>'reconnection_count')::integer, 0) + 1
+                                        COALESCE(CAST(json_extract(settings, '$.reconnection_count') AS INTEGER), 0) + 1
                                     )
-                            WHERE interview_id = %s AND user_id = %s AND status = 'recovering'
+                                )
+                            WHERE interview_id = ? AND user_id = ? AND status = 'recovering'
                             """,
                             (interview_id, user_id),
                         )
                         await async_execute(
                             """
-                            INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
-                            VALUES (%s, %s, 'connection_restored', '{}'::jsonb)
+                            INSERT INTO SelfReviewEvents (interview_id, user_id, event_type, payload)
+                            VALUES (?, ?, 'connection_restored', '{}')
                             """,
                             (interview_id, user_id),
                         )
                         await persist_integrity_event("connection_restored", {}, source="server")
                         current_status = "in_progress"
 
-                    if redis_client is None:
+                    if coordination_store is None:
                         await send_ws_message({
                             "type": "error",
                             "code": "controller_lease_unavailable",
@@ -3708,7 +3770,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     if not active_session_key:
                         try:
                             active_session_key = f"attempt-controller:{interview_id}"
-                            acquired = acquire_controller_lease(redis_client, active_session_key, ws_connection_id)
+                            acquired = acquire_controller_lease(coordination_store, active_session_key, ws_connection_id)
                             if not acquired:
                                 await persist_integrity_event(
                                     "duplicate_controller_rejected",
@@ -3725,7 +3787,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             controller_lease_task = track_ws_task(renew_controller_loop())
                         except Exception:
                             active_session_key = None
-                            logger.warning("Redis active interview lock failed; rejecting unsafe session binding")
+                            logger.warning("Local active interview lock failed; rejecting unsafe session binding")
                             await send_ws_message({
                                 "type": "error",
                                 "code": "controller_lease_unavailable",
@@ -3736,9 +3798,12 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     session_bound = True
 
                     persona = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                    knowledge_map = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+                    knowledge_map = decrypt_json_field(row[10], row[1], {})
+                    if not isinstance(knowledge_map, dict):
+                        raise RuntimeError("The encrypted interview question plan is invalid")
                     interview_mode = row[3]
                     ws_settings = row[4] if isinstance(row[4], dict) else json.loads(row[4]) if row[4] else {}
+                    opening_intro_delivered = bool(ws_settings.get("opening_intro_delivered"))
                     session_started_at = (
                         _coerce_blueprint_datetime(row[7])
                         if row[7]
@@ -3776,7 +3841,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         """
                         SELECT resume_payload_encrypted
                         FROM AttemptContextSnapshots
-                        WHERE interview_id = %s AND user_id = %s
+                        WHERE interview_id = ? AND user_id = ?
                         """,
                         (interview_id, user_id),
                         fetchone=True,
@@ -3785,7 +3850,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     if not snapshot_row:
                         resume_row, _ = await asyncio.to_thread(
                             _db_execute,
-                            "SELECT resume_json, profile_json, external_profile_signals FROM UserInfo WHERE user_id = %s",
+                            "SELECT resume_json, profile_json FROM UserInfo WHERE user_id = ?",
                             (user_id,),
                             fetchone=True
                         )
@@ -3819,7 +3884,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     elif resume_row:
                         rj = _json_load(resume_row[0], {})
                         pj = _json_load(resume_row[1], {})
-                        external_signals = resume_row[2] or {}
                         profile_for_opening = rj or pj
                         report_profile_context = _profile_context_from_rows(rj, pj, external_signals)
                         parts = []
@@ -3840,10 +3904,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         for proj in projs[:3]:
                             if isinstance(proj, dict):
                                 parts.append(f"Project: {proj.get('name', '')} - {proj.get('description', '')[:150]}")
-                        github = external_signals.get("github", {}) if isinstance(external_signals, dict) else {}
-                        for repo in (github.get("repositories") or [])[:2]:
-                            if isinstance(repo, dict):
-                                parts.append(f"GitHub: {repo.get('name', '')} - {repo.get('description', '') or repo.get('language', '')}")
                         resume_context = redact_pii_text(
                             "\n".join(parts),
                             extra_values=collect_profile_identifiers(rj or {}, pj or {}),
@@ -3853,11 +3913,12 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         **profile_for_opening,
                         "target_role": ws_settings.get("job_title") or profile_for_opening.get("target_role"),
                     }
-                    opening_text = _build_personalized_opening(
-                        persona,
-                        opening_profile,
-                        external_signals,
-                        interview_mode or "mock",
+                    opening_script = _build_opening_script(persona, opening_profile)
+                    opening_text = opening_script["intro_question"]
+                    opening_intro_text = (
+                        opening_script["greeting"]
+                        if not opening_intro_delivered
+                        else None
                     )
 
                     current_battleground = get_next_battleground(knowledge_map)
@@ -3871,37 +3932,63 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     existing_questions, _ = await asyncio.to_thread(
                         _db_execute,
                         """
+                        WITH latest_responses AS (
+                            SELECT candidate_response.*,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY candidate_response.question_id
+                                       ORDER BY candidate_response.created_at DESC
+                                   ) AS response_rank
+                            FROM InterviewResponses candidate_response
+                            WHERE candidate_response.interview_id = ?
+                        ), latest_assessments AS (
+                            SELECT assessment_json_encrypted, assessment_json, response_id,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY response_id
+                                       ORDER BY created_at DESC
+                                   ) AS assessment_rank
+                            FROM ResponseAssessments
+                        )
                         SELECT iq.question_id, iq.question_text, iq.question_type,
                                iq.parent_question_id, iq.topic_label,
                                iq.blueprint_section_id, iq.question_order, iq.created_at,
                                ir.response_id, ir.answer_text_encrypted, ir.user_response,
                                ir.idempotency_key, ir.input_mode, ir.timing_json,
-                               ra.assessment_json
+                               COALESCE(ra.assessment_json_encrypted, ra.assessment_json)
                         FROM InterviewQuestions iq
-                        LEFT JOIN LATERAL (
-                            SELECT response_id, answer_text_encrypted, user_response,
-                                   idempotency_key, input_mode, timing_json, created_at
-                            FROM InterviewResponses
-                            WHERE interview_id = iq.interview_id
-                              AND question_id = iq.question_id
-                            ORDER BY created_at DESC
-                            LIMIT 1
-                        ) ir ON TRUE
-                        LEFT JOIN LATERAL (
-                            SELECT assessment_json
-                            FROM ResponseAssessments
-                            WHERE response_id = ir.response_id
-                            ORDER BY created_at DESC
-                            LIMIT 1
-                        ) ra ON TRUE
-                        WHERE iq.interview_id = %s
+                        LEFT JOIN latest_responses ir
+                          ON ir.question_id = iq.question_id AND ir.response_rank = 1
+                        LEFT JOIN latest_assessments ra
+                          ON ra.response_id = ir.response_id AND ra.assessment_rank = 1
+                        WHERE iq.interview_id = ?
                         ORDER BY iq.question_order, iq.created_at, iq.question_id
                         """,
-                        (interview_id,),
+                        (interview_id, interview_id),
                         fetchall=True,
                     )
 
                     if existing_questions:
+                        # Existing persisted questions are authoritative on a
+                        # reconnect.  Mark the greeting as delivered without
+                        # replaying it into an already-running transcript.
+                        if not opening_intro_delivered:
+                            opening_intro_delivered = True
+                            ws_settings["opening_intro_delivered"] = True
+                            ws_settings["opening_intro_version"] = "realistic-opening-v1"
+                            await async_execute(
+                                """
+                                UPDATE Interviews
+                                SET settings = json_patch(COALESCE(settings, '{}'), ?)
+                                WHERE interview_id = ? AND user_id = ?
+                                """,
+                                (
+                                    json.dumps({
+                                        "opening_intro_delivered": True,
+                                        "opening_intro_version": "realistic-opening-v1",
+                                    }),
+                                    interview_id,
+                                    user_id,
+                                ),
+                            )
                         conversation_history.clear()
                         persisted_question_ids.clear()
                         resumable_row = None
@@ -3970,9 +4057,11 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             "recovered_connection": was_recovering,
                             "question_id": current_question_id,
                             "question_type": current_question_type,
+                            "opening_intro_text": None,
+                            "opening_intro_id": f"opening-intro:{interview_id}",
                             "opening_text": current_question_text,
                             "opening_audio": None,
-                            "audio_pending": not bool(pending_assessment),
+                            "audio_pending": False,
                             "current_question": current_question_text,
                             "current_topic": resumable_row[4] or current_battleground.get("label") or "Interview",
                             "progress": "Attempt restored",
@@ -3980,8 +4069,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             "settings": ws_settings,
                             "persona": persona,
                         })
-                        if not pending_assessment and resumable_row[8] is None:
-                            track_ws_task(send_speech_chunk(current_question_text, current_question_id))
                         if pending_assessment and pending_assessment["answer"]:
                             track_ws_task(process_candidate_response(
                                 pending_assessment["answer"],
@@ -4000,8 +4087,10 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                                 ))
                         continue
 
-                    # The warm-up is a committed question too, so text/voice
-                    # clients receive its stable id in the first frame.
+                    # The warm-up is a committed, context-only question too,
+                    # so text/voice clients receive its stable id in the first
+                    # frame.  The greeting state is persisted before delivery
+                    # so reconnects cannot duplicate it.
                     warmup_pending = True
                     current_question_id = str(uuid.uuid4())
                     current_question_text = opening_text
@@ -4016,7 +4105,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             "label": "Warm-up",
                             "kind": "behavioral",
                             "taxonomy_keys": ["behavioral:introduction"],
-                            "expected_points": ["direct background summary", "role motivation"],
+                            "expected_points": ["personal ownership", "role relevance"],
                             "rubric": {
                                 "version": "warmup_v1",
                                 "weights": {"relevance": 0.5, "communication": 0.5},
@@ -4028,14 +4117,36 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         generation_metadata={"warmup": True, "source": "deterministic"},
                     )
 
+                    if opening_intro_text:
+                        opening_intro_delivered = True
+                        ws_settings["opening_intro_delivered"] = True
+                        ws_settings["opening_intro_version"] = "realistic-opening-v1"
+                        await async_execute(
+                            """
+                            UPDATE Interviews
+                            SET settings = json_patch(COALESCE(settings, '{}'), ?)
+                            WHERE interview_id = ? AND user_id = ?
+                            """,
+                            (
+                                json.dumps({
+                                    "opening_intro_delivered": True,
+                                    "opening_intro_version": "realistic-opening-v1",
+                                }),
+                                interview_id,
+                                user_id,
+                            ),
+                        )
+
                     await send_ws_message({
                         "type": "session_started",
                         "mode": interview_mode,
                         "question_id": current_question_id,
                         "question_type": current_question_type,
+                        "opening_intro_text": opening_intro_text,
+                        "opening_intro_id": f"opening-intro:{interview_id}",
                         "opening_text": opening_text,
                         "opening_audio": None,
-                        "audio_pending": True,
+                        "audio_pending": False,
                         "current_question": opening_text,
                         "current_topic": "Warm-up",
                         "progress": "Warm-up",
@@ -4043,21 +4154,14 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "settings": ws_settings,
                         "persona": persona
                     })
-                    track_ws_task(send_speech_chunk(opening_text, current_question_id))
                     conversation_history.append({
                         "role": "interviewer",
+                        "scoring_excluded": True,
                         "content": opening_text,
                         "type": "opening",
                     })
 
                 elif msg_type == "init_pipeline":
-                    if ws_settings.get("camera_mode") == "required" and message.get("camera_enabled") is not True:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "camera_required",
-                            "message": "Camera access is required to begin this interview.",
-                        })
-                        continue
                     await persist_integrity_event("camera_started", {}, source="server")
                     if str(message.get("input_mode") or "voice") == "voice":
                         await persist_integrity_event("microphone_started", {}, source="server")
@@ -4073,15 +4177,17 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         await async_execute(
                             """
                             UPDATE Interviews
-                            SET started_at = %s,
-                                deadline_at = %s,
-                                settings = COALESCE(settings, '{}'::jsonb)
-                                    || jsonb_build_object(
-                                        'interview_activated_at', %s,
-                                        'started_at', %s,
-                                        'deadline_at', %s
+                            SET started_at = ?,
+                                deadline_at = ?,
+                                settings = json_patch(
+                                    COALESCE(settings, '{}'),
+                                    json_object(
+                                        'interview_activated_at', ?,
+                                        'started_at', ?,
+                                        'deadline_at', ?
                                     )
-                            WHERE interview_id = %s AND user_id = %s
+                                )
+                            WHERE interview_id = ? AND user_id = ?
                               AND status IN ('in_progress', 'recovering')
                             """,
                             (
@@ -4098,8 +4204,8 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     await send_ws_message({
                         "type": "pipeline_ready",
                         "pipeline_mode": "legacy",
-                        "stt_connected": bool(settings.OPENAI_API_KEY),
-                        "tts_connected": True,
+                        "stt_connected": has_provider_api_key("openai"),
+                        "tts_connected": False,
                         "avatar_connected": False,
                         "avatar_session": None,
                         "activated_at": session_activated_at.isoformat(),
@@ -4198,7 +4304,7 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         _db_execute,
                         """
                         INSERT INTO ClientBodyLanguageMetrics (interview_id, user_id, payload)
-                        VALUES (%s, %s, %s)
+                        VALUES (?, ?, ?)
                         """,
                         (interview_id, user_id, json.dumps(analysis)),
                         commit=True,
@@ -4212,14 +4318,11 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                         "analysis_method": analysis.get("analysis_method"),
                     })
 
-                elif msg_type == "anti_cheat_event":
+                elif msg_type == "self_review_signal":
                     if not interview_id:
                         continue
                     event_type = canonical_integrity_event(message.get("event_type"))
-                    if event_type == "camera_stopped":
-                        pipeline_initialized = False
                     payload = message.get("payload") or {}
-                    severity = "severe" if event_type in {"paste", "paste_blocked", "camera_stopped", "microphone_stopped", "screen_share_stopped"} else "warning"
                     await persist_integrity_event(
                         event_type,
                         payload,
@@ -4231,8 +4334,8 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                     await asyncio.to_thread(
                         _db_execute,
                         """
-                        INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
-                        VALUES (%s, %s, %s, %s)
+                        INSERT INTO SelfReviewEvents (interview_id, user_id, event_type, payload)
+                        VALUES (?, ?, ?, ?)
                         """,
                         (
                             interview_id,
@@ -4248,22 +4351,6 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
                             "event_id": client_event.event_id,
                             "status": "committed",
                         })
-                    await asyncio.to_thread(
-                        _db_execute,
-                        """
-                        INSERT INTO MalpracticeEvents (interview_id, user_id, event_type, severity, payload)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (
-                            interview_id,
-                            user_id,
-                            event_type,
-                            severity,
-                            json.dumps(payload),
-                        ),
-                        commit=True,
-                    )
-
                 elif msg_type == "response_complete":
                     await process_candidate_response(
                         message.get("response", ""),
@@ -4323,9 +4410,9 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
             task.cancel()
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)
-        if redis_client and active_session_key:
+        if coordination_store and active_session_key:
             try:
-                release_controller_lease(redis_client, active_session_key, ws_connection_id)
+                release_controller_lease(coordination_store, active_session_key, ws_connection_id)
             except Exception:
                 pass
         if session_bound and interview_id and user_id and not completion_sent:
@@ -4343,10 +4430,10 @@ async def websocket_video_interview(websocket: WebSocket, ticket: str):
 async def create_media_upload_url(
     interview_id: str,
     request: MediaUploadUrlRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     interview = await async_execute(
-        "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
+        "SELECT 1 FROM Interviews WHERE interview_id = ? AND user_id = ?",
         (interview_id, current_user["user_id"]),
         fetchone=True,
     )
@@ -4355,6 +4442,7 @@ async def create_media_upload_url(
 
     asset_id = str(uuid.uuid4())
     safe_kind = _require_raw_media_retention(request.media_kind)
+    safe_content_type = _validated_media_content_type(safe_kind, request.content_type)
     chunk = request.chunk_index if request.chunk_index is not None else 0
     object_key = f"interviews/{current_user['user_id']}/{interview_id}/{safe_kind}/{asset_id}-{chunk}.webm"
     await async_execute(
@@ -4363,7 +4451,7 @@ async def create_media_upload_url(
             asset_id, interview_id, user_id, media_kind, object_key, content_type,
             byte_size, chunk_index, chunk_count, metadata, status
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
         """,
         (
             asset_id,
@@ -4371,7 +4459,7 @@ async def create_media_upload_url(
             current_user["user_id"],
             safe_kind,
             object_key,
-            request.content_type,
+            safe_content_type,
             request.byte_size or 0,
             request.chunk_index,
             request.chunk_count,
@@ -4392,67 +4480,62 @@ async def create_media_upload_url(
 async def complete_media_chunk(
     interview_id: str,
     request: MediaChunkCompleteRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     safe_kind = _require_raw_media_retention(request.media_kind)
+    safe_content_type = _validated_media_content_type(safe_kind, request.content_type)
     interview = await async_execute(
-        "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
+        "SELECT 1 FROM Interviews WHERE interview_id = ? AND user_id = ?",
         (interview_id, current_user["user_id"]),
         fetchone=True,
     )
     if not interview:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
 
-    asset_id = request.asset_id or str(uuid.uuid4())
     updated = await async_execute(
         """
         UPDATE InterviewMediaAssets
-        SET byte_size = %s, checksum = %s, metadata = %s, status = 'completed',
-            content_type = COALESCE(%s, content_type), completed_at = NOW()
-        WHERE asset_id = %s AND interview_id = %s AND user_id = %s
+        SET byte_size = ?, checksum = ?,
+            metadata = json_patch(COALESCE(metadata, '{}'), ?),
+            status = 'completed', completed_at = CURRENT_TIMESTAMP
+        WHERE asset_id = ? AND interview_id = ? AND user_id = ?
+          AND status = 'pending'
+          AND media_kind = ?
+          AND object_key = ?
+          AND content_type = ?
+          AND (byte_size = 0 OR byte_size = ?)
+          AND chunk_index IS ?
+          AND chunk_count IS ?
         RETURNING asset_id
         """,
         (
             request.byte_size,
             request.checksum,
-            json.dumps(request.metadata or {}),
-            request.content_type,
-            asset_id,
+            json.dumps({"browser_recorded": bool((request.metadata or {}).get("browser_recorded"))}),
+            request.asset_id,
             interview_id,
             current_user["user_id"],
+            safe_kind,
+            request.object_key,
+            safe_content_type,
+            request.byte_size,
+            request.chunk_index,
+            request.chunk_count,
         ),
         fetchone=True,
     )
     if not updated:
-        await async_execute(
-            """
-            INSERT INTO InterviewMediaAssets (
-                asset_id, interview_id, user_id, media_kind, object_key, content_type,
-                byte_size, chunk_index, chunk_count, checksum, metadata, status, completed_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'completed', NOW())
-            """,
-            (
-                asset_id,
-                interview_id,
-                current_user["user_id"],
-                safe_kind,
-                request.object_key,
-                request.content_type,
-                request.byte_size,
-                request.chunk_index,
-                request.chunk_count,
-                request.checksum,
-                json.dumps(request.metadata or {}),
-            ),
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Media completion did not match a server-issued pending asset.",
         )
-    return {"success": True, "asset_id": asset_id}
+    return {"success": True, "asset_id": request.asset_id}
 
 
 @router.post("/{interview_id}/end")
 async def end_interview_session(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     if not await _has_persisted_candidate_evidence(interview_id, current_user["user_id"]):
         raise HTTPException(
@@ -4479,24 +4562,27 @@ async def end_interview_session(
 @router.get("/{interview_id}/analysis-status")
 async def get_analysis_status(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     row = await async_execute(
         """
+        WITH latest_jobs AS (
+            SELECT job_id, interview_id, status, current_stage, progress,
+                   error_message, updated_at, retry_count, manual_retry_count,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY interview_id
+                       ORDER BY created_at DESC
+                   ) AS job_rank
+            FROM AnalysisJobs
+        )
         SELECT i.status, i.overall_score, i.completed_at, i.report_json,
                aj.job_id, aj.status, aj.current_stage, aj.progress, aj.error_message, aj.updated_at,
                aj.retry_count, i.report_json_encrypted, i.analysis_status,
-               aj.manual_retry_count, i.attempt_status
+               aj.manual_retry_count, i.attempt_status, i.settings
         FROM Interviews i
-        LEFT JOIN LATERAL (
-            SELECT job_id, status, current_stage, progress, error_message, updated_at,
-                   retry_count, manual_retry_count
-            FROM AnalysisJobs
-            WHERE interview_id = i.interview_id
-            ORDER BY created_at DESC
-            LIMIT 1
-        ) aj ON TRUE
-        WHERE i.interview_id = %s AND i.user_id = %s
+        LEFT JOIN latest_jobs aj
+          ON aj.interview_id = i.interview_id AND aj.job_rank = 1
+        WHERE i.interview_id = ? AND i.user_id = ?
         """,
         (interview_id, current_user["user_id"]),
         fetchone=True,
@@ -4526,35 +4612,38 @@ async def get_analysis_status(
             await async_execute(
                 """
                 UPDATE Interviews
-                SET analysis_job_id = %s,
+                SET analysis_job_id = ?,
                     status = CASE
                         WHEN status IN ('completed', 'report_ready', 'partial', 'failed')
                              AND report_json IS NULL AND report_json_encrypted IS NULL
                         THEN 'analysis_pending'
                         ELSE status
                     END
-                WHERE interview_id = %s
-                  AND user_id = %s
+                WHERE interview_id = ?
+                  AND user_id = ?
                   AND status IN ('analysis_pending', 'analysis_running', 'completed', 'report_ready', 'partial', 'failed')
                 """,
                 (job_id, interview_id, current_user["user_id"]),
             )
         row = await async_execute(
             """
+            WITH latest_jobs AS (
+                SELECT job_id, interview_id, status, current_stage, progress,
+                       error_message, updated_at, retry_count, manual_retry_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY interview_id
+                           ORDER BY created_at DESC
+                       ) AS job_rank
+                FROM AnalysisJobs
+            )
             SELECT i.status, i.overall_score, i.completed_at, i.report_json,
                    aj.job_id, aj.status, aj.current_stage, aj.progress, aj.error_message, aj.updated_at,
                    aj.retry_count, i.report_json_encrypted, i.analysis_status,
-                   aj.manual_retry_count, i.attempt_status
+                   aj.manual_retry_count, i.attempt_status, i.settings
             FROM Interviews i
-            LEFT JOIN LATERAL (
-                SELECT job_id, status, current_stage, progress, error_message, updated_at,
-                       retry_count, manual_retry_count
-                FROM AnalysisJobs
-                WHERE interview_id = i.interview_id
-                ORDER BY created_at DESC
-                LIMIT 1
-            ) aj ON TRUE
-            WHERE i.interview_id = %s AND i.user_id = %s
+            LEFT JOIN latest_jobs aj
+              ON aj.interview_id = i.interview_id AND aj.job_rank = 1
+            WHERE i.interview_id = ? AND i.user_id = ?
             """,
             (interview_id, current_user["user_id"]),
             fetchone=True,
@@ -4563,25 +4652,34 @@ async def get_analysis_status(
     canonical_ready = await _has_current_canonical_analysis(interview_id, current_user["user_id"])
     manual_retry_count = int(row[13] or 0) if row[13] is not None else 0
     job_status = str(row[5] or "")
+    settings_payload = _json_load(row[15], {})
+    if not isinstance(settings_payload, dict):
+        settings_payload = {}
+    execution_pending = bool(settings_payload.get("technical_finalize_requested")) and str(row[0] or "").lower() in {
+        "in_progress",
+        "uploading",
+    }
+    public_status = "execution_pending" if execution_pending else row[0]
     report_ready = row[0] in REPORT_READY_STATUSES and isinstance(stored_report, dict) and canonical_ready
-    report_state = (
-        str(stored_report.get("report_state") or ("partial" if row[0] == "partial" else "ready"))
-        if report_ready
-        else (
-            "failed" if job_status == "failed"
-            else ("retrying" if manual_retry_count > 0 and job_status in {"queued", "running"} else "generating")
-        )
+    report_state = _analysis_report_state(
+        interview_status=public_status,
+        attempt_status=row[14],
+        report_ready=report_ready,
+        stored_report=stored_report,
+        job_status=job_status,
+        manual_retry_count=manual_retry_count,
     )
     return {
         "interview_id": interview_id,
-        "status": row[0],
+        "status": public_status,
         "overall_score": float(row[1]) if row[1] is not None else None,
         "completed_at": row[2].isoformat() if row[2] else None,
         "report_ready": report_ready,
         "report_state": report_state,
         "analysis_status": row[12],
         "attempt_status": row[14],
-        "processing_sla_minutes": 15,
+        "execution_pending": execution_pending,
+        "processing_sla_minutes": 60,
         "retry_in_progress": report_state == "retrying",
         "retryable": job_status == "failed" and manual_retry_count < 3,
         "job": {
@@ -4589,7 +4687,15 @@ async def get_analysis_status(
             "status": row[5],
             "current_stage": row[6],
             "progress": row[7] or 0,
-            "error_message": row[8],
+            # Detailed worker exceptions stay in server logs/storage. They can
+            # contain provider, database, or infrastructure details and must
+            # never be rendered directly to the candidate.
+            "error_message": (
+                "Report analysis failed. Your recorded evidence is safe; retry the report when available."
+                if job_status == "failed"
+                else None
+            ),
+            "error_code": "analysis_failed" if job_status == "failed" else None,
             "updated_at": row[9].isoformat() if row[9] else None,
             "retry_count": row[10] or 0,
             "manual_retry_count": manual_retry_count,
@@ -4600,10 +4706,10 @@ async def get_analysis_status(
 @router.post("/{interview_id}/analysis/retry", status_code=status.HTTP_202_ACCEPTED)
 async def retry_failed_analysis(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     owned = await async_execute(
-        "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
+        "SELECT 1 FROM Interviews WHERE interview_id = ? AND user_id = ?",
         (interview_id, current_user["user_id"]),
         fetchone=True,
     )
@@ -4624,7 +4730,7 @@ async def retry_failed_analysis(
 @router.get("/status/{interview_id}")
 async def get_interview_status(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -4636,7 +4742,7 @@ async def get_interview_status(
                    attempt_status, analysis_status, integrity_status,
                    started_at, deadline_at, recovery_deadline_at, lifecycle_revision
             FROM Interviews
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
             """,
             (interview_id, current_user["user_id"])
         )
@@ -4687,7 +4793,7 @@ def _report_job_target(
         """
         SELECT profile_type, job_context_encrypted
         FROM AttemptContextSnapshots
-        WHERE interview_id = %s AND user_id = %s
+        WHERE interview_id = ? AND user_id = ?
         LIMIT 1
         """,
         (interview_id, user_id),
@@ -4725,7 +4831,7 @@ def _report_job_target(
             """
             SELECT role, company, job_description_encrypted, job_description_hash
             FROM JobProfiles
-            WHERE profile_id = %s AND user_id = %s
+            WHERE profile_id = ? AND user_id = ?
             """,
             (job_profile_id, user_id),
         )
@@ -4764,10 +4870,10 @@ def _report_job_target(
         SELECT EXISTS (
             SELECT 1
             FROM JobProfiles reusable_profile
-            WHERE reusable_profile.user_id = %s
-              AND LOWER(BTRIM(reusable_profile.role)) = LOWER(BTRIM(%s))
-              AND LOWER(BTRIM(COALESCE(reusable_profile.company, ''))) = LOWER(BTRIM(%s))
-              AND reusable_profile.job_description_hash IS NOT DISTINCT FROM %s
+            WHERE reusable_profile.user_id = ?
+              AND LOWER(trim(reusable_profile.role)) = LOWER(trim(?))
+              AND LOWER(trim(COALESCE(reusable_profile.company, ''))) = LOWER(trim(?))
+              AND reusable_profile.job_description_hash IS ?
         )
         """,
         (user_id, role, company, description_hash),
@@ -4796,7 +4902,7 @@ def _decrypt_job_description_value(value: Any) -> str:
 @router.get("/report/{interview_id}")
 async def get_interview_report(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -4809,7 +4915,7 @@ async def get_interview_report(
                    status, report_json_encrypted, analysis_status, job_profile_id, settings,
                    duration_seconds, started_at, deadline_at
             FROM Interviews
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
             """,
             (interview_id, current_user["user_id"])
         )
@@ -4844,9 +4950,7 @@ async def get_interview_report(
                 "assessment": turn.get("assessment"),
                 "evaluator_version": turn.get("evaluator_version"),
                 "insufficient_evidence": bool(turn.get("insufficient_evidence")),
-                "status": "Not Answered" if not turn.get("response") else (
-                    "Unable to Evaluate" if turn.get("insufficient_evidence") and not turn.get("assessment") else "Completed"
-                ),
+                "status": _detailed_response_status(turn),
             }
             for turn in turns
         ]
@@ -4857,6 +4961,19 @@ async def get_interview_report(
                 stored_report = json.loads(stored_report)
             except Exception:
                 stored_report = None
+        if isinstance(stored_report, dict):
+            for question_key in ("questions", "per_turn_feedback"):
+                questions = stored_report.get(question_key)
+                if not isinstance(questions, list):
+                    continue
+                stored_report[question_key] = [
+                    {
+                        **question,
+                        "status": _stored_report_question_status(question),
+                    }
+                    if isinstance(question, dict) else question
+                    for question in questions
+                ]
 
         canonical_ready = await _has_current_canonical_analysis(interview_id, current_user["user_id"])
         stale_report = isinstance(stored_report, dict) and not canonical_ready
@@ -4877,13 +4994,13 @@ async def get_interview_report(
                 await async_execute(
                     """
                     UPDATE Interviews
-                    SET analysis_job_id = %s,
+                    SET analysis_job_id = ?,
                         status = CASE
                             WHEN status IN ('completed', 'partial') THEN 'analysis_pending'
                             ELSE status
                         END,
                         feedback_summary = COALESCE(feedback_summary, 'Interview complete. Async analysis is queued.')
-                    WHERE interview_id = %s AND user_id = %s
+                    WHERE interview_id = ? AND user_id = ?
                     """,
                     (analysis_job_id, interview_id, current_user["user_id"]),
                 )
@@ -4944,11 +5061,222 @@ async def get_interview_report(
         cursor.close()
         return_db_connection(connection)
 
+
+@router.get("/report/{interview_id}/export")
+async def export_interview_report_json(
+    interview_id: str,
+    current_user: Dict = Depends(local_user),
+):
+    """Export the candidate-safe official report and its linked evidence state."""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT interview_mode, interview_type, job_title, status,
+                   report_json, report_json_encrypted, created_at, completed_at
+            FROM Interviews
+            WHERE interview_id = ? AND user_id = ?
+            """,
+            (interview_id, current_user["user_id"]),
+        )
+        interview = cursor.fetchone()
+        if not interview:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+
+        cursor.execute(
+            """
+            SELECT artifact_id, status, evidence_hash, provenance_json,
+                   payload, created_at, published_at
+            FROM ReportArtifacts
+            WHERE interview_id = ? AND user_id = ? AND audience = 'candidate'
+              AND status <> 'superseded'
+            ORDER BY published_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """,
+            (interview_id, current_user["user_id"]),
+        )
+        artifact = cursor.fetchone()
+
+        cursor.execute(
+            """
+            SELECT analysis_id, mode, schema_version, evidence_hash,
+                   status, is_current, producer_version, evidence_status,
+                   overall_score, analysis_json, analysis_json_encrypted,
+                   evidence_index_json, evidence_index_encrypted, created_at
+            FROM SessionPerformanceAnalyses
+            WHERE interview_id = ? AND user_id = ?
+              AND schema_version = 'session-performance-v4'
+              AND status = 'ready' AND is_current = TRUE
+            ORDER BY revision_no DESC, created_at DESC
+            LIMIT 1
+            """,
+            (interview_id, current_user["user_id"]),
+        )
+        canonical = cursor.fetchone()
+        if not canonical or not artifact:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The official report is still being generated. Try again when the report is ready.",
+            )
+
+        stored_report = _decrypt_json_blob(interview[5], None) or _json_load(interview[4], None)
+        if not isinstance(stored_report, dict) and artifact[4]:
+            stored_report = _json_load(artifact[4], None)
+        if not isinstance(stored_report, dict):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The official report is still being generated. Try again when the report is ready.",
+            )
+
+        canonical_projection = _decrypt_json_blob(canonical[10], None) or _json_load(canonical[9], {})
+        if not isinstance(canonical_projection, dict):
+            canonical_projection = {}
+        evidence_index = _decrypt_json_blob(canonical[12], None) or _json_load(canonical[11], {})
+        if not isinstance(evidence_index, dict):
+            evidence_index = {}
+        canonical_evidence_status = str(canonical[7] or "unknown")
+        evidence_items: List[Dict[str, Any]] = []
+        evidence_key_labels = {
+            "response_ids": "response",
+            "round_ids": "technical_round",
+            "submission_ids": "technical_submission",
+            "reasoning_evidence_ids": "reasoning",
+            "run_ids": "technical_run",
+            "snapshot_ids": "technical_draft",
+        }
+        seen_evidence = set()
+        for key, kind in evidence_key_labels.items():
+            values = evidence_index.get(key) or []
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                identifier = str(value or "").strip()
+                if not identifier or (kind, identifier) in seen_evidence:
+                    continue
+                seen_evidence.add((kind, identifier))
+                evidence_items.append({
+                    "kind": kind,
+                    "id": identifier,
+                    "status": canonical_evidence_status,
+                })
+
+        mission = None
+        if canonical_evidence_status == "sufficient" and canonical[8] is not None:
+            cursor.execute(
+                """
+                SELECT mission_id, mode, status, title, assignment_reason,
+                       source_interview_id, source_analysis_id, validation_status,
+                       progress_percent, current_readiness, target_readiness,
+                       created_at, updated_at, completed_at
+                FROM ImprovementMissions
+                WHERE user_id = ? AND source_interview_id = ?
+                  AND status IN ('active', 'completed')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (current_user["user_id"], interview_id),
+            )
+            mission = cursor.fetchone()
+        improve_pathway: Optional[Dict[str, Any]] = None
+        if mission:
+            cursor.execute(
+                """
+                SELECT roadmap_node_id, exercise_id, order_index, title,
+                       activity_type, availability_status, attempt_status,
+                       result_status, mastery_status, completed_at
+                FROM ImprovementRoadmapNodes
+                WHERE user_id = ? AND mission_id = ?
+                ORDER BY order_index, roadmap_node_id
+                """,
+                (current_user["user_id"], mission[0]),
+            )
+            nodes = [
+                {
+                    "roadmap_node_id": row[0],
+                    "exercise_id": row[1],
+                    "order_index": int(row[2] or 0),
+                    "title": row[3],
+                    "activity_type": row[4],
+                    "availability_status": row[5],
+                    "attempt_status": row[6],
+                    "result_status": row[7],
+                    "mastery_status": row[8],
+                    "completed_at": row[9].isoformat() if row[9] else None,
+                }
+                for row in cursor.fetchall() or []
+            ]
+            improve_pathway = {
+                "mission_id": mission[0],
+                "mode": mission[1],
+                "status": mission[2],
+                "title": mission[3],
+                "assignment_reason": mission[4],
+                "source_interview_id": mission[5],
+                "source_analysis_id": mission[6],
+                "validation_status": mission[7],
+                "progress_percent": float(mission[8] or 0),
+                "current_readiness": float(mission[9] or 0),
+                "target_readiness": float(mission[10] or 0),
+                "nodes": nodes,
+            }
+
+        safe_report = _safe_report_payload(stored_report)
+        created_at = canonical[13]
+        export_payload = {
+            "schema_version": "prepmate-report-export-v1",
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "interview": {
+                "interview_id": interview_id,
+                "mode": interview[0],
+                "interview_type": interview[1],
+                "job_title": interview[2],
+                "status": interview[3],
+                "created_at": interview[6].isoformat() if interview[6] else None,
+                "completed_at": interview[7].isoformat() if interview[7] else None,
+            },
+            "report": safe_report,
+            "canonical_performance": {
+                "analysis_id": canonical[0],
+                "mode": canonical[1],
+                "schema_version": canonical[2],
+                "status": canonical[4],
+                "is_current": bool(canonical[5]),
+                "producer_version": canonical[6],
+                "evidence_status": canonical[7],
+                "overall_score": float(canonical[8]) if canonical[8] is not None else None,
+                "evidence_hash": canonical[3],
+                "created_at": created_at.isoformat() if created_at else None,
+                "projection": canonical_projection,
+            },
+            "evidence": {
+                "status": canonical_evidence_status,
+                "items": evidence_items,
+            },
+            "improve_pathway": improve_pathway,
+            "artifact": {
+                "artifact_id": artifact[0],
+                "status": artifact[1],
+                "evidence_hash": artifact[2],
+                "provenance": _json_load(artifact[3], {}) or {},
+                "published_at": artifact[6].isoformat() if artifact[6] else None,
+            },
+        }
+        safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(interview[2] or "interview"))[:48].strip("-") or "interview"
+        filename = f"prepmate-report-{safe_title}-{interview_id[:8]}.json"
+        return JSONResponse(
+            content=export_payload,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
 @router.post("/{interview_id}/abandon")
 @router.delete("/cancel/{interview_id}")
 async def cancel_interview(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -4963,17 +5291,22 @@ async def cancel_interview(
                 completion_kind = 'voluntary_exit',
                 recovery_deadline_at = NULL,
                 lifecycle_revision = lifecycle_revision + 1,
-                completed_at = COALESCE(completed_at, NOW()),
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
                 overall_score = NULL,
                 duration_seconds = CASE
                     WHEN started_at IS NULL THEN duration_seconds
-                    ELSE GREATEST(0, EXTRACT(EPOCH FROM (NOW() - started_at))::integer)
+                    ELSE MAX(0, CAST(
+                        (julianday(CURRENT_TIMESTAMP) - julianday(started_at)) * 86400
+                        AS INTEGER
+                    ))
                 END,
                 feedback_summary = 'Attempt ended incomplete by the candidate.',
-                settings = (COALESCE(settings, '{}'::jsonb) - 'recovery_deadline' - 'recovery_reason')
-                    || jsonb_build_object('abandonment_reason', 'voluntary_exit')
-            WHERE interview_id = %s
-              AND user_id = %s
+                settings = json_patch(
+                    json_remove(COALESCE(settings, '{}'), '$.recovery_deadline', '$.recovery_reason'),
+                    json_object('abandonment_reason', 'voluntary_exit')
+                )
+            WHERE interview_id = ?
+              AND user_id = ?
               AND status IN ('in_progress', 'uploading', 'recovering')
             RETURNING interview_id
             """,
@@ -4990,9 +5323,9 @@ async def cancel_interview(
             """
             UPDATE TechnicalInterviewRounds
             SET status = 'cancelled',
-                completed_at = COALESCE(completed_at, NOW())
-            WHERE interview_id = %s
-              AND user_id = %s
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+            WHERE interview_id = ?
+              AND user_id = ?
               AND status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
             """,
             (interview_id, current_user["user_id"]),

@@ -10,9 +10,8 @@ import { useFaceCheck } from "@/hooks/use-face-check"
 import { useStreamingMetrics } from "@/hooks/use-streaming-metrics"
 import { useAudioEnvironment } from "@/hooks/use-audio-environment"
 import { useSessionControlLock } from "@/hooks/use-session-control-lock"
-import { getAuthHeaders } from "@/lib/auth"
 import { API_CONFIG } from "@/lib/config"
-import { abandonInterviewSession, cancelInterviewSession, endInterviewSession } from "@/lib/api"
+import { cancelInterviewSession, endInterviewSession } from "@/lib/api"
 import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
 import {
   getTechnicalCameraStream,
@@ -36,40 +35,11 @@ interface TranscriptMessage {
   isPartial?: boolean
   questionId?: string
 }
-type BrowserSpeechRecognitionResult = {
-  isFinal: boolean
-  0: { transcript: string }
-}
-type BrowserSpeechRecognitionResults = {
-  length: number
-  [index: number]: BrowserSpeechRecognitionResult
-}
-type BrowserSpeechRecognition = {
-  lang: string
-  continuous: boolean
-  interimResults: boolean
-  maxAlternatives: number
-  onresult: ((event: { resultIndex: number; results: BrowserSpeechRecognitionResults }) => void) | null
-  onend: (() => void) | null
-  onerror: (() => void) | null
-  start: () => void
-  stop: () => void
-}
-type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition
-
-function getBrowserSpeechRecognition(): BrowserSpeechRecognitionConstructor | null {
-  if (typeof window === "undefined") return null
-  const browserWindow = window as Window & {
-    SpeechRecognition?: BrowserSpeechRecognitionConstructor
-    webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor
-  }
-  return browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition || null
-}
-function buildInterviewWsUrl(apiBase: string, ticket: string) {
+function buildInterviewWsUrl(apiBase: string) {
   const hostBase = /^https?:\/\//i.test(apiBase)
     ? apiBase.replace(/^http/i, "ws").replace(/\/api\/?$/, "")
     : window.location.origin.replace(/^http/i, "ws")
-  return `${hostBase}/api/interview/ws/video/${ticket}`
+  return `${hostBase}/api/interview/ws/video`
 }
 
 function createEnvelopeId() {
@@ -84,14 +54,13 @@ export default function InterviewRoom() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const sessionId = params.id as string
-  const requestedMode = searchParams.get("mode")
-  const mode: SessionMode = "mock-voice"
-  const inputMode: "voice" = "voice"
-  const cameraEnabled = true
+  const inputMode: "voice" | "text" = searchParams.get("input") === "voice" ? "voice" : "text"
+  const mode: SessionMode = inputMode === "voice" ? "mock-voice" : "mock-ai"
+  const cameraEnabled = false
   const recoveryGraceSeconds = readRecoveryGraceSeconds()
   const sessionControlLock = useSessionControlLock(sessionId)
   const voiceMode = inputMode === "voice"
-  const requiresStrictPermissions = true
+  const requiresStrictPermissions = false
   const [isMicOn, setIsMicOn] = useState(false)
   const [isVideoOn, setIsVideoOn] = useState(cameraEnabled)
   const [messages, setMessages] = useState<TranscriptMessage[]>([])
@@ -123,9 +92,7 @@ export default function InterviewRoom() {
   const clientSequenceRef = useRef(0)
   const localStreamRef = useRef<MediaStream | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const sessionRecorderRef = useRef<MediaRecorder | null>(null)
   const recordedChunksRef = useRef<Blob[]>([])
-  const sessionChunkIndexRef = useRef(0)
   const discardRecordingRef = useRef(false)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const aiTokenBufferRef = useRef("")
@@ -148,8 +115,6 @@ export default function InterviewRoom() {
   const answerInFlightRef = useRef(false)
   const aiSpeakingRef = useRef(false)
   const isProcessingRef = useRef(false)
-  const liveSubtitleRecognitionRef = useRef<BrowserSpeechRecognition | null>(null)
-  const liveSubtitleQuestionIdRef = useRef<string | null>(null)
   const pendingTextAnswerRef = useRef<{ idempotencyKey: string; text: string } | null>(null)
   const cleanupInterviewEnvironmentRef = useRef<(options?: { complete?: boolean; keepalive?: boolean }) => void>(() => {})
   const deferredUnmountCleanupRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -197,62 +162,10 @@ export default function InterviewRoom() {
       reader.readAsDataURL(blob)
     })
   }, [])
-  const registerMediaChunk = useCallback(async (blob: Blob, mediaKind: "video" | "audio" = "video") => {
-    try {
-      const chunkIndex = sessionChunkIndexRef.current++
-      const uploadResp = await fetch(`${API_CONFIG.BASE_URL}/interview/${sessionId}/media/upload-url`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify({
-          media_kind: mediaKind,
-          content_type: blob.type || "video/webm",
-          byte_size: blob.size,
-          chunk_index: chunkIndex,
-        }),
-      })
-      if (!uploadResp.ok) return
-      const upload = await uploadResp.json()
-      await fetch(`${API_CONFIG.BASE_URL}/interview/${sessionId}/media/chunk-complete`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-        body: JSON.stringify({
-          asset_id: upload.asset_id,
-          media_kind: mediaKind,
-          object_key: upload.object_key,
-          content_type: blob.type || "video/webm",
-          byte_size: blob.size,
-          chunk_index: chunkIndex,
-          metadata: { browser_recorded: true },
-        }),
-      })
-    } catch {
-    }
-  }, [sessionId])
-  const startSessionRecording = useCallback((stream: MediaStream) => {
-    if (typeof MediaRecorder === "undefined" || sessionRecorderRef.current) return
-    const mediaKind = stream.getVideoTracks().length > 0 ? "video" : "audio"
-    const candidates = mediaKind === "video"
-      ? ["video/webm;codecs=vp8,opus", "video/webm"]
-      : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
-    const mimeType = candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) || ""
-    try {
-      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) void registerMediaChunk(event.data, mediaKind)
-      }
-      recorder.start(10000)
-      sessionRecorderRef.current = recorder
-    } catch {
-      sendClientEvent("anti_cheat_event", { event_type: "recording_failed", payload: {} })
-    }
-  }, [registerMediaChunk, sendClientEvent])
-  const stopSessionRecording = useCallback(() => {
-    const recorder = sessionRecorderRef.current
-    if (recorder && recorder.state !== "inactive") recorder.stop()
-    sessionRecorderRef.current = null
-  }, [])
+  // PrepMate does not record rolling session chunks. Audio is captured only
+  // for the answer the user explicitly submits below.
+  const startSessionRecording = useCallback((_stream: MediaStream) => {}, [])
+  const stopSessionRecording = useCallback(() => {}, [])
   const stopSpeechRecording = useCallback((discard = false) => {
     const recorder = mediaRecorderRef.current
     if (!recorder || recorder.state === "inactive") return
@@ -341,64 +254,12 @@ export default function InterviewRoom() {
     mediaRecorderRef.current = recorder
     return true
   }, [blobToBase64, getSupportedAudioMimeType, sendClientEvent])
-  const stopLiveSubtitleRecognition = useCallback(() => {
-    const recognition = liveSubtitleRecognitionRef.current
-    liveSubtitleRecognitionRef.current = null
-    liveSubtitleQuestionIdRef.current = null
-    if (!recognition) return
-    recognition.onresult = null
-    recognition.onend = null
-    recognition.onerror = null
-    try {
-      recognition.stop()
-    } catch {
-    }
-  }, [])
-  const startLiveSubtitleRecognition = useCallback(() => {
-    const Recognition = getBrowserSpeechRecognition()
-    if (!Recognition || liveSubtitleRecognitionRef.current) return
-    let recognition: BrowserSpeechRecognition
-    try {
-      recognition = new Recognition()
-    } catch {
-      return
-    }
-    recognition.lang = "en-US"
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.maxAlternatives = 1
-    liveSubtitleQuestionIdRef.current = lastQuestionIdRef.current
-    recognition.onresult = (event) => {
-      const transcript = Array.from({ length: event.results.length }, (_, index) => {
-        const result = event.results[index]
-        return result?.[0]?.transcript || ""
-      }).join(" ").replace(/\s+/g, " ").trim()
-      if (!transcript) return
-      const questionId = liveSubtitleQuestionIdRef.current || lastQuestionIdRef.current || undefined
-      setMessages((prev) => [
-        ...prev.filter((message) => !message.isPartial),
-        { role: "user", text: transcript, isPartial: true, ...(questionId ? { questionId } : {}) },
-      ])
-    }
-    recognition.onerror = () => {
-      if (liveSubtitleRecognitionRef.current === recognition) {
-        liveSubtitleRecognitionRef.current = null
-      }
-    }
-    recognition.onend = () => {
-      if (liveSubtitleRecognitionRef.current === recognition) {
-        liveSubtitleRecognitionRef.current = null
-      }
-    }
-    liveSubtitleRecognitionRef.current = recognition
-    try {
-      recognition.start()
-    } catch {
-      if (liveSubtitleRecognitionRef.current === recognition) {
-        liveSubtitleRecognitionRef.current = null
-      }
-    }
-  }, [])
+  // Browser-managed speech recognition is intentionally disabled: browsers
+  // may route microphone audio through an undisclosed vendor. The explicit
+  // answer recording path remains available for a configured transcription
+  // provider, while subtitles are omitted when none is configured.
+  const startLiveSubtitleRecognition = useCallback(() => {}, [])
+  const stopLiveSubtitleRecognition = useCallback(() => {}, [])
   const {
     metrics: streamingMetrics,
     updateEngagement,
@@ -412,7 +273,7 @@ export default function InterviewRoom() {
     enabled: voiceMode && interviewState === "active",
     onBackgroundAudioDetected: useCallback((details: { type: string; confidence: number }) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        sendClientEvent("anti_cheat_event", {
+        sendClientEvent("self_review_signal", {
           event_type: "background_audio_detected",
           payload: details,
         })
@@ -433,12 +294,6 @@ export default function InterviewRoom() {
   useEffect(() => {
     isProcessingRef.current = isProcessing
   }, [isProcessing])
-  useEffect(() => {
-    if (requestedMode && requestedMode !== "mock-voice") {
-      toast.info("Opening your Interview Round.")
-      router.replace(`/interview/${sessionId}?mode=mock-voice`)
-    }
-  }, [requestedMode, router, sessionId])
   const vad = useVAD({
     onSpeechStart: () => {
       if (
@@ -498,27 +353,15 @@ export default function InterviewRoom() {
     const handleCameraEnded = () => {
       if (interviewEndSentRef.current || interviewStateRef.current !== "active") return
       setIsVideoOn(false)
-      sendClientEvent("anti_cheat_event", {
-        event_type: "camera_track_ended",
+      sendClientEvent("self_review_signal", {
+        event_type: "camera_coaching_stopped",
         payload: {},
       })
-      toast.error("Camera connection was interrupted. Restore camera access to continue.")
-      if (cameraLossTimerRef.current) window.clearTimeout(cameraLossTimerRef.current)
-      cameraLossTimerRef.current = window.setTimeout(() => {
-        const hasLiveCamera = Boolean(
-          localStreamRef.current?.getVideoTracks().some((track) => track.readyState === "live" && track.enabled)
-        )
-        if (hasLiveCamera || interviewEndSentRef.current) return
-        interviewEndSentRef.current = true
-        void cancelInterviewSession(sessionId).finally(() => {
-          cleanupInterviewEnvironmentRef.current()
-          router.replace("/?tab=interview")
-        })
-      }, recoveryGraceSeconds * 1000)
+      toast.info("Optional camera coaching stopped. The interview will continue.")
     }
     videoTrack.addEventListener("ended", handleCameraEnded)
     return () => videoTrack.removeEventListener("ended", handleCameraEnded)
-  }, [localStream, recoveryGraceSeconds, router, sendClientEvent, sessionId])
+  }, [localStream, sendClientEvent])
   useEffect(() => {
     async function setupMedia() {
       if (!voiceMode && !cameraEnabled) {
@@ -530,22 +373,22 @@ export default function InterviewRoom() {
         const preflightCamera = getTechnicalCameraStream()
         const preflightMicrophone = getTechnicalMicrophoneStream()
         const preflightTracks = [
-          ...(preflightCamera?.getVideoTracks() || []),
+          ...(cameraEnabled ? preflightCamera?.getVideoTracks() || [] : []),
           ...(voiceMode ? preflightMicrophone?.getAudioTracks() || [] : []),
         ].filter((track) => track.readyState === "live")
-        const hasPreflightVideo = preflightTracks.some((track) => track.kind === "video")
+        const hasPreflightVideo = !cameraEnabled || preflightTracks.some((track) => track.kind === "video")
         const hasPreflightAudio = !voiceMode || preflightTracks.some((track) => track.kind === "audio")
         const stream = hasPreflightVideo && hasPreflightAudio
           ? new MediaStream(preflightTracks)
-          : await navigator.mediaDevices.getUserMedia({ video: true, audio: voiceMode })
+          : await navigator.mediaDevices.getUserMedia({ video: cameraEnabled, audio: voiceMode })
         if (videoRef.current) videoRef.current.srcObject = stream
         localStreamRef.current = stream
         setLocalStream(stream)
         startSessionRecording(stream)
       } catch {
         toast.error(voiceMode
-          ? "Camera and microphone access are required for the Interview Round. Allow both, then retry."
-          : "Camera access is required for the Interview Round. Allow it, then retry.")
+          ? "Microphone access is required for the Interview Round. Allow it, then retry."
+          : "Media access is unavailable. You can continue with typed answers.")
         setIsVideoOn(false)
         setIsMicOn(false)
       }
@@ -586,6 +429,12 @@ export default function InterviewRoom() {
             }
             if (data.settings?.job_context && typeof data.settings.job_context === "object") {
               setJobContext(data.settings.job_context as JobContext)
+            }
+            if (data.opening_intro_text) {
+              const openingIntroId = data.opening_intro_id || `opening-intro:${sessionId}`
+              setMessages((prev) => prev.some((item) => item.role === "interviewer" && item.questionId === openingIntroId)
+                ? prev
+                : [...prev, { role: "interviewer", text: data.opening_intro_text, questionId: openingIntroId }])
             }
             if (data.opening_text) {
               setCurrentQuestion(data.current_question || data.opening_text)
@@ -850,25 +699,8 @@ export default function InterviewRoom() {
     async function connectWebSocket() {
       const apiBase = API_CONFIG.BASE_URL
       try {
-        const ticketRes = await fetch(`${apiBase}/interview/ws-ticket`, {
-          method: "POST",
-          credentials: "include",
-          headers: getAuthHeaders(),
-        })
-        if (!ticketRes.ok) {
-          const body = await ticketRes.json().catch(() => null)
-          if (ticketRes.status === 401 || ticketRes.status === 403) {
-            toast.error(body?.detail || body?.message || "Your session expired. Sign in again.")
-            router.replace("/")
-            return
-          }
-          scheduleReconnect()
-          return
-        }
-        const { ticket } = await ticketRes.json()
-        if (cancelled || !ticket) return
-
-        const ws = new WebSocket(buildInterviewWsUrl(apiBase, ticket))
+        if (cancelled) return
+        const ws = new WebSocket(buildInterviewWsUrl(apiBase))
 
         ws.onopen = () => {
           setIsConnected(true)
@@ -918,50 +750,6 @@ export default function InterviewRoom() {
       vad.stopListening()
     }
   }, [aiSpeaking, interviewState, isMicOn, stopLiveSubtitleRecognition, stopSpeechRecording, voiceMode])
-  useEffect(() => {
-    if (!requiresStrictPermissions) return
-    const lastPermissionDialogRef = { current: 0 }
-    const sendAntiCheat = (eventType: string, payload: Record<string, unknown> = {}) => {
-      sendClientEvent("anti_cheat_event", { event_type: eventType, payload })
-    }
-    const warnStrictMode = (eventType: string, message: string, payload: Record<string, unknown> = {}) => {
-      sendAntiCheat(eventType, payload)
-      toast.warning(message)
-    }
-    const onVisibility = () => {
-      if (Date.now() - pageLoadTimeRef.current < 15000) return
-      if (Date.now() - lastPermissionDialogRef.current < 3000) return
-      if (document.visibilityState === "hidden") {
-        warnStrictMode("tab_switch", "Strict mock warning: tab switching is flagged.", { visibilityState: document.visibilityState })
-      }
-    }
-    const onBlur = () => {
-      if (Date.now() - pageLoadTimeRef.current < 15000) return
-      if (Date.now() - lastPermissionDialogRef.current < 3000) return
-      warnStrictMode("window_blur", "Strict mock warning: leaving the interview window is logged.")
-    }
-    const onFullscreen = () => {
-      if (Date.now() - pageLoadTimeRef.current < 15000) return
-      lastPermissionDialogRef.current = Date.now()
-      if (!document.fullscreenElement && interviewState === "active") {
-        warnStrictMode("fullscreen_exit", "Strict mock warning: fullscreen exit is flagged.")
-      }
-    }
-    const onPaste = (event: ClipboardEvent) => {
-      event.preventDefault()
-      warnStrictMode("paste_blocked", "Paste is disabled and this interview was flagged.")
-    }
-    document.addEventListener("visibilitychange", onVisibility)
-    document.addEventListener("fullscreenchange", onFullscreen)
-    window.addEventListener("blur", onBlur)
-    document.addEventListener("paste", onPaste)
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility)
-      document.removeEventListener("fullscreenchange", onFullscreen)
-      window.removeEventListener("blur", onBlur)
-      document.removeEventListener("paste", onPaste)
-    }
-  }, [requiresStrictPermissions, interviewState, sendClientEvent])
   const playAudioBase64 = useCallback((base64: string, mimeType = "audio/wav") => {
     audioQueueRef.current = audioQueueRef.current.then(() => new Promise<void>((resolve) => {
       try {
@@ -1054,14 +842,14 @@ export default function InterviewRoom() {
         toast.error("Microphone access is required for the Interview Round. Allow microphone access, then retry.")
         return
       }
-      if (!localStreamRef.current?.getVideoTracks().length) {
-        toast.error("Camera access is required for the Interview Round. Allow camera access, then retry.")
+      if (cameraEnabled && !localStreamRef.current?.getVideoTracks().length) {
+        toast.error("Optional camera coaching is unavailable. Continue with audio or typed answers.")
         return
       }
       interviewStartedRef.current = true
       if (requiresStrictPermissions && document.fullscreenEnabled && !document.fullscreenElement) {
         document.documentElement.requestFullscreen().catch(() => {
-          sendClientEvent("anti_cheat_event", {
+        sendClientEvent("self_review_signal", {
             event_type: "fullscreen_request_failed",
             payload: {},
           })
@@ -1091,9 +879,27 @@ export default function InterviewRoom() {
       return next
     })
   }, [stopSpeechRecording])
-  const toggleVideo = useCallback(() => {
-    toast.info("Camera must remain on throughout the Interview Round.")
-  }, [])
+  const toggleVideo = useCallback(async () => {
+    if (isVideoOn) {
+      localStreamRef.current?.getVideoTracks().forEach((track) => track.stop())
+      const audioTracks = localStreamRef.current?.getAudioTracks().filter((track) => track.readyState === "live") || []
+      const next = audioTracks.length ? new MediaStream(audioTracks) : null
+      localStreamRef.current = next
+      setLocalStream(next)
+      setIsVideoOn(false)
+      return
+    }
+    try {
+      const camera = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+      const activeTracks = localStreamRef.current?.getTracks().filter((track) => track.readyState === "live" && track.kind !== "video") || []
+      const next = new MediaStream([...activeTracks, ...camera.getVideoTracks()])
+      localStreamRef.current = next
+      setLocalStream(next)
+      setIsVideoOn(true)
+    } catch {
+      toast.error("Camera coaching was not enabled. You can continue without it.")
+    }
+  }, [isVideoOn])
   const submitTextAnswer = useCallback(() => {
     const text = textAnswer.trim()
     if (!text || textSubmitting || isProcessing) return
@@ -1146,20 +952,18 @@ export default function InterviewRoom() {
       event.preventDefault()
       event.returnValue = ""
     }
-    const onPageHide = () => {
-      if (!interviewEndSentRef.current) {
-        interviewEndSentRef.current = true
-        void abandonInterviewSession(sessionId, { keepalive: true }).catch(() => undefined)
-      }
-      cleanupInterviewEnvironment()
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return
+      window.removeEventListener("beforeunload", onBeforeUnload)
+      window.location.reload()
     }
     window.addEventListener("beforeunload", onBeforeUnload)
-    window.addEventListener("pagehide", onPageHide)
+    window.addEventListener("pageshow", onPageShow)
     return () => {
       window.removeEventListener("beforeunload", onBeforeUnload)
-      window.removeEventListener("pagehide", onPageHide)
+      window.removeEventListener("pageshow", onPageShow)
     }
-  }, [cleanupInterviewEnvironment, interviewState, sessionId, showAnalyzing])
+  }, [interviewState, showAnalyzing])
 
   useEffect(() => {
     if (showAnalyzing || interviewState === "complete") return
@@ -1391,12 +1195,14 @@ function MeetSelfTile({
   videoRef,
   isVideoOn,
   isMicOn,
+  showMicrophone = true,
   compact = false,
 }: {
   stream: MediaStream | null
   videoRef: React.RefObject<HTMLVideoElement | null>
   isVideoOn: boolean
   isMicOn: boolean
+  showMicrophone?: boolean
   compact?: boolean
 }) {
   useEffect(() => {
@@ -1418,7 +1224,7 @@ function MeetSelfTile({
       <div className="absolute bottom-3 left-3 z-10">
         <span className="text-foreground text-xs font-medium bg-background/70 backdrop-blur-sm px-2.5 py-1 rounded">You</span>
       </div>
-      {!isMicOn && (
+      {showMicrophone && !isMicOn && (
         <div className="absolute bottom-3 right-3 z-10">
           <div className="w-7 h-7 rounded-full bg-destructive flex items-center justify-center"><MicOff className="w-3.5 h-3.5 text-primary-foreground" /></div>
         </div>
@@ -1428,7 +1234,7 @@ function MeetSelfTile({
 }
 
 function MockVoiceLayout(props: LayoutProps) {
-  const [showCaptions, setShowCaptions] = useState(true)
+  const [showCaptions, setShowCaptions] = useState(props.inputMode === "voice")
   const lastUserMsg = [...props.messages].reverse().find(m => m.role === "user")
   return (
     <div className="relative flex h-screen flex-col overflow-hidden bg-secondary/20 text-foreground">
@@ -1451,8 +1257,8 @@ function MockVoiceLayout(props: LayoutProps) {
           <span className="text-sm font-mono tabular-nums text-foreground">{props.formatTimer(props.sessionTimer)}</span>
           <span className="hidden text-xs text-muted-foreground sm:inline">Interview in progress</span>
         </div>
-        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} captionsEnabled={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)} endLabel="Leave interview" cameraLocked />
-        <div className="hidden justify-self-end text-xs text-muted-foreground sm:block">Camera remains on</div>
+        <InterviewControls variant="meet" isMicOn={props.isMicOn} isVideoOn={props.isVideoOn} onToggleMic={props.onToggleMic} onToggleVideo={props.onToggleVideo} onEndCall={props.onEndCall} captionsEnabled={showCaptions} onToggleCaptions={() => setShowCaptions(!showCaptions)} endLabel="Leave interview" microphoneAvailable={props.inputMode === "voice"} captionsAvailable={props.inputMode === "voice"} />
+        <div className="hidden justify-self-end text-xs text-muted-foreground sm:block">Camera coaching is optional</div>
       </div>
       <EndConfirmDialog show={props.showEndConfirm} onConfirm={props.onConfirmEnd} onCancel={props.onCancelEnd} />
     </div>
@@ -1466,7 +1272,7 @@ function CleanInterviewStage({ props }: { props: LayoutProps }) {
       ? "Listening"
       : props.aiSpeaking
         ? "Interviewer speaking"
-        : "Ready for your answer"
+        : props.inputMode === "text" ? "Ready to type" : "Ready for your answer"
   return (
     <div className="grid h-full min-h-[420px] gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
       <section className="flex min-h-0 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm">
@@ -1499,6 +1305,37 @@ function CleanInterviewStage({ props }: { props: LayoutProps }) {
           <h1 className="mt-3 max-w-3xl text-balance text-2xl font-semibold leading-relaxed text-foreground sm:text-3xl">
             {props.currentQuestion || "Your interview will begin in a moment."}
           </h1>
+          {props.inputMode === "text" && (
+            <div className="mt-8 w-full max-w-3xl text-left">
+              <textarea
+                value={props.textAnswer}
+                onChange={(event) => props.onTextAnswerChange(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault()
+                    props.onSubmitTextAnswer()
+                  }
+                }}
+                disabled={props.textSubmitting || props.isProcessing || props.interviewState !== "active"}
+                rows={6}
+                maxLength={12000}
+                aria-label="Your interview answer"
+                placeholder="Type your answer here…"
+                className="w-full resize-none rounded-xl border border-border bg-background px-4 py-3 text-sm leading-6 text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:border-primary disabled:cursor-not-allowed disabled:opacity-60"
+              />
+              <div className="mt-2 flex items-center justify-between gap-3">
+                <span className="text-xs text-muted-foreground">Ctrl or ⌘ + Enter to submit</span>
+                <button
+                  type="button"
+                  onClick={props.onSubmitTextAnswer}
+                  disabled={!props.textAnswer.trim() || props.textSubmitting || props.isProcessing || props.interviewState !== "active"}
+                  className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {props.textSubmitting ? "Submitting…" : "Submit answer"}
+                </button>
+              </div>
+            </div>
+          )}
           <div className="mt-8 flex items-center gap-2 rounded-full border border-border bg-background px-4 py-2 text-sm text-muted-foreground">
             <span className={`h-2 w-2 rounded-full ${props.isCapturing || props.aiSpeaking ? "animate-pulse bg-primary" : "bg-muted-foreground/50"}`} />
             {status}
@@ -1507,12 +1344,12 @@ function CleanInterviewStage({ props }: { props: LayoutProps }) {
       </section>
       <aside className="flex min-h-0 flex-col gap-3">
         <div className="h-40 overflow-hidden rounded-xl border border-border bg-card shadow-sm lg:h-44">
-          <MeetSelfTile stream={props.localStream} videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} compact />
+          <MeetSelfTile stream={props.localStream} videoRef={props.videoRef} isVideoOn={props.isVideoOn} isMicOn={props.isMicOn} showMicrophone={props.inputMode === "voice"} compact />
         </div>
         <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
           <div className="space-y-2 text-sm text-foreground">
-            <p className="flex items-center justify-between"><span className="text-muted-foreground">Camera</span><span className="text-emerald-600 dark:text-emerald-300">On</span></p>
-            <p className="flex items-center justify-between"><span className="text-muted-foreground">Microphone</span><span>{props.isMicOn ? "On" : "Muted"}</span></p>
+            <p className="flex items-center justify-between"><span className="text-muted-foreground">Camera</span><span>{props.isVideoOn ? "On" : "Off"}</span></p>
+            <p className="flex items-center justify-between"><span className="text-muted-foreground">Answer format</span><span>{props.inputMode === "voice" ? (props.isMicOn ? "Voice" : "Muted") : "Typed"}</span></p>
           </div>
         </div>
       </aside>

@@ -1,9 +1,8 @@
 # ============================================================================
 # MODULE: workspace_api.py
-# PURPOSE: Authenticated workspace API — learning snapshot, exercises (coach +
-#          generated), interview profile, job profiles, jobs catalog, recent
-#          activity, technical-round history, performance trend, analytics,
-#          support submissions.  Mounted under /api/workspace.
+# PURPOSE: Local workspace API — learning snapshot, exercises, interview
+#          profile, saved roles, recent activity, technical-round history,
+#          performance trend, and analytics. Mounted under /api/workspace.
 # STRUCTURE:
 #   - Pydantic models (top ~300 lines)
 #   - Helpers for snapshots/aggregations (~middle)
@@ -12,26 +11,23 @@
 #   - GET  /stats                         -> headline counters (line 1029)
 #   - GET  /learning                      -> learning snapshot (1154)
 #   - POST /exercises/{id}/attempt        -> grade attempt (1172)
-#   - POST /exercises/{id}/run            -> run code via Piston (1193)
+#   - POST /exercises/{id}/run            -> run code in the local OS sandbox
 #   - GET/PUT /interview-profile          -> profile_type selector (1275/1303)
 #   - GET/POST /job-profiles              -> CRUD per-user job profiles (1349/1373)
 #   - POST /job-profiles/{id}/select      -> set selected (1425)
-#   - GET  /jobs[/{id}]                   -> public job catalog (1477/1516)
-#   - POST /select-job/{id}               -> link UserInfo.job_id (1559)
+#   - GET  /jobs[/{id}]                   -> bundled role catalog
+#   - POST /select-job/{id}               -> select a local role
 #   - GET  /recent-activity               -> last N days (1609)
 #   - GET  /technical-rounds              -> tech round history (1659)
 #   - GET  /performance-trend             -> per-day score series (1715)
 #   - GET  /analytics                     -> aggregate analytics (1747)
-#   - POST /support                       -> create SupportSubmission (1767)
-#   - GET  /support/submissions           -> list (admin only) (1832)
-#   - PATCH /support/submissions/{id}     -> update status/notes (1889)
-# DEPENDS ON: auth, config, database, interview_profiles, learning_engine,
-#             security_utils
+# DEPENDS ON: database, interview_profiles, learning_engine, local_execution,
+#             local_runtime, security_utils
 # CONSUMED BY: app.py, Frontend/components/app-shell.tsx,
 #              Frontend/lib/api.ts (~20 helpers)
 # DATA TABLES: UserInfo, Interviews, InterviewResponses, JobProfiles, Jobs,
 #              GeneratedExercises, ExerciseAttempts,
-#              TechnicalInterviewRounds, LearnerSkillStates, SupportSubmissions
+#              TechnicalInterviewRounds, LearnerSkillStates
 # ============================================================================
 
 from collections import Counter, defaultdict
@@ -44,15 +40,15 @@ import time
 import uuid
 import hashlib
 
-import aiohttp
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 
-from auth import get_current_admin, get_current_user
+from local_runtime import local_user
 
 from database import async_execute, get_db_connection, return_db_connection
 from analysis_pipeline import ANALYSIS_STAGE_VERSION
 from interview_profiles import DEFAULT_PROFILE_TYPE, PROFILE_CONFIGS, normalize_profile_type
+from local_execution import execute_local
 from learning_engine import (
     _active_mission_payload,
     _exercise_from_row,
@@ -60,10 +56,87 @@ from learning_engine import (
     build_error_signature,
     submit_exercise_attempt,
 )
-from security_utils import decrypt_data, encrypt_data, stable_hash
+from security_utils import decrypt_data, decrypt_json_field, encrypt_data, stable_hash
 
 router = APIRouter(tags=["Dashboard"])
 logger = logging.getLogger("ai_interviewer.dashboard")
+def _performance_ready_count(cursor: Any, user_id: str) -> int:
+    """Count current, evidence-backed Performance analyses for Improve.
+
+    Improve is a coaching projection of Performance, not a second source of
+    truth.  A report/assessment row by itself is therefore not enough to
+    unlock missions or exercises.
+    """
+    cursor.execute(
+        """
+        SELECT COALESCE(MAX(mode_count), 0)
+        FROM (
+            SELECT mode, COUNT(*) AS mode_count
+            FROM SessionPerformanceAnalyses
+            WHERE user_id = ?
+              AND schema_version = 'session-performance-v4'
+              AND producer_version = ?
+              AND status = 'ready'
+              AND is_current = TRUE
+              AND evidence_status = 'sufficient'
+              AND overall_score IS NOT NULL
+              AND analysis_json_encrypted IS NOT NULL
+              AND evidence_index_encrypted IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM ReportArtifacts artifact
+                  WHERE artifact.analysis_id = SessionPerformanceAnalyses.analysis_id
+                    AND artifact.interview_id = SessionPerformanceAnalyses.interview_id
+                    AND artifact.user_id = SessionPerformanceAnalyses.user_id
+                    AND artifact.audience = 'candidate'
+                    AND artifact.status IN ('completed', 'partial')
+                    AND artifact.payload_encrypted IS NOT NULL
+              )
+            GROUP BY mode
+        ) ready_modes
+        """,
+        (user_id, ANALYSIS_STAGE_VERSION),
+    )
+    return int((cursor.fetchone() or [0])[0] or 0)
+
+
+async def _require_performance_ready(user_id: str) -> None:
+    row = await async_execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM SessionPerformanceAnalyses
+            WHERE user_id = ?
+              AND schema_version = 'session-performance-v4'
+              AND producer_version = ?
+              AND status = 'ready'
+              AND is_current = TRUE
+              AND evidence_status = 'sufficient'
+              AND overall_score IS NOT NULL
+              AND analysis_json_encrypted IS NOT NULL
+              AND evidence_index_encrypted IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM ReportArtifacts artifact
+                  WHERE artifact.analysis_id = SessionPerformanceAnalyses.analysis_id
+                    AND artifact.interview_id = SessionPerformanceAnalyses.interview_id
+                    AND artifact.user_id = SessionPerformanceAnalyses.user_id
+                    AND artifact.audience = 'candidate'
+                    AND artifact.status IN ('completed', 'partial')
+                    AND artifact.payload_encrypted IS NOT NULL
+              )
+            GROUP BY mode
+            HAVING COUNT(*) >= 1
+        )
+        """,
+        (user_id, ANALYSIS_STAGE_VERSION),
+        fetchone=True,
+    )
+    if not row or not bool(row[0]):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Improve becomes available after an evidence-backed Performance analysis is ready.",
+        )
 
 
 class JobResponse(BaseModel):
@@ -80,7 +153,7 @@ class JobResponse(BaseModel):
 JOB_PROFILE_SELECT = """
     SELECT profile_id, role, company, tech_stack, is_selected, created_at,
            job_description_encrypted, job_description_hash,
-           normalized_requirements, normalization_version,
+           normalized_requirements, normalized_requirements_encrypted, normalization_version,
            experience_level, parser_version, updated_at
     FROM JobProfiles
 """
@@ -88,7 +161,7 @@ JOB_PROFILE_SELECT = """
 JOB_PROFILE_RETURNING = """
     RETURNING profile_id, role, company, tech_stack, is_selected, created_at,
               job_description_encrypted, job_description_hash,
-              normalized_requirements, normalization_version,
+              normalized_requirements, normalized_requirements_encrypted, normalization_version,
               experience_level, parser_version, updated_at
 """
 
@@ -175,6 +248,30 @@ def _decrypt_job_description(value: Any) -> Optional[str]:
     return decrypted or None
 
 
+def _encrypt_job_requirements(value: Dict[str, Any]) -> bytes:
+    return encrypt_data(json.dumps(value, separators=(",", ":"), sort_keys=True)).encode("utf-8")
+
+
+def _decrypt_job_requirements(encrypted: Any, legacy: Any = None) -> Dict[str, Any]:
+    if isinstance(encrypted, memoryview):
+        encrypted = encrypted.tobytes()
+    if isinstance(encrypted, bytes):
+        encrypted = encrypted.decode("utf-8")
+    if encrypted:
+        try:
+            value = json.loads(decrypt_data(str(encrypted)))
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            logger.warning("Could not decrypt saved job requirements")
+    if isinstance(legacy, str):
+        try:
+            legacy = json.loads(legacy)
+        except ValueError:
+            legacy = {}
+    return legacy if isinstance(legacy, dict) and legacy.get("encrypted") is not True else {}
+
+
 class JobProfileCreate(BaseModel):
     role: str = Field(min_length=2, max_length=255)
     company: Optional[str] = Field(default=None, max_length=255)
@@ -256,63 +353,6 @@ class InterviewProfileResponse(BaseModel):
     profile_type: str
     label: str
     options: List[Dict[str, Any]]
-
-
-class SupportSubmissionCreate(BaseModel):
-    kind: str
-    title: Optional[str] = None
-    message: str = Field(min_length=10, max_length=5000)
-    steps: Optional[str] = Field(default=None, max_length=4000)
-    rating: Optional[int] = Field(default=None, ge=1, le=5)
-    interview_id: Optional[str] = None
-    page_url: Optional[str] = Field(default=None, max_length=1000)
-
-    @field_validator("kind")
-    @classmethod
-    def validate_kind(cls, value: str) -> str:
-        normalized = (value or "").strip().lower()
-        if normalized not in {"bug", "feedback"}:
-            raise ValueError("kind must be either 'bug' or 'feedback'")
-        return normalized
-
-    @field_validator("title")
-    @classmethod
-    def normalize_title(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        text = value.strip()
-        return text or None
-
-    @field_validator("steps", "page_url")
-    @classmethod
-    def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        text = value.strip()
-        return text or None
-
-
-class SupportSubmissionUpdate(BaseModel):
-    status: Optional[str] = None
-    admin_notes: Optional[str] = Field(default=None, max_length=4000)
-
-    @field_validator("status")
-    @classmethod
-    def validate_status(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        normalized = value.strip().lower()
-        if normalized not in {"open", "reviewing", "resolved", "closed"}:
-            raise ValueError("Unsupported status")
-        return normalized
-
-    @field_validator("admin_notes")
-    @classmethod
-    def normalize_notes(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
-        text = value.strip()
-        return text or None
 
 
 class ExerciseAttemptCreate(BaseModel):
@@ -498,37 +538,6 @@ def _candidate_report_cta(
     }
 
 
-EXERCISE_FILE_NAMES = {
-    "python": "main.py",
-    "javascript": "main.js",
-    "java": "Main.java",
-}
-PISTON_RUNTIME_CACHE: Dict[str, Dict[str, str]] = {}
-
-
-async def _resolve_piston_runtime(language: str) -> Dict[str, str]:
-    if language in PISTON_RUNTIME_CACHE:
-        return PISTON_RUNTIME_CACHE[language]
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
-        headers = {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"} if settings.PISTON_API_TOKEN else {}
-        async with session.get(settings.PISTON_API_URL.rstrip("/") + "/runtimes", headers=headers) as response:
-            if response.status >= 400:
-                raise HTTPException(status_code=502, detail="Could not load code runtimes")
-            runtimes = await response.json()
-    aliases = {
-        "python": {"python", "py"},
-        "javascript": {"javascript", "js", "node"},
-        "java": {"java"},
-    }[language]
-    for runtime in runtimes:
-        names = {runtime.get("language"), *(runtime.get("aliases") or [])}
-        if aliases & {str(name).lower() for name in names if name}:
-            resolved = {"language": runtime["language"], "version": runtime["version"]}
-            PISTON_RUNTIME_CACHE[language] = resolved
-            return resolved
-    raise HTTPException(status_code=502, detail=f"No isolated sandbox runtime for {language}")
-
-
 def _text_tokens(value: str) -> List[str]:
     return re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{1,}", value.lower())
 
@@ -624,10 +633,9 @@ def _profile_context(cursor, user_id: str) -> Dict[str, Any]:
     cursor.execute(
         """
         SELECT mock_interview_count, practice_interview_count, profile_completed,
-               resume_json, profile_json, interviews_remaining, plan_type,
-               external_profile_signals
+               resume_json, profile_json
         FROM UserInfo
-        WHERE user_id = %s
+        WHERE user_id = ?
         """,
         (user_id,)
     )
@@ -651,15 +659,13 @@ def _profile_context(cursor, user_id: str) -> Dict[str, Any]:
         or []
     )
     context["skills"] = context.get("skills") or profile_json.get("skills") or []
-    context["external_profile_signals"] = row[7] or {}
+    context["external_profile_signals"] = {}
     return {
         "mock_interview_count": row[0] or 0,
         "practice_interview_count": row[1] or 0,
         "profile_completed": bool(row[2]),
         "resume_json": resume_json,
         "profile_json": profile_json,
-        "interviews_remaining": row[5] or 0,
-        "plan_type": row[6] or "free",
         "profile_context": context,
     }
 
@@ -734,7 +740,7 @@ def _non_technical_interview_where(alias: str = "i") -> str:
     return f"""
       AND NOT (
         LOWER(COALESCE({alias}.interview_type, '')) IN ('technical', 'technical interview', 'technical mode', 'coding', 'technical_round')
-        OR COALESCE(({alias}.settings->>'technical_mode')::boolean, false)
+        OR COALESCE(CAST(json_extract({alias}.settings, '$.technical_mode') AS INTEGER), 0) = 1
         OR EXISTS (
             SELECT 1
             FROM TechnicalInterviewRounds tir_filter
@@ -749,8 +755,8 @@ def _gradable_interview_where(alias: str = "i") -> str:
       AND {alias}.status IN ('completed', 'report_ready', 'partial')
       AND {alias}.overall_score IS NOT NULL
       AND {alias}.report_json IS NOT NULL
-      AND COALESCE({alias}.report_json->>'readiness_label', '') <> 'Not gradable'
-      AND COALESCE({alias}.report_json->>'version', '') NOT ILIKE '%%no_evidence%%'
+      AND COALESCE(json_extract({alias}.report_json, '$.readiness_label'), '') <> 'Not gradable'
+      AND COALESCE(json_extract({alias}.report_json, '$.version'), '') NOT LIKE '%no_evidence%'
     """
 
 
@@ -761,7 +767,7 @@ def _recent_interviews(cursor, user_id: str, limit: int = 20) -> List[Dict[str, 
                i.overall_score, i.created_at, i.interview_mode,
                i.status, i.attempt_status, i.duration_seconds
         FROM Interviews i
-        WHERE i.user_id = %s
+        WHERE i.user_id = ?
           AND i.status IN ('completed', 'report_ready', 'partial', 'failed')
           AND i.attempt_status = 'completed'
           AND EXISTS (
@@ -770,7 +776,7 @@ def _recent_interviews(cursor, user_id: str, limit: int = 20) -> List[Dict[str, 
           )
         {_non_technical_interview_where("i")}
         ORDER BY i.created_at DESC
-        LIMIT %s
+        LIMIT ?
         """,
         (user_id, limit)
     )
@@ -796,9 +802,18 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
     if not interview_ids:
         return []
 
-    placeholders = ",".join(["%s"] * len(interview_ids))
+    placeholders = ",".join(["?"] * len(interview_ids))
     cursor.execute(
         f"""
+        WITH latest_assessments AS (
+            SELECT response_id, assessment_json_encrypted, assessment_json,
+                   overall_score,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY response_id
+                       ORDER BY created_at DESC, assessment_id DESC
+                   ) AS assessment_rank
+            FROM ResponseAssessments
+        )
         SELECT ir.response_id, iq.question_text, iq.question_type, iq.is_followup,
                COALESCE(iq.topic_label, i.job_title, 'General') AS topic_label,
                ir.score, ir.response_time_seconds, ir.technical_accuracy,
@@ -806,18 +821,15 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
                ir.answer_quality_flags, ir.evidence_quotes, ir.ai_feedback,
                ir.user_response, ir.answer_text_encrypted,
                ir.interview_id, ir.created_at,
+               latest_assessment.assessment_json_encrypted,
                latest_assessment.assessment_json,
                latest_assessment.overall_score
         FROM InterviewResponses ir
         JOIN InterviewQuestions iq ON ir.question_id = iq.question_id
         JOIN Interviews i ON ir.interview_id = i.interview_id
-        LEFT JOIN LATERAL (
-            SELECT ra.assessment_json, ra.overall_score
-            FROM ResponseAssessments ra
-            WHERE ra.response_id = ir.response_id
-            ORDER BY ra.created_at DESC
-            LIMIT 1
-        ) latest_assessment ON TRUE
+        LEFT JOIN latest_assessments latest_assessment
+          ON latest_assessment.response_id = ir.response_id
+         AND latest_assessment.assessment_rank = 1
         WHERE ir.interview_id IN ({placeholders})
         ORDER BY ir.created_at
         """,
@@ -826,10 +838,10 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
 
     items = []
     for row in cursor.fetchall():
-        assessment = _json_object(row[19])
+        assessment = decrypt_json_field(row[19], row[20], {})
         dimensions = assessment.get("dimension_scores") if isinstance(assessment.get("dimension_scores"), dict) else {}
         scores = assessment.get("scores") if isinstance(assessment.get("scores"), dict) else {}
-        assessment_score = row[20]
+        assessment_score = row[21]
         if assessment_score is None:
             assessment_score = assessment.get("overall_score")
         insufficient = bool(
@@ -837,6 +849,13 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
             or assessment.get("evidence_status") == "insufficient_evidence"
         )
         authoritative = bool(assessment_score is not None and not insufficient)
+        evidence_status = str(assessment.get("evidence_status") or "").strip().lower()
+        if not evidence_status:
+            evidence_status = (
+                "assessment_missing"
+                if not assessment
+                else ("insufficient_evidence" if not authoritative else "sufficient")
+            )
 
         encrypted_answer = row[16]
         if isinstance(encrypted_answer, memoryview):
@@ -887,7 +906,7 @@ def _response_rows(cursor, interview_ids: List[str]) -> List[Dict[str, Any]]:
             "response": answer_text,
             "interview_id": row[17],
             "created_at": row[18],
-            "evidence_status": assessment.get("evidence_status"),
+            "evidence_status": evidence_status,
             "authoritative": authoritative,
         })
     return items
@@ -904,7 +923,7 @@ def _technical_problem_analytics(cursor, user_id: str) -> Dict[str, Any]:
                MAX(tre.created_at) AS last_run_at
         FROM TechnicalInterviewRounds tir
         LEFT JOIN TechnicalRunEvents tre ON tre.round_id = tir.round_id
-        WHERE tir.user_id = %s
+        WHERE tir.user_id = ?
         GROUP BY tir.round_id, tir.interview_id, tir.round_type, tir.language,
                  tir.prompt, tir.status, tir.created_at, tir.metadata
         ORDER BY tir.created_at DESC
@@ -946,12 +965,12 @@ def _technical_problem_analytics(cursor, user_id: str) -> Dict[str, Any]:
     cursor.execute(
         """
         SELECT COUNT(*)
-        FROM AntiCheatEvents
-        WHERE user_id = %s
+        FROM SessionReviewEvents
+        WHERE user_id = ?
         """,
         (user_id,),
     )
-    anti_cheat_count = int((cursor.fetchone() or [0])[0] or 0)
+    self_review_signal_count = int((cursor.fetchone() or [0])[0] or 0)
     total_runs = sum(item["run_count"] for item in problems)
     successful_runs = sum(item["successful_runs"] for item in problems)
 
@@ -961,7 +980,7 @@ def _technical_problem_analytics(cursor, user_id: str) -> Dict[str, Any]:
             "total_runs": total_runs,
             "successful_runs": successful_runs,
             "success_rate": round((successful_runs / total_runs) * 100, 1) if total_runs else 0,
-            "anti_cheat_events": anti_cheat_count,
+            "self_review_signals": self_review_signal_count,
         },
         "by_round_type": [
             {
@@ -1679,6 +1698,14 @@ def _canonical_round_history_item(session: Dict[str, Any], mode: str) -> Dict[st
             "problems_attempted": len(attempted),
             "problems_total": len(matrix) or int(technical.get("round_count") or 0),
             "problems_solved": len(solved),
+            "problems_partially_solved": max(0, len(submitted) - len(solved)),
+            "problems_not_submitted": max(0, len(attempted) - len(submitted)),
+            "problems_not_attempted": max(0, (len(matrix) or int(technical.get("round_count") or 0)) - len(attempted)),
+            "languages": list(dict.fromkeys(
+                str(item.get("language")).strip()
+                for item in matrix
+                if str(item.get("language") or "").strip()
+            )),
             "questions_completed": None,
             "questions_total": None,
             "key_result": (
@@ -1698,12 +1725,469 @@ def _canonical_round_history_item(session: Dict[str, Any], mode: str) -> Dict[st
         result.update({
             "questions_completed": answered,
             "questions_total": total,
+            "questions_skipped": max(0, total - answered),
             "problems_attempted": None,
             "problems_total": None,
             "problems_solved": None,
             "key_result": f"{fully}/{total} fully answered" if total else None,
         })
     return result
+
+
+ROUND_FINDING_IMPACT = {
+    "Technical knowledge gap": "An interviewer needs a technically correct explanation before they can trust the decision or implementation.",
+    "Incorrect statement": "An incorrect claim can undermine otherwise strong evidence in the same answer.",
+    "Missing reasoning": "Without the reasoning, the interviewer cannot tell whether the decision was understood or guessed.",
+    "Missing justification or trade-offs": "Interviewers use alternatives and trade-offs to test decision quality, not just recall.",
+    "Weak example or evidence": "A concrete action, result, or example is what makes the claim credible.",
+    "Incomplete answer": "Stopping early leaves part of the question unproven.",
+    "Unclear answer structure": "The core answer becomes harder to identify even when relevant knowledge is present.",
+    "Follow-up depth": "Follow-ups test whether the initial answer reflects durable understanding.",
+    "Not attempted": "No candidate work was recorded, so this problem could not demonstrate readiness.",
+    "Incomplete execution": "Without a final submission, correctness cannot be verified against the complete test set.",
+    "Compilation failure": "Code that does not compile cannot demonstrate the intended solution.",
+    "Runtime failure": "Runtime failures prevent an otherwise plausible approach from producing a usable result.",
+    "Correctness or edge cases": "Failed evaluated cases show that the implementation does not yet handle the full problem contract.",
+    "Complexity or optimization": "An approach that exceeds the expected complexity may fail under interview constraints even when it is logically correct.",
+    "Technical implementation": "The saved implementation evidence did not meet the problem's evaluated requirements.",
+}
+
+
+def _string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def _report_question_map(analysis: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    report = _analysis_report(analysis)
+    questions = report.get("questions") or report.get("per_turn_feedback") or []
+    return {
+        str(item.get("response_id")): item
+        for item in questions
+        if isinstance(item, dict) and item.get("response_id")
+    }
+
+
+def _interview_issue_type(item: Dict[str, Any]) -> str:
+    flags = {str(flag).strip().lower() for flag in item.get("answer_quality_flags") or []}
+    dimensions = item.get("dimension_scores") if isinstance(item.get("dimension_scores"), dict) else {}
+    incorrect = item.get("incorrect_claim_ids") or item.get("incorrect_claims") or []
+    missed = item.get("missed_point_ids") or item.get("missed_points") or []
+    if incorrect or item.get("contradictions"):
+        return "Incorrect statement"
+    if "missing_tradeoffs" in flags or (
+        _performance_number(dimensions.get("tradeoffs")) is not None
+        and float(_performance_number(dimensions.get("tradeoffs")) or 0) < 60
+    ):
+        return "Missing justification or trade-offs"
+    if flags.intersection({"no_evidence", "unsupported_or_unspecific", "ownership_unclear"}):
+        return "Weak example or evidence"
+    if flags.intersection({"indirect_response", "vague", "off_topic", "low_lexical_relevance"}):
+        return "Unclear answer structure"
+    if flags.intersection({"too_short", "no_response", "insufficient_evidence"}) or missed:
+        return "Incomplete answer"
+    if item.get("is_followup") or (item.get("follow_up_chain") or {}).get("parent_question_id"):
+        return "Follow-up depth"
+    technical_score = _performance_number(
+        dimensions.get("technical_accuracy"),
+        dimensions.get("correctness"),
+        dimensions.get("technical_competency"),
+    )
+    if technical_score is not None and technical_score < 60:
+        return "Technical knowledge gap"
+    problem_solving = _performance_number(dimensions.get("problem_solving"), dimensions.get("depth"))
+    if problem_solving is not None and problem_solving < 60:
+        return "Missing reasoning"
+    return "Incomplete answer"
+
+
+def _technical_issue_type(item: Dict[str, Any]) -> str:
+    text = " ".join(str(item.get(key) or "") for key in (
+        "status", "main_issue", "failure_reason", "final_verdict", "evidence_state",
+    )).lower()
+    complexity = item.get("complexity") if isinstance(item.get("complexity"), dict) else {}
+    if "not attempted" in text or "no_evidence" in text or "no candidate evidence" in text:
+        return "Not attempted"
+    if "no final submission" in text or "draft_only" in text or "run_only" in text or "incomplete" in text:
+        return "Incomplete execution"
+    if "compil" in text:
+        return "Compilation failure"
+    if "runtime" in text:
+        return "Runtime failure"
+    expected = str(complexity.get("expected") or item.get("expected_time_complexity") or "").strip()
+    actual = str(complexity.get("actual") or complexity.get("time") or item.get("user_time_complexity") or "").strip()
+    if "complex" in text or "time limit" in text or (expected and actual and expected != actual):
+        return "Complexity or optimization"
+    if any(token in text for token in ("failed", "wrong answer", "needs work", "partial")):
+        return "Correctness or edge cases"
+    return "Technical implementation"
+
+
+def _canonical_round_findings(session: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Project one canonical report into factual strengths and issues.
+
+    The projection intentionally stays question/problem level. It never creates
+    a weakness merely because a generic taxonomy category exists.
+    """
+    analysis = session.get("analysis") or {}
+    report = _analysis_report(analysis)
+    issues: List[Dict[str, Any]] = []
+    strengths: List[Dict[str, Any]] = []
+
+    if mode == "technical":
+        report_technical = report.get("technical") if isinstance(report.get("technical"), dict) else {}
+        problems = report_technical.get("problems") or report.get("problems") or report.get("test_matrix")
+        if not isinstance(problems, list) or not problems:
+            technical = analysis.get("technical") if isinstance(analysis.get("technical"), dict) else {}
+            problems = technical.get("test_matrix") or []
+        for problem in problems:
+            if not isinstance(problem, dict):
+                continue
+            title = _short_text(
+                problem.get("title") or problem.get("problem") or _human_label(problem.get("round_type") or "Technical problem"),
+                120,
+            )
+            score = _performance_number(problem.get("score"), problem.get("final_pass_rate"))
+            status_value = str(problem.get("status") or problem.get("final_verdict") or problem.get("evidence_state") or "").strip()
+            evidence_ids = _string_list(problem.get("evidence_ids"))
+            for candidate in (
+                problem.get("submission_id"), problem.get("run_id"),
+                problem.get("snapshot_id"), problem.get("round_id"),
+            ):
+                if candidate and str(candidate) not in evidence_ids:
+                    evidence_ids.append(str(candidate))
+            visible_passed = int(problem.get("visible_passed") or 0)
+            visible_total = int(problem.get("visible_total") or 0)
+            hidden_passed = int(problem.get("hidden_passed") or 0)
+            hidden_total = int(problem.get("hidden_total") or 0)
+            total_tests = visible_total + hidden_total
+            passed_tests = visible_passed + hidden_passed
+            solved = (
+                (score is not None and score >= 100)
+                or (total_tests > 0 and passed_tests == total_tests and bool(problem.get("final_submission") or problem.get("submission_id")))
+                or status_value.lower() in {"accepted", "correct", "solved", "meets bar"}
+            )
+            source = {
+                "source_label": title,
+                "round_id": problem.get("round_id"),
+                "evidence_ids": evidence_ids,
+                "score": score,
+                "status": status_value or None,
+            }
+            if solved:
+                detail = (
+                    f"Passed all {total_tests} evaluated tests."
+                    if total_tests else
+                    _short_text(problem.get("what_happened") or "The recorded technical response met the evaluated bar.", 180)
+                )
+                strengths.append({
+                    **source,
+                    "label": title,
+                    "detail": detail,
+                    "what_happened": _short_text(problem.get("what_happened"), 220) or detail,
+                })
+                continue
+            main_issue = _short_text(
+                problem.get("main_issue") or problem.get("failure_reason") or problem.get("what_happened"),
+                220,
+            )
+            state = str(problem.get("evidence_state") or status_value).strip().lower()
+            failed = bool(
+                main_issue
+                or state in {"no_evidence", "no_candidate_evidence", "run_only", "draft_only", "insufficient_evidence"}
+                or (score is not None and score < 70)
+                or (status_value and status_value.lower() not in {"submitted", "completed", "accepted", "correct", "solved", "meets bar"})
+                or (total_tests and passed_tests < total_tests)
+            )
+            if not failed:
+                continue
+            issue_type = _technical_issue_type(problem)
+            issues.append({
+                **source,
+                "label": issue_type,
+                "detail": main_issue or _human_label(status_value or state or "Technical evidence needs review"),
+                "what_happened": _short_text(problem.get("what_happened"), 220) or None,
+                "why_it_matters": ROUND_FINDING_IMPACT.get(issue_type),
+            })
+    else:
+        report_questions = _report_question_map(analysis)
+        questions = analysis.get("question_analyses") or analysis.get("questions") or []
+        for item in questions:
+            if not isinstance(item, dict):
+                continue
+            response_id = item.get("response_id")
+            report_item = report_questions.get(str(response_id), {})
+            score = _question_score(item)
+            flags = _string_list(item.get("answer_quality_flags"))
+            missed = item.get("missed_point_ids") or item.get("missed_points") or []
+            incorrect = item.get("incorrect_claim_ids") or item.get("incorrect_claims") or []
+            contradictions = item.get("contradictions") or []
+            report_reduced = _string_list(report_item.get("what_reduced_score"))
+            report_good = _string_list(report_item.get("what_was_good"))
+            question = _short_text(item.get("question") or report_item.get("question") or "Interview answer", 140)
+            evidence_ids = [str(response_id)] if response_id else []
+            needs_work = bool(
+                item.get("insufficient_evidence")
+                or score is None
+                or score < 70
+                or flags
+                or missed
+                or incorrect
+                or contradictions
+                or report_reduced
+            )
+            if needs_work:
+                issue_type = _interview_issue_type(item)
+                detail = report_reduced[0] if report_reduced else (
+                    _flag_label(flags[0]) if flags else
+                    "Correct or clarify the inaccurate claim." if incorrect or contradictions else
+                    "Add the missing expected point or evidence." if missed else
+                    "The saved evaluator evidence was insufficient to grade this answer." if score is None else
+                    f"The report scored this answer at {score:g}%."
+                )
+                issues.append({
+                    "label": issue_type,
+                    "source_label": question,
+                    "detail": _short_text(detail, 220),
+                    "what_happened": _short_text(report_item.get("what_candidate_answered"), 220) or None,
+                    "why_it_matters": ROUND_FINDING_IMPACT.get(issue_type),
+                    "response_id": response_id,
+                    "evidence_ids": evidence_ids,
+                    "score": score,
+                    "status": report_item.get("status") or ("insufficient" if score is None else "needs_work"),
+                })
+            if score is not None and score >= 70:
+                strong_dimensions = []
+                dimensions = item.get("dimension_scores") if isinstance(item.get("dimension_scores"), dict) else {}
+                for raw_key, raw_value in sorted(
+                    dimensions.items(),
+                    key=lambda pair: -float(_performance_number(pair[1]) or 0),
+                ):
+                    dimension_score = _performance_number(raw_value)
+                    if dimension_score is None or dimension_score < 70:
+                        continue
+                    strong_dimensions.append(
+                        f"{PERFORMANCE_ANALYTICS_DIMENSION_LABELS.get(str(raw_key).lower(), _human_label(raw_key))} ({dimension_score:g}%)"
+                    )
+                    if len(strong_dimensions) == 2:
+                        break
+                fallback_detail = f"The report scored this answer at {score:g}%."
+                if strong_dimensions:
+                    fallback_detail = (
+                        f"The report scored this answer at {score:g}%; its strongest evaluated "
+                        f"dimensions were {' and '.join(strong_dimensions)}."
+                    )
+                strengths.append({
+                    "label": question,
+                    "source_label": question,
+                    "detail": _short_text(report_good[0], 220) if report_good else fallback_detail,
+                    "response_id": response_id,
+                    "evidence_ids": evidence_ids,
+                    "score": score,
+                    "status": report_item.get("status") or "completed",
+                })
+
+    issues = issues[:8]
+    strengths = strengths[:6]
+    takeaway = None
+    if issues and strengths:
+        takeaway = (
+            f"The report records a clear strength in {strengths[0]['source_label']}, "
+            f"while {issues[0]['label'].lower()} is the most important issue to revisit."
+        )
+    elif issues:
+        takeaway = (
+            f"The clearest issue in this report is {issues[0]['label'].lower()} "
+            f"in {issues[0]['source_label']}."
+        )
+    elif strengths:
+        takeaway = f"The strongest recorded evidence in this report came from {strengths[0]['source_label']}."
+
+    return {
+        "summary": _short_text(report.get("summary"), 220) or None,
+        "takeaway": takeaway,
+        "strengths": strengths,
+        "issues": issues,
+    }
+
+
+def _canonical_round_mistakes(session: Dict[str, Any], mode: str) -> List[Dict[str, Any]]:
+    """Compatibility projection for older Performance clients."""
+    return _canonical_round_findings(session, mode)["issues"][:5]
+
+
+def _combined_report_findings(
+    rows: List[Dict[str, Any]],
+    mode: str,
+) -> Dict[str, Any]:
+    """Combine qualitative findings from every current report for one mode.
+
+    Scores and trend deltas are intentionally excluded here because reports can
+    use different evaluator or rubric versions. Numeric aggregation remains in
+    the comparable cohort; this projection answers the separate product need to
+    diagnose the user's complete saved report history.
+    """
+    issue_buckets: Dict[str, Dict[str, Any]] = {}
+    strength_buckets: Dict[str, Dict[str, Any]] = {}
+    reports_with_findings: set[str] = set()
+    reports_with_issues: set[str] = set()
+    reports_with_strengths: set[str] = set()
+    official_reports = 0
+    finding_count = 0
+    strength_count = 0
+
+    def report_key(session: Dict[str, Any]) -> str:
+        return str(session.get("interview_id") or session.get("analysis_id") or "")
+
+    def evidence_entry(
+        session: Dict[str, Any],
+        finding: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "interview_id": session.get("interview_id"),
+            "analysis_id": session.get("analysis_id"),
+            "date": _performance_iso(session.get("created_at")),
+            "role": session.get("role"),
+            "source_label": finding.get("source_label") or finding.get("label"),
+            "detail": finding.get("detail"),
+            "what_happened": finding.get("what_happened"),
+            "why_it_matters": finding.get("why_it_matters"),
+            "score": finding.get("score"),
+            "status": finding.get("status"),
+            "response_id": finding.get("response_id"),
+            "round_id": finding.get("round_id"),
+            "evidence_ids": finding.get("evidence_ids") or [],
+        }
+
+    for order, session in enumerate(rows):
+        key = report_key(session)
+        if (
+            session.get("evidence_status") == "sufficient"
+            and session.get("overall_score") is not None
+        ):
+            official_reports += 1
+        findings = _canonical_round_findings(session, mode)
+        issues = [item for item in findings.get("issues") or [] if isinstance(item, dict)]
+        strengths = [item for item in findings.get("strengths") or [] if isinstance(item, dict)]
+        if issues or strengths:
+            reports_with_findings.add(key)
+        if issues:
+            reports_with_issues.add(key)
+        if strengths:
+            reports_with_strengths.add(key)
+
+        for finding in issues:
+            finding_count += 1
+            label = _short_text(finding.get("label"), 120) or "Recorded issue"
+            bucket = issue_buckets.setdefault(label, {
+                "label": label,
+                "count": 0,
+                "report_ids": set(),
+                "evidence": [],
+                "why_it_matters": finding.get("why_it_matters"),
+                "first_order": order,
+            })
+            bucket["count"] += 1
+            if key:
+                bucket["report_ids"].add(key)
+            bucket["evidence"].append(evidence_entry(session, finding))
+            if not bucket.get("why_it_matters") and finding.get("why_it_matters"):
+                bucket["why_it_matters"] = finding.get("why_it_matters")
+
+        for finding in strengths:
+            strength_count += 1
+            label = _short_text(
+                finding.get("source_label") or finding.get("label"),
+                140,
+            ) or "Recorded strength"
+            bucket = strength_buckets.setdefault(label, {
+                "label": label,
+                "count": 0,
+                "report_ids": set(),
+                "evidence": [],
+                "first_order": order,
+            })
+            bucket["count"] += 1
+            if key:
+                bucket["report_ids"].add(key)
+            bucket["evidence"].append(evidence_entry(session, finding))
+
+    def rows_from_buckets(
+        buckets: Dict[str, Dict[str, Any]],
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        combined: List[Dict[str, Any]] = []
+        ordered = sorted(
+            buckets.values(),
+            key=lambda item: (
+                -len(item.get("report_ids") or []),
+                -int(item.get("count") or 0),
+                int(item.get("first_order") or 0),
+                str(item.get("label") or ""),
+            ),
+        )
+        for bucket in ordered[:limit] if limit else ordered:
+            evidence = bucket.get("evidence") or []
+            latest = evidence[0] if evidence else {}
+            combined.append({
+                "label": bucket.get("label"),
+                "count": int(bucket.get("count") or 0),
+                "round_count": len(bucket.get("report_ids") or []),
+                "evidence_count": len(evidence),
+                "explanation": latest.get("detail"),
+                "why_it_matters": bucket.get("why_it_matters"),
+                "latest_source_label": latest.get("source_label"),
+                "evidence": evidence,
+            })
+        return combined
+
+    issues = rows_from_buckets(issue_buckets)
+    strengths = rows_from_buckets(strength_buckets, limit=12)
+    total_reports = len(rows)
+    recurring_issue_count = sum(
+        1 for item in issues if int(item.get("round_count") or 0) >= 2
+    )
+    report_scope = f"{mode} {'report' if total_reports == 1 else 'reports'}"
+    takeaway = None
+    if issues and strengths:
+        issue_signal = (
+            "most repeated concern"
+            if int(issues[0].get("round_count") or 0) >= 2
+            else "clearest recorded concern"
+        )
+        takeaway = (
+            f"Across {total_reports} {report_scope}, {str(issues[0]['label']).lower()} "
+            f"is the {issue_signal}; the strongest recent evidence came from "
+            f"{str(strengths[0]['label']).rstrip(' .!?')}."
+        )
+    elif issues:
+        takeaway = (
+            f"Across {total_reports} {report_scope}, "
+            f"{str(issues[0]['label']).lower()} is the clearest recorded concern."
+        )
+    elif strengths:
+        takeaway = (
+            f"Across {total_reports} {report_scope}, the strongest recent evidence "
+            f"came from {str(strengths[0]['label']).rstrip(' .!?')}."
+        )
+
+    return {
+        "summary": {
+            "total_reports": total_reports,
+            "official_reports": official_reports,
+            "reports_with_findings": len(reports_with_findings),
+            "reports_with_issues": len(reports_with_issues),
+            "reports_with_strengths": len(reports_with_strengths),
+            "issue_count": finding_count,
+            "strength_count": strength_count,
+            "recurring_issue_count": recurring_issue_count,
+        },
+        "takeaway": takeaway,
+        "issues": issues,
+        "strengths": strengths,
+    }
 
 
 def _cumulative_performance_analytics(
@@ -2131,7 +2615,7 @@ def _canonical_performance_cohort(
     return latest_attempt, score_anchor, comparable
 
 
-def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100) -> Dict[str, Optional[Dict[str, Any]]]:
+def _canonical_performance_payloads(cursor: Any, user_id: str) -> Dict[str, Optional[Dict[str, Any]]]:
     cursor.execute(
         """
         SELECT analysis.analysis_id, analysis.interview_id, analysis.mode,
@@ -2149,18 +2633,27 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
         JOIN Interviews interview
           ON interview.interview_id = analysis.interview_id
          AND interview.user_id = analysis.user_id
-        WHERE analysis.user_id = %s
+        WHERE analysis.user_id = ?
           AND analysis.status = 'ready'
           AND analysis.schema_version = 'session-performance-v4'
-          AND analysis.producer_version = %s
+          AND analysis.producer_version = ?
           AND analysis.is_current = TRUE
           AND analysis.analysis_json_encrypted IS NOT NULL
           AND analysis.evidence_index_encrypted IS NOT NULL
+          AND EXISTS (
+              SELECT 1
+              FROM ReportArtifacts artifact
+              WHERE artifact.analysis_id = analysis.analysis_id
+                AND artifact.interview_id = analysis.interview_id
+                AND artifact.user_id = analysis.user_id
+                AND artifact.audience = 'candidate'
+                AND artifact.status IN ('completed', 'partial')
+                AND artifact.payload_encrypted IS NOT NULL
+          )
         ORDER BY COALESCE(interview.completed_at, interview.created_at) DESC,
                  analysis.created_at DESC
-        LIMIT %s
         """,
-        (user_id, ANALYSIS_STAGE_VERSION, min(max(int(limit or 100), 1), 200)),
+        (user_id, ANALYSIS_STAGE_VERSION),
     )
     grouped: Dict[str, List[Dict[str, Any]]] = {"interview": [], "technical": []}
     for row in cursor.fetchall() or []:
@@ -2262,7 +2755,12 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
         round_history = []
         for item in rows:
             history_item = _canonical_round_history_item(item, mode)
+            findings = _canonical_round_findings(item, mode)
             history_item["included_in_trend"] = str(item.get("analysis_id")) in comparable_ids
+            history_item["report_path"] = f"/interview/{item.get('interview_id')}/report"
+            history_item["evidence_ids"] = evidence_ids_for(item)
+            history_item.update(findings)
+            history_item["mistakes"] = findings["issues"][:5]
             round_history.append(history_item)
         round_history.sort(key=lambda item: item.get("completed_at") or "", reverse=True)
         trend = [
@@ -2539,6 +3037,15 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
             trend if mode == "technical" else [],
         )
         cumulative_analytics = _cumulative_performance_analytics(comparable, mode)
+        cumulative_analytics["report_findings"] = _combined_report_findings(rows, mode)
+        cumulative_analytics["summary"].update({
+            "total_reports": len(rows),
+            "official_reports": sum(
+                1 for item in rows
+                if item.get("evidence_status") == "sufficient"
+                and item.get("overall_score") is not None
+            ),
+        })
         if mode != "technical":
             interview_dimensions = _analysis_dimensions(latest.get("analysis") or {})
             technical_summary["latest_score"] = _performance_number(
@@ -2618,6 +3125,8 @@ def _canonical_performance_payloads(cursor: Any, user_id: str, limit: int = 100)
                 "comparable_analysis_count": len(comparable),
                 "excluded_incompatible_count": excluded_count,
             },
+            "comparison_ready": len(comparable) >= 2,
+            "improve_available": False,
             "trend": trend,
             "round_history": round_history,
             "analytics": cumulative_analytics,
@@ -2668,7 +3177,7 @@ def _performance_role_context(cursor: Any, user_id: str) -> Dict[str, Optional[s
         """
         SELECT role, company
         FROM JobProfiles
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC
         LIMIT 1
         """,
@@ -2890,8 +3399,10 @@ def _answer_status(response: Dict[str, Any]) -> str:
     technical_accuracy = response.get("technical_accuracy")
     if not text or "no_response" in flags:
         return "Unanswered"
-    if not response.get("authoritative") and response.get("evidence_status") == "insufficient_evidence":
-        return "Needs reframing"
+    if not response.get("authoritative"):
+        if response.get("evidence_status") == "insufficient_evidence":
+            return "Needs reframing"
+        return "Unable to evaluate"
     if "off_topic" in flags or (relevance is not None and relevance < 35):
         return "Avoided"
     if technical_accuracy is not None and technical_accuracy < 40:
@@ -2908,6 +3419,8 @@ def _answer_problem_type(response: Dict[str, Any]) -> Optional[str]:
     communication = response.get("communication")
     problem_solving = response.get("problem_solving")
     flags = {str(flag).lower() for flag in response.get("answer_quality_flags") or []}
+    if not str(response.get("response") or "").strip() or "no_response" in flags:
+        return None
     if "too_short" in flags:
         return "Incomplete answer"
     if "off_topic" in flags or "low_lexical_relevance" in flags:
@@ -2918,6 +3431,8 @@ def _answer_problem_type(response: Dict[str, Any]) -> Optional[str]:
         return "Missing evidence"
     if "missing_tradeoffs" in flags:
         return "Missing trade-off"
+    if not response.get("authoritative"):
+        return "Assessment unavailable"
     if technical_accuracy is not None and technical_accuracy < 50:
         return "Knowledge gap"
     if problem_solving is not None and problem_solving < 55:
@@ -3474,7 +3989,7 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         LEFT JOIN TechnicalRunEvents tre ON tre.round_id = tir.round_id
         LEFT JOIN TechnicalCodeSnapshots tcs ON tcs.round_id = tir.round_id
         LEFT JOIN TechnicalSubmissions ts ON ts.round_id = tir.round_id
-        WHERE tir.user_id = %s
+        WHERE tir.user_id = ?
           AND interview.attempt_status = 'completed'
         GROUP BY tir.round_id, tir.interview_id, tir.round_type, tir.prompt,
                  tir.metadata, tir.status, tir.created_at, tir.completed_at
@@ -3487,21 +4002,31 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         return _dynamic_payload("technical", False, [], [])
 
     round_ids = [row[0] for row in rounds]
+    round_placeholders = ",".join(["?"] * len(round_ids))
     latest_submissions: Dict[str, Dict[str, Any]] = {}
     latest_runs: Dict[str, Dict[str, Any]] = {}
     reasoning_by_round: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
     cursor.execute(
         """
-        SELECT DISTINCT ON (round_id)
-               round_id, visible_passed, visible_total, hidden_passed, hidden_total,
+        WITH ranked_submissions AS (
+            SELECT round_id, visible_passed, visible_total, hidden_passed, hidden_total,
+                   source_code, result_json, runtime_ms, memory_kb, created_at,
+                   source_code_encrypted,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY round_id
+                       ORDER BY created_at DESC, submission_id DESC
+                   ) AS submission_rank
+            FROM TechnicalSubmissions
+            WHERE user_id = ? AND round_id IN ({round_placeholders})
+        )
+        SELECT round_id, visible_passed, visible_total, hidden_passed, hidden_total,
                source_code, result_json, runtime_ms, memory_kb, created_at,
                source_code_encrypted
-        FROM TechnicalSubmissions
-        WHERE user_id = %s AND round_id = ANY(%s)
-        ORDER BY round_id, created_at DESC
-        """,
-        (user_id, round_ids),
+        FROM ranked_submissions
+        WHERE submission_rank = 1
+        """.format(round_placeholders=round_placeholders),
+        (user_id, *round_ids),
     )
     for row in cursor.fetchall():
         latest_submissions[row[0]] = {
@@ -3518,14 +4043,22 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
 
     cursor.execute(
         """
-        SELECT DISTINCT ON (round_id)
-               round_id, exit_code, error_signature, stderr, source_code,
+        WITH ranked_runs AS (
+            SELECT round_id, exit_code, error_signature, stderr, source_code,
+                   hidden_validation_result, created_at, source_code_encrypted,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY round_id
+                       ORDER BY created_at DESC, run_id DESC
+                   ) AS run_rank
+            FROM TechnicalRunEvents
+            WHERE user_id = ? AND round_id IN ({round_placeholders})
+        )
+        SELECT round_id, exit_code, error_signature, stderr, source_code,
                hidden_validation_result, created_at, source_code_encrypted
-        FROM TechnicalRunEvents
-        WHERE user_id = %s AND round_id = ANY(%s)
-        ORDER BY round_id, created_at DESC
-        """,
-        (user_id, round_ids),
+        FROM ranked_runs
+        WHERE run_rank = 1
+        """.format(round_placeholders=round_placeholders),
+        (user_id, *round_ids),
     )
     for row in cursor.fetchall():
         latest_runs[row[0]] = {
@@ -3542,10 +4075,10 @@ def _technical_performance_payload(cursor, user_id: str) -> Dict[str, Any]:
         SELECT round_id, evidence_type, content, payload,
                content_encrypted, created_at
         FROM TechnicalReasoningEvidence
-        WHERE user_id = %s AND round_id = ANY(%s)
+        WHERE user_id = ? AND round_id IN ({round_placeholders})
         ORDER BY created_at ASC
         """,
-        (user_id, round_ids),
+        (user_id, *round_ids),
     )
     for row in cursor.fetchall():
         decrypted_payload = _encrypted_json_object(row[4]) if row[4] else {}
@@ -4082,25 +4615,34 @@ def _merge_recorded_technical_analytics(
             if recorded_submission.get(key) is not None:
                 canonical_submission[key] = recorded_submission[key]
         existing_problems = list(canonical_submission.get("problems") or [])
+        def submission_problem_key(item: Dict[str, Any]) -> tuple[str, ...]:
+            round_id = str(item.get("round_id") or "").strip()
+            if round_id:
+                return ("round", round_id)
+            problem = " ".join(str(item.get("problem") or "").lower().split())
+            return ("report_problem", str(item.get("interview_id") or ""), problem)
+
         problems_by_key = {
-            (
-                item.get("interview_id"),
-                item.get("round_id"),
-                item.get("problem"),
-            ): item
+            submission_problem_key(item): item
             for item in existing_problems
             if isinstance(item, dict)
         }
         for item in recorded_submission.get("problems") or []:
             if not isinstance(item, dict):
                 continue
-            key = (item.get("interview_id"), item.get("round_id"), item.get("problem"))
+            key = submission_problem_key(item)
             if key not in problems_by_key:
                 problems_by_key[key] = item
                 continue
             existing = problems_by_key[key]
-            if not existing.get("evidence") and item.get("evidence"):
-                problems_by_key[key] = {**existing, "evidence": item["evidence"]}
+            merged_problem = dict(existing)
+            if not merged_problem.get("evidence") and item.get("evidence"):
+                merged_problem["evidence"] = item["evidence"]
+            if not merged_problem.get("run_count") and item.get("run_count"):
+                merged_problem["run_count"] = item["run_count"]
+            if not merged_problem.get("time_used_seconds") and item.get("time_used_seconds"):
+                merged_problem["time_used_seconds"] = item["time_used_seconds"]
+            problems_by_key[key] = merged_problem
         canonical_submission["problems"] = list(problems_by_key.values())
         canonical_submission["coded_not_submitted"] = max(
             int(canonical_submission.get("coded_not_submitted") or 0),
@@ -4122,7 +4664,7 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
         """
         SELECT i.interview_id,
                CASE
-                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%%technical%%'
+                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%technical%'
                         OR EXISTS (
                             SELECT 1 FROM TechnicalInterviewRounds round
                             WHERE round.interview_id = i.interview_id
@@ -4136,7 +4678,7 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
                i.job_title,
                i.duration_seconds
         FROM Interviews i
-        WHERE i.user_id = %s
+        WHERE i.user_id = ?
           AND i.attempt_status = 'completed'
           AND i.overall_score > 0
           AND (i.report_json IS NOT NULL OR i.report_json_encrypted IS NOT NULL)
@@ -4150,6 +4692,16 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
                 AND analysis.is_current = TRUE
                 AND analysis.analysis_json_encrypted IS NOT NULL
                 AND analysis.evidence_index_encrypted IS NOT NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM ReportArtifacts artifact
+                    WHERE artifact.analysis_id = analysis.analysis_id
+                      AND artifact.interview_id = analysis.interview_id
+                      AND artifact.user_id = analysis.user_id
+                      AND artifact.audience = 'candidate'
+                      AND artifact.status IN ('completed', 'partial')
+                      AND artifact.payload_encrypted IS NOT NULL
+                )
           )
         ORDER BY COALESCE(i.completed_at, i.created_at) DESC
         LIMIT 100
@@ -4185,9 +4737,17 @@ def _legacy_performance_history(cursor: Any, user_id: str) -> List[Dict[str, Any
 def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
     cursor.execute(
         """
+        WITH latest_jobs AS (
+            SELECT status, retry_count, interview_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY interview_id
+                       ORDER BY created_at DESC, job_id DESC
+                   ) AS row_number
+            FROM AnalysisJobs
+        )
         SELECT i.interview_id,
                CASE
-                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%%technical%%'
+                   WHEN LOWER(COALESCE(i.interview_type, '')) LIKE '%technical%'
                         OR EXISTS (
                             SELECT 1 FROM TechnicalInterviewRounds round
                             WHERE round.interview_id = i.interview_id
@@ -4226,27 +4786,29 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
                    WHERE response.interview_id = i.interview_id
                ) AS response_present
         FROM Interviews i
-        LEFT JOIN LATERAL (
-            SELECT analysis_id, overall_score, evidence_status
-            FROM SessionPerformanceAnalyses current_analysis
-            WHERE current_analysis.interview_id = i.interview_id
-              AND current_analysis.user_id = i.user_id
-              AND current_analysis.schema_version = 'session-performance-v4'
-              AND current_analysis.producer_version = %s
-              AND current_analysis.is_current = TRUE
-              AND current_analysis.status = 'ready'
-              AND current_analysis.analysis_json_encrypted IS NOT NULL
-              AND current_analysis.evidence_index_encrypted IS NOT NULL
-            LIMIT 1
-        ) analysis ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT status, retry_count
-            FROM AnalysisJobs latest_job
-            WHERE latest_job.interview_id = i.interview_id
-            ORDER BY latest_job.created_at DESC
-            LIMIT 1
-        ) job ON TRUE
-        WHERE i.user_id = %s
+        LEFT JOIN SessionPerformanceAnalyses analysis
+          ON analysis.interview_id = i.interview_id
+         AND analysis.user_id = i.user_id
+         AND analysis.schema_version = 'session-performance-v4'
+         AND analysis.producer_version = ?
+         AND analysis.is_current = TRUE
+         AND analysis.status = 'ready'
+         AND analysis.analysis_json_encrypted IS NOT NULL
+         AND analysis.evidence_index_encrypted IS NOT NULL
+         AND EXISTS (
+                  SELECT 1
+                  FROM ReportArtifacts artifact
+                  WHERE artifact.analysis_id = analysis.analysis_id
+                    AND artifact.interview_id = analysis.interview_id
+                    AND artifact.user_id = analysis.user_id
+                    AND artifact.audience = 'candidate'
+                    AND artifact.status IN ('completed', 'partial')
+                    AND artifact.payload_encrypted IS NOT NULL
+              )
+        LEFT JOIN latest_jobs job
+          ON job.interview_id = i.interview_id
+         AND job.row_number = 1
+        WHERE i.user_id = ?
           AND i.attempt_status = 'completed'
           AND i.status IN (
               'analysis_pending', 'analysis_running',
@@ -4262,7 +4824,7 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
         SELECT EXISTS (
             SELECT 1 FROM WorkerHeartbeats
             WHERE worker_type = 'analysis'
-              AND heartbeat_at >= NOW() - INTERVAL '30 seconds'
+              AND heartbeat_at >= datetime(CURRENT_TIMESTAMP, '-30 seconds')
         )
         """
     )
@@ -4336,7 +4898,7 @@ def _performance_availability(cursor: Any, user_id: str) -> Dict[str, Any]:
             1 for item in sessions if item["score_state"] == "failed"
         ),
         "worker_available": worker_available,
-        "processing_sla_minutes": 15,
+        "processing_sla_minutes": 60,
         "by_mode": by_mode,
         "sessions": sessions,
     }
@@ -4855,7 +5417,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         SELECT skill_key, skill_category, mastery_score, confidence_score,
                evidence_count, last_evidence_at, next_review_at
         FROM LearnerSkillStates
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY mastery_score ASC, next_review_at ASC NULLS FIRST
         LIMIT 12
         """,
@@ -4883,7 +5445,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
                root_cause_hypothesis, root_cause_confidence,
                evidence_summary, last_observed_at
         FROM WeaknessStates
-        WHERE user_id = %s AND lifecycle_state <> 'resolved'
+        WHERE user_id = ? AND lifecycle_state <> 'resolved'
         ORDER BY
             CASE lifecycle_state
                 WHEN 'worsening' THEN 0 WHEN 'repeated' THEN 1
@@ -4918,7 +5480,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         SELECT cluster_id, round_id, mistake_type, mistake_key, examples,
                occurrence_count, last_seen_at
         FROM TechnicalMistakeClusters
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY occurrence_count DESC, last_seen_at DESC
         LIMIT 8
         """,
@@ -4942,7 +5504,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         SELECT gap_id, project_key, gap_key, gap_summary, evidence,
                status, next_check_at, updated_at
         FROM ProjectKnowledgeGaps
-        WHERE user_id = %s AND status = 'open'
+        WHERE user_id = ? AND status = 'open'
         ORDER BY next_check_at ASC NULLS FIRST, updated_at DESC
         LIMIT 8
         """,
@@ -4962,6 +5524,22 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         for row in cursor.fetchall() or []
     ]
 
+    # Improve is a coaching projection of one sufficient canonical report.
+    # Comparison readiness remains a separate two-round Performance state.
+    performance_ready_count = _performance_ready_count(cursor, user_id)
+    performance_ready = performance_ready_count >= 1
+    comparison_ready = performance_ready_count >= 2
+    if not performance_ready:
+        # Do not surface stale missions, practice history, or generated
+        # exercises from before the canonical Performance projection existed.
+        # They remain persisted for auditability, but Improve is intentionally
+        # unavailable until Performance has at least one sufficient,
+        # authoritative current row in one mode.
+        skill_gaps = []
+        weakness_states = []
+        technical_mistakes = []
+        project_homework = []
+
     cursor.execute(
         """
         SELECT exercise_id, interview_id, skill_key, exercise_type, prompt,
@@ -4969,7 +5547,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
                mission_id, mission_skill_id, roadmap_node_id, activity_type,
                variation_group, is_checkpoint, activity_metadata
         FROM GeneratedExercises
-        WHERE user_id = %s
+        WHERE user_id = ?
           AND status IN ('queued', 'in_progress')
           AND mission_id IS NOT NULL
           AND EXISTS (
@@ -4983,20 +5561,30 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         """,
         (user_id,),
     )
-    exercise_queue = [_exercise_from_row(row) for row in cursor.fetchall() or []]
-    active_missions = {
-        "interview": _active_mission_payload(cursor, user_id, mode="mock"),
-        "technical": _active_mission_payload(cursor, user_id, mode="technical"),
-    }
-    active_mission = active_missions["interview"] or active_missions["technical"]
-    improvement_history = _improvement_history_payload(cursor, user_id)
+    exercise_queue = [_exercise_from_row(row) for row in cursor.fetchall() or []] if performance_ready else []
+    if performance_ready:
+        active_missions = {
+            "interview": _active_mission_payload(cursor, user_id, mode="mock"),
+            "technical": _active_mission_payload(cursor, user_id, mode="technical"),
+        }
+        active_mission = active_missions["interview"] or active_missions["technical"]
+        improvement_history = _improvement_history_payload(cursor, user_id)
+    else:
+        active_missions = {"interview": None, "technical": None}
+        active_mission = None
+        improvement_history = {
+            "skills": [],
+            "completed_missions": [],
+            "recent_attempts": [],
+            "has_history": False,
+        }
 
     cursor.execute(
         """
-        SELECT event_type, severity, COUNT(*), MAX(created_at)
-        FROM MalpracticeEvents
-        WHERE user_id = %s
-        GROUP BY event_type, severity
+        SELECT event_type, COUNT(*), MAX(created_at)
+        FROM SessionReviewEvents
+        WHERE user_id = ?
+        GROUP BY event_type
         ORDER BY MAX(created_at) DESC
         LIMIT 8
         """,
@@ -5005,18 +5593,19 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
     integrity_events = [
         {
             "event_type": row[0],
-            "severity": row[1],
-            "count": int(row[2] or 0),
-            "last_seen_at": row[3].isoformat() if row[3] else None,
+            "severity": "info",
+            "count": int(row[1] or 0),
+            "last_seen_at": row[2].isoformat() if row[2] else None,
         }
         for row in cursor.fetchall() or []
     ]
-    severe_count = sum(item["count"] for item in integrity_events if item["severity"] == "severe")
-    warning_count = sum(item["count"] for item in integrity_events if item["severity"] != "severe")
+    signal_count = sum(item["count"] for item in integrity_events)
     integrity_status = {
-        "status": "flagged" if severe_count else "watched" if warning_count else "clean",
-        "severe_count": severe_count,
-        "warning_count": warning_count,
+        "status": "self_review",
+        "mode": "self_review",
+        "severe_count": 0,
+        "warning_count": 0,
+        "signal_count": signal_count,
         "events": integrity_events,
     }
 
@@ -5078,7 +5667,7 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
                   )
             )
         FROM Interviews i
-        WHERE i.user_id = %s
+        WHERE i.user_id = ?
           AND i.status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
           AND (
               i.attempt_status = 'completed'
@@ -5140,16 +5729,23 @@ def build_readonly_learning_snapshot(cursor: Any, user_id: str) -> Dict[str, Any
         "roadmap": roadmap,
         "improvement_history": improvement_history,
         "integrity_status": integrity_status,
+        "performance_ready": performance_ready,
+        "comparison_ready": comparison_ready,
+        "improve_available": bool(active_mission or exercise_queue),
         "analysis_availability": {
             "completed_count": int(analysis_row[0] or 0),
             "missing_canonical_count": int(analysis_row[1] or 0),
+            "performance_ready": performance_ready,
+            "performance_ready_count": performance_ready_count,
+            "comparison_ready": comparison_ready,
+            "improve_available": bool(active_mission or exercise_queue),
         },
     }
 
 
 @router.get("/learning")
 async def get_learning_dashboard(
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5161,7 +5757,7 @@ async def get_learning_dashboard(
 
 
 @router.get("/exercises")
-async def get_generated_exercises(current_user: Dict = Depends(get_current_user)):
+async def get_generated_exercises(current_user: Dict = Depends(local_user)):
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
@@ -5193,8 +5789,9 @@ async def create_exercise_attempt_session(
     exercise_id: str,
     request: ExerciseAttemptSessionCreate,
     idempotency_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
+    await _require_performance_ready(current_user["user_id"])
     if idempotency_header != request.idempotency_key:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5206,12 +5803,12 @@ async def create_exercise_attempt_session(
         FROM GeneratedExercises ge
         JOIN ImprovementMissions mission ON mission.mission_id = ge.mission_id
         JOIN ImprovementRoadmapNodes node ON node.roadmap_node_id = ge.roadmap_node_id
-        WHERE ge.exercise_id = %s
-          AND ge.user_id = %s
-          AND ge.mission_id = %s
-          AND ge.roadmap_node_id = %s
-          AND mission.user_id = %s
-          AND node.user_id = %s
+        WHERE ge.exercise_id = ?
+          AND ge.user_id = ?
+          AND ge.mission_id = ?
+          AND ge.roadmap_node_id = ?
+          AND mission.user_id = ?
+          AND node.user_id = ?
           AND mission.status = 'active'
           AND node.availability_status = 'current'
           AND node.result_status NOT IN ('passed', 'strong_pass')
@@ -5237,10 +5834,10 @@ async def create_exercise_attempt_session(
                deadline_at, remaining_seconds, updated_at, expires_at,
                mission_id, roadmap_node_id, exercise_id
         FROM ImprovementAttemptSessions
-        WHERE user_id = %s AND mission_id = %s AND roadmap_node_id = %s
-          AND exercise_id = %s
+        WHERE user_id = ? AND mission_id = ? AND roadmap_node_id = ?
+          AND exercise_id = ?
           AND status IN ('draft', 'in_progress', 'save_failed')
-          AND (expires_at IS NULL OR expires_at > NOW())
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
         ORDER BY updated_at DESC
         LIMIT 1
         """,
@@ -5261,7 +5858,7 @@ async def create_exercise_attempt_session(
             status, draft_payload, draft_payload_encrypted, idempotency_key, expires_at
         )
         VALUES (
-            %s, %s, %s, %s, %s, 'in_progress', %s, %s, %s, NOW() + INTERVAL '24 hours'
+            ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, datetime(CURRENT_TIMESTAMP, '+24 hours')
         )
         ON CONFLICT (user_id, exercise_id, idempotency_key)
         DO UPDATE SET
@@ -5286,10 +5883,10 @@ async def create_exercise_attempt_session(
     logger.info(
         "improve_attempt_session_started",
         extra={
-            "user_id": current_user["user_id"],
-            "exercise_id": exercise_id,
-            "mission_id": request.mission_id,
-            "roadmap_node_id": request.roadmap_node_id,
+            "user_ref": stable_hash(current_user["user_id"], "user"),
+            "exercise_ref": stable_hash(exercise_id, "exercise"),
+            "mission_ref": stable_hash(request.mission_id, "mission"),
+            "roadmap_node_ref": stable_hash(request.roadmap_node_id, "roadmap-node"),
         },
     )
     return _attempt_session_response(row)
@@ -5301,8 +5898,9 @@ async def update_exercise_attempt_session(
     attempt_session_id: str,
     request: ExerciseAttemptSessionUpdate,
     idempotency_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
+    await _require_performance_ready(current_user["user_id"])
     if idempotency_header != request.idempotency_key:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5313,20 +5911,20 @@ async def update_exercise_attempt_session(
     row = await async_execute(
         """
         UPDATE ImprovementAttemptSessions
-        SET status = COALESCE(%s, status),
-            draft_payload = COALESCE(%s::jsonb, draft_payload),
-            draft_payload_encrypted = COALESCE(%s, draft_payload_encrypted),
+        SET status = COALESCE(?, status),
+            draft_payload = COALESCE(?, draft_payload),
+            draft_payload_encrypted = COALESCE(?, draft_payload_encrypted),
             remaining_seconds = NULL,
             deadline_at = NULL,
-            updated_at = NOW()
-        WHERE attempt_session_id = %s
-          AND exercise_id = %s
-          AND user_id = %s
-          AND mission_id = %s
-          AND roadmap_node_id = %s
-          AND idempotency_key = %s
+            updated_at = CURRENT_TIMESTAMP
+        WHERE attempt_session_id = ?
+          AND exercise_id = ?
+          AND user_id = ?
+          AND mission_id = ?
+          AND roadmap_node_id = ?
+          AND idempotency_key = ?
           AND status IN ('draft', 'in_progress', 'save_failed')
-          AND (expires_at IS NULL OR expires_at > NOW())
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
         RETURNING attempt_session_id, status, draft_payload_encrypted, draft_payload,
                   idempotency_key,
                   deadline_at, remaining_seconds, updated_at, expires_at,
@@ -5349,7 +5947,12 @@ async def update_exercise_attempt_session(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Attempt session is unavailable or expired")
     logger.info(
         "improve_attempt_session_updated",
-        extra={"user_id": current_user["user_id"], "exercise_id": exercise_id, "attempt_session_id": attempt_session_id, "status": row[1]},
+        extra={
+            "user_ref": stable_hash(current_user["user_id"], "user"),
+            "exercise_ref": stable_hash(exercise_id, "exercise"),
+            "attempt_session_ref": stable_hash(attempt_session_id, "attempt-session"),
+            "status": row[1],
+        },
     )
     return _attempt_session_response(row)
 
@@ -5359,8 +5962,9 @@ async def create_exercise_attempt(
     exercise_id: str,
     request: ExerciseAttemptCreate,
     idempotency_header: Optional[str] = Header(default=None, alias="Idempotency-Key"),
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
+    await _require_performance_ready(current_user["user_id"])
     if idempotency_header and idempotency_header != request.idempotency_key:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5405,45 +6009,26 @@ async def create_exercise_attempt(
 async def run_exercise_code(
     exercise_id: str,
     request: ExerciseRunRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     exercise = await async_execute(
         """
         SELECT exercise_id, exercise_type, prompt
         FROM GeneratedExercises
-        WHERE exercise_id = %s AND user_id = %s
+        WHERE exercise_id = ? AND user_id = ?
         """,
         (exercise_id, current_user["user_id"]),
         fetchone=True,
     )
     if not exercise:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exercise not found")
+    await _require_performance_ready(current_user["user_id"])
 
-    started = time.time()
-    runtime = await _resolve_piston_runtime(request.language)
-    payload = {
-        "language": runtime["language"],
-        "version": runtime["version"],
-        "files": [{"name": EXERCISE_FILE_NAMES[request.language], "content": request.code}],
-        "stdin": request.stdin or "",
-    }
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.PISTON_TIMEOUT_SECONDS)) as session:
-            headers = {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"} if settings.PISTON_API_TOKEN else {}
-            async with session.post(settings.PISTON_API_URL.rstrip("/") + "/execute", json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    raise HTTPException(status_code=502, detail="Code execution service failed")
-                result = await response.json()
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=502, detail="Code execution service unavailable")
-
-    run = result.get("run") or {}
-    stdout = run.get("stdout") or ""
-    stderr = run.get("stderr") or ""
-    exit_code = run.get("code")
-    runtime_ms = int((time.time() - started) * 1000)
+    result = await execute_local(request.language, request.code, request.stdin or "")
+    stdout = result.get("stdout") or ""
+    stderr = result.get("stderr") or ""
+    exit_code = result.get("exit_code")
+    runtime_ms = result.get("runtime_ms") or 0
     return {
         "exercise_id": exercise_id,
         "language": request.language,
@@ -5462,12 +6047,10 @@ def _job_profile_from_row(row: Any) -> Dict[str, Any]:
             tech_stack = json.loads(tech_stack)
         except Exception:
             tech_stack = []
-    normalized_requirements = row[8] if len(row) > 8 else {}
-    if isinstance(normalized_requirements, str):
-        try:
-            normalized_requirements = json.loads(normalized_requirements)
-        except Exception:
-            normalized_requirements = {}
+    normalized_requirements = _decrypt_job_requirements(
+        row[9] if len(row) > 9 else None,
+        row[8] if len(row) > 8 else None,
+    )
     return {
         "profile_id": row[0],
         "role": row[1],
@@ -5476,12 +6059,12 @@ def _job_profile_from_row(row: Any) -> Dict[str, Any]:
         "job_description": _decrypt_job_description(row[6]) if len(row) > 6 else None,
         "job_description_hash": row[7] if len(row) > 7 else None,
         "normalized_requirements": normalized_requirements if isinstance(normalized_requirements, dict) else {},
-        "normalization_version": row[9] if len(row) > 9 else None,
-        "experience_level": row[10] if len(row) > 10 else None,
-        "parser_version": row[11] if len(row) > 11 else None,
+        "normalization_version": row[10] if len(row) > 10 else None,
+        "experience_level": row[11] if len(row) > 11 else None,
+        "parser_version": row[12] if len(row) > 12 else None,
         "is_selected": bool(row[4]),
         "created_at": row[5],
-        "updated_at": row[12] if len(row) > 12 else None,
+        "updated_at": row[13] if len(row) > 13 else None,
     }
 
 
@@ -5501,7 +6084,7 @@ def _profile_options() -> List[Dict[str, Any]]:
 
 @router.get("/interview-profile", response_model=InterviewProfileResponse)
 async def get_interview_profile(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5509,9 +6092,9 @@ async def get_interview_profile(
     try:
         cursor.execute(
             """
-            SELECT COALESCE(interview_profile_type, %s)
+            SELECT COALESCE(interview_profile_type, ?)
             FROM UserInfo
-            WHERE user_id = %s
+            WHERE user_id = ?
             """,
             (DEFAULT_PROFILE_TYPE, current_user["user_id"])
         )
@@ -5530,7 +6113,7 @@ async def get_interview_profile(
 @router.put("/interview-profile", response_model=InterviewProfileResponse)
 async def update_interview_profile(
     request: InterviewProfileRequest,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5540,8 +6123,8 @@ async def update_interview_profile(
         cursor.execute(
             """
             UPDATE UserInfo
-            SET interview_profile_type = %s, updated_at = NOW()
-            WHERE user_id = %s
+            SET interview_profile_type = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
             RETURNING interview_profile_type
             """,
             (profile_type, current_user["user_id"])
@@ -5575,7 +6158,7 @@ async def update_interview_profile(
 
 @router.get("/job-profiles", response_model=List[JobProfileResponse])
 async def get_job_profiles(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5583,7 +6166,7 @@ async def get_job_profiles(
     try:
         cursor.execute(
             JOB_PROFILE_SELECT
-            + " WHERE user_id = %s ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC",
+            + " WHERE user_id = ? ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC",
             (current_user["user_id"],)
         )
         return [_job_profile_from_row(row) for row in cursor.fetchall()]
@@ -5596,7 +6179,7 @@ async def get_job_profiles(
 @router.post("/job-profiles", response_model=JobProfileResponse)
 async def create_job_profile(
     request: JobProfileCreate,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5605,20 +6188,20 @@ async def create_job_profile(
         if not request.role:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Job role is required")
         cursor.execute(
-            "SELECT 1 FROM UserInfo WHERE user_id = %s FOR UPDATE",
+            "SELECT 1 FROM UserInfo WHERE user_id = ?",
             (current_user["user_id"],),
         )
         if not cursor.fetchone():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
         cursor.execute(
-            "SELECT COUNT(*) FROM JobProfiles WHERE user_id = %s",
+            "SELECT COUNT(*) FROM JobProfiles WHERE user_id = ?",
             (current_user["user_id"],)
         )
         is_first = (cursor.fetchone()[0] or 0) == 0
 
         if is_first:
             cursor.execute(
-                "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s",
+                "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = ?",
                 (current_user["user_id"],)
             )
 
@@ -5628,10 +6211,10 @@ async def create_job_profile(
             """
             SELECT profile_id
             FROM JobProfiles reusable_profile
-            WHERE reusable_profile.user_id = %s
-              AND LOWER(BTRIM(reusable_profile.role)) = LOWER(BTRIM(%s))
-              AND LOWER(BTRIM(COALESCE(reusable_profile.company, ''))) = LOWER(BTRIM(%s))
-              AND reusable_profile.job_description_hash IS NOT DISTINCT FROM %s
+            WHERE reusable_profile.user_id = ?
+              AND LOWER(trim(reusable_profile.role)) = LOWER(trim(?))
+              AND LOWER(trim(COALESCE(reusable_profile.company, ''))) = LOWER(trim(?))
+              AND reusable_profile.job_description_hash IS ?
             ORDER BY reusable_profile.updated_at DESC NULLS LAST, reusable_profile.created_at DESC
             LIMIT 1
             """,
@@ -5645,7 +6228,7 @@ async def create_job_profile(
         reusable = cursor.fetchone()
         if reusable:
             cursor.execute(
-                JOB_PROFILE_SELECT + " WHERE profile_id = %s AND user_id = %s",
+                JOB_PROFILE_SELECT + " WHERE profile_id = ? AND user_id = ?",
                 (reusable[0], current_user["user_id"]),
             )
             existing = cursor.fetchone()
@@ -5661,10 +6244,10 @@ async def create_job_profile(
             INSERT INTO JobProfiles (
                 user_id, role, company, tech_stack, is_selected,
                 job_description_encrypted, job_description_hash,
-                normalized_requirements, normalization_version,
+                normalized_requirements, normalized_requirements_encrypted, normalization_version,
                 experience_level, parser_version, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """
             + JOB_PROFILE_RETURNING,
             (
@@ -5675,7 +6258,8 @@ async def create_job_profile(
                 is_first,
                 _encrypt_job_description(job_description),
                 description_hash,
-                json.dumps(normalized_requirements),
+                '{"encrypted":true}',
+                _encrypt_job_requirements(normalized_requirements),
                 JOB_REQUIREMENT_NORMALIZATION_VERSION,
                 request.experience_level,
                 JOB_PROFILE_PARSER_VERSION,
@@ -5705,14 +6289,14 @@ async def create_job_profile(
 async def update_job_profile(
     profile_id: int,
     request: JobProfileUpdate,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
         cursor.execute(
             JOB_PROFILE_SELECT
-            + " WHERE profile_id = %s AND user_id = %s FOR UPDATE",
+            + " WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"]),
         )
         row = cursor.fetchone()
@@ -5749,17 +6333,18 @@ async def update_job_profile(
         cursor.execute(
             """
             UPDATE JobProfiles
-            SET role = %s,
-                company = %s,
-                tech_stack = %s,
-                job_description_encrypted = %s,
-                job_description_hash = %s,
-                normalized_requirements = %s,
-                normalization_version = %s,
-                experience_level = %s,
-                parser_version = %s,
-                updated_at = NOW()
-            WHERE profile_id = %s AND user_id = %s
+            SET role = ?,
+                company = ?,
+                tech_stack = ?,
+                job_description_encrypted = ?,
+                job_description_hash = ?,
+                normalized_requirements = ?,
+                normalized_requirements_encrypted = ?,
+                normalization_version = ?,
+                experience_level = ?,
+                parser_version = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE profile_id = ? AND user_id = ?
             """
             + JOB_PROFILE_RETURNING,
             (
@@ -5768,7 +6353,8 @@ async def update_job_profile(
                 json.dumps(tech_stack or []),
                 _encrypt_job_description(job_description),
                 description_hash,
-                json.dumps(normalized_requirements),
+                '{"encrypted":true}',
+                _encrypt_job_requirements(normalized_requirements),
                 JOB_REQUIREMENT_NORMALIZATION_VERSION,
                 experience_level,
                 JOB_PROFILE_PARSER_VERSION,
@@ -5794,13 +6380,13 @@ async def update_job_profile(
 @router.delete("/job-profiles/{profile_id}")
 async def delete_job_profile(
     profile_id: int,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
         cursor.execute(
-            "SELECT 1 FROM JobProfiles WHERE profile_id = %s AND user_id = %s FOR UPDATE",
+            "SELECT 1 FROM JobProfiles WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"]),
         )
         if not cursor.fetchone():
@@ -5809,22 +6395,22 @@ async def delete_job_profile(
             """
             UPDATE InterviewBlueprints
             SET status = CASE WHEN status = 'ready' THEN 'expired' ELSE status END
-            WHERE user_id = %s AND job_profile_id = %s
+            WHERE user_id = ? AND job_profile_id = ?
             """,
             (current_user["user_id"], profile_id),
         )
         cursor.execute(
-            "DELETE FROM JobProfiles WHERE profile_id = %s AND user_id = %s",
+            "DELETE FROM JobProfiles WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"]),
         )
         cursor.execute(
             """
             UPDATE JobProfiles
-            SET is_selected = TRUE, updated_at = NOW()
+            SET is_selected = TRUE, updated_at = CURRENT_TIMESTAMP
             WHERE profile_id = (
                 SELECT profile_id
                 FROM JobProfiles
-                WHERE user_id = %s
+                WHERE user_id = ?
                 ORDER BY is_selected DESC, updated_at DESC NULLS LAST, created_at DESC
                 LIMIT 1
             )
@@ -5848,18 +6434,18 @@ async def delete_job_profile(
 @router.post("/job-profiles/{profile_id}/select", response_model=JobProfileResponse)
 async def select_job_profile(
     profile_id: int,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
 
     try:
         cursor.execute(
-            "SELECT 1 FROM UserInfo WHERE user_id = %s FOR UPDATE",
+            "SELECT 1 FROM UserInfo WHERE user_id = ?",
             (current_user["user_id"],),
         )
         cursor.execute(
-            "SELECT 1 FROM JobProfiles WHERE profile_id = %s AND user_id = %s",
+            "SELECT 1 FROM JobProfiles WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"])
         )
         if not cursor.fetchone():
@@ -5869,19 +6455,19 @@ async def select_job_profile(
             )
 
         cursor.execute(
-            "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s",
+            "UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = ?",
             (current_user["user_id"],)
         )
         cursor.execute(
             """
             UPDATE JobProfiles
-            SET is_selected = TRUE, updated_at = NOW()
-            WHERE profile_id = %s AND user_id = %s
+            SET is_selected = TRUE, updated_at = CURRENT_TIMESTAMP
+            WHERE profile_id = ? AND user_id = ?
             """,
             (profile_id, current_user["user_id"])
         )
         cursor.execute(
-            JOB_PROFILE_SELECT + " WHERE profile_id = %s AND user_id = %s",
+            JOB_PROFILE_SELECT + " WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"]),
         )
         row = cursor.fetchone()
@@ -5952,7 +6538,7 @@ def _historical_job_target(
 @router.post("/interviews/{interview_id}/copy-profile")
 async def copy_interview_profile(
     interview_id: str,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -5964,8 +6550,7 @@ async def copy_interview_profile(
             FROM Interviews i
             LEFT JOIN AttemptContextSnapshots snapshot
               ON snapshot.interview_id = i.interview_id AND snapshot.user_id = i.user_id
-            WHERE i.interview_id = %s AND i.user_id = %s
-            FOR UPDATE OF i
+            WHERE i.interview_id = ? AND i.user_id = ?
             """,
             (interview_id, current_user["user_id"]),
         )
@@ -5988,10 +6573,10 @@ async def copy_interview_profile(
             """
             SELECT profile_id
             FROM JobProfiles
-            WHERE user_id = %s
-              AND LOWER(BTRIM(role)) = LOWER(BTRIM(%s))
-              AND LOWER(BTRIM(COALESCE(company, ''))) = LOWER(BTRIM(%s))
-              AND job_description_hash IS NOT DISTINCT FROM %s
+            WHERE user_id = ?
+              AND LOWER(trim(role)) = LOWER(trim(?))
+              AND LOWER(trim(COALESCE(company, ''))) = LOWER(trim(?))
+              AND job_description_hash IS ?
             ORDER BY updated_at DESC NULLS LAST, created_at DESC
             LIMIT 1
             """,
@@ -6004,11 +6589,11 @@ async def copy_interview_profile(
         )
         existing = cursor.fetchone()
         created = False
-        cursor.execute("UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = %s", (current_user["user_id"],))
+        cursor.execute("UPDATE JobProfiles SET is_selected = FALSE WHERE user_id = ?", (current_user["user_id"],))
         if existing:
             profile_id = int(existing[0])
             cursor.execute(
-                "UPDATE JobProfiles SET is_selected = TRUE, updated_at = NOW() WHERE profile_id = %s AND user_id = %s",
+                "UPDATE JobProfiles SET is_selected = TRUE, updated_at = CURRENT_TIMESTAMP WHERE profile_id = ? AND user_id = ?",
                 (profile_id, current_user["user_id"]),
             )
         else:
@@ -6019,10 +6604,10 @@ async def copy_interview_profile(
                 INSERT INTO JobProfiles (
                     user_id, role, company, tech_stack, is_selected,
                     job_description_encrypted, job_description_hash,
-                    normalized_requirements, normalization_version,
+                    normalized_requirements, normalized_requirements_encrypted, normalization_version,
                     experience_level, parser_version, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, '[]', TRUE, %s, %s, %s, %s, NULL, %s, NOW(), NOW())
+                VALUES (?, ?, ?, '[]', TRUE, ?, ?, ?, ?, ?, NULL, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 RETURNING profile_id
                 """,
                 (
@@ -6031,7 +6616,8 @@ async def copy_interview_profile(
                     target["company"],
                     _encrypt_job_description(target["job_description"]),
                     target["job_description_hash"],
-                    json.dumps(normalized_requirements),
+                    '{"encrypted":true}',
+                    _encrypt_job_requirements(normalized_requirements),
                     JOB_REQUIREMENT_NORMALIZATION_VERSION,
                     JOB_PROFILE_PARSER_VERSION,
                 ),
@@ -6039,7 +6625,7 @@ async def copy_interview_profile(
             profile_id = int(cursor.fetchone()[0])
 
         cursor.execute(
-            JOB_PROFILE_SELECT + " WHERE profile_id = %s AND user_id = %s",
+            JOB_PROFILE_SELECT + " WHERE profile_id = ? AND user_id = ?",
             (profile_id, current_user["user_id"]),
         )
         profile = _job_profile_from_row(cursor.fetchone())
@@ -6059,7 +6645,7 @@ async def copy_interview_profile(
 
 @router.get("/jobs", response_model=List[JobResponse])
 async def get_all_jobs(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -6099,7 +6685,7 @@ async def get_all_jobs(
 @router.get("/jobs/{job_id}", response_model=JobResponse)
 async def get_job_details(
     job_id: int,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -6110,7 +6696,7 @@ async def get_job_details(
             SELECT job_id, title, description, company, location,
                    salary_range, experience_level, created_at
             FROM Jobs
-            WHERE job_id = %s
+            WHERE job_id = ?
             """,
             (job_id,)
         )
@@ -6142,14 +6728,14 @@ async def get_job_details(
 @router.post("/select-job/{job_id}")
 async def select_job(
     job_id: int,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
 
     try:
         cursor.execute(
-            "SELECT job_id FROM Jobs WHERE job_id = %s",
+            "SELECT job_id FROM Jobs WHERE job_id = ?",
             (job_id,)
         )
 
@@ -6160,7 +6746,7 @@ async def select_job(
             )
 
         cursor.execute(
-            "UPDATE UserInfo SET job_id = %s WHERE user_id = %s",
+            "UPDATE UserInfo SET job_id = ? WHERE user_id = ?",
             (job_id, current_user["user_id"])
         )
 
@@ -6191,7 +6777,7 @@ async def select_job(
 
 @router.get("/recent-activity")
 async def get_recent_activity(
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
     days: int = 30
 ):
     connection = get_db_connection()
@@ -6242,20 +6828,62 @@ async def get_recent_activity(
                          AND analysis.user_id = i.user_id
                          AND analysis.status = 'ready'
                          AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.producer_version = ?
                          AND analysis.is_current = TRUE
                          AND analysis.analysis_json_encrypted IS NOT NULL
                          AND analysis.evidence_index_encrypted IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1
+                             FROM ReportArtifacts artifact
+                             WHERE artifact.analysis_id = analysis.analysis_id
+                               AND artifact.interview_id = analysis.interview_id
+                               AND artifact.user_id = analysis.user_id
+                               AND artifact.audience = 'candidate'
+                               AND artifact.status IN ('completed', 'partial')
+                               AND artifact.payload_encrypted IS NOT NULL
+                         )
                    ) AS canonical_report_ready,
+                   (
+                       SELECT analysis.overall_score
+                       FROM SessionPerformanceAnalyses analysis
+                       WHERE analysis.interview_id = i.interview_id
+                         AND analysis.user_id = i.user_id
+                         AND analysis.status = 'ready'
+                         AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.producer_version = ?
+                         AND analysis.is_current = TRUE
+                         AND analysis.evidence_status = 'sufficient'
+                         AND analysis.overall_score IS NOT NULL
+                         AND analysis.analysis_json_encrypted IS NOT NULL
+                         AND analysis.evidence_index_encrypted IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1
+                             FROM ReportArtifacts artifact
+                             WHERE artifact.analysis_id = analysis.analysis_id
+                               AND artifact.interview_id = analysis.interview_id
+                               AND artifact.user_id = analysis.user_id
+                               AND artifact.audience = 'candidate'
+                               AND artifact.status IN ('completed', 'partial')
+                               AND artifact.payload_encrypted IS NOT NULL
+                         )
+                       ORDER BY analysis.created_at DESC
+                       LIMIT 1
+                   ) AS official_score,
                    i.job_profile_id, i.settings,
                    snapshot.profile_type, snapshot.job_context_encrypted
             FROM Interviews i
             LEFT JOIN AttemptContextSnapshots snapshot
               ON snapshot.interview_id = i.interview_id AND snapshot.user_id = i.user_id
-            WHERE i.user_id = %s AND i.created_at >= %s
+            WHERE i.user_id = ? AND i.created_at >= ?
             {_non_technical_interview_where("i")}
             ORDER BY i.created_at DESC
             """,
-            (current_user["user_id"], start_date)
+            (
+                ANALYSIS_STAGE_VERSION,
+                ANALYSIS_STAGE_VERSION,
+                current_user["user_id"],
+                start_date,
+            )
         )
 
         rows = cursor.fetchall()
@@ -6263,7 +6891,7 @@ async def get_recent_activity(
             """
             SELECT profile_id, role, company, job_description_hash
             FROM JobProfiles
-            WHERE user_id = %s
+            WHERE user_id = ?
             """,
             (current_user["user_id"],),
         )
@@ -6281,13 +6909,13 @@ async def get_recent_activity(
 
         for row in rows:
             job_target = _historical_job_target(
-                settings_value=row[12],
-                linked_job_profile_id=row[11],
-                snapshot_profile_type=row[13],
-                snapshot_job_value=row[14],
+                settings_value=row[13],
+                linked_job_profile_id=row[12],
+                snapshot_profile_type=row[14],
+                snapshot_job_value=row[15],
                 fallback_title=row[2],
             )
-            saved_profile_id = saved_by_id.get(int(row[11])) if row[11] is not None else None
+            saved_profile_id = saved_by_id.get(int(row[12])) if row[12] is not None else None
             if saved_profile_id is None:
                 saved_profile_id = saved_by_content.get((
                     str(job_target["role"] or "").strip().lower(),
@@ -6298,7 +6926,7 @@ async def get_recent_activity(
                 "interview_id": row[0],
                 "interview_type": row[1],
                 "job_title": row[2],
-                "overall_score": float(row[3]) if row[3] is not None else None,
+                "overall_score": float(row[11]) if row[11] is not None else None,
                 "created_at": row[4].isoformat() if row[4] else None,
                 "completed_at": row[5].isoformat() if row[5] else None,
                 "duration_seconds": int(row[6]) if row[6] is not None else None,
@@ -6341,7 +6969,7 @@ async def get_recent_activity(
 
 @router.get("/technical-rounds")
 async def get_technical_rounds(
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
     limit: int = Query(default=20, ge=1, le=100),
 ):
     connection = get_db_connection()
@@ -6364,7 +6992,7 @@ async def get_technical_rounds(
                    MAX(ts.created_at) AS submitted_at,
                    i.status AS interview_status,
                    i.completed_at AS interview_completed_at,
-                   i.settings->>'profile_type' AS profile_type,
+                   json_extract(i.settings, '$.profile_type') AS profile_type,
                    i.job_title,
                    i.duration_seconds,
                    (i.report_json IS NOT NULL OR i.report_json_encrypted IS NOT NULL) AS report_present,
@@ -6401,9 +7029,20 @@ async def get_technical_rounds(
                          AND analysis.mode = 'technical'
                          AND analysis.status = 'ready'
                          AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.producer_version = ?
                          AND analysis.is_current = TRUE
                          AND analysis.analysis_json_encrypted IS NOT NULL
                          AND analysis.evidence_index_encrypted IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1
+                             FROM ReportArtifacts artifact
+                             WHERE artifact.analysis_id = analysis.analysis_id
+                               AND artifact.interview_id = analysis.interview_id
+                               AND artifact.user_id = analysis.user_id
+                               AND artifact.audience = 'candidate'
+                               AND artifact.status IN ('completed', 'partial')
+                               AND artifact.payload_encrypted IS NOT NULL
+                         )
                    ) AS canonical_report_ready,
                    (
                        SELECT analysis.overall_score
@@ -6413,11 +7052,22 @@ async def get_technical_rounds(
                          AND analysis.mode = 'technical'
                          AND analysis.status = 'ready'
                          AND analysis.schema_version = 'session-performance-v4'
+                         AND analysis.producer_version = ?
                          AND analysis.is_current = TRUE
                          AND analysis.evidence_status = 'sufficient'
                          AND analysis.overall_score IS NOT NULL
                          AND analysis.analysis_json_encrypted IS NOT NULL
                          AND analysis.evidence_index_encrypted IS NOT NULL
+                         AND EXISTS (
+                             SELECT 1
+                             FROM ReportArtifacts artifact
+                             WHERE artifact.analysis_id = analysis.analysis_id
+                               AND artifact.interview_id = analysis.interview_id
+                               AND artifact.user_id = analysis.user_id
+                               AND artifact.audience = 'candidate'
+                               AND artifact.status IN ('completed', 'partial')
+                               AND artifact.payload_encrypted IS NOT NULL
+                         )
                        ORDER BY analysis.created_at DESC
                        LIMIT 1
                    ) AS official_score
@@ -6425,14 +7075,19 @@ async def get_technical_rounds(
             LEFT JOIN TechnicalRunEvents tre ON tre.round_id = tir.round_id
             LEFT JOIN TechnicalSubmissions ts ON ts.round_id = tir.round_id
             JOIN Interviews i ON i.interview_id = tir.interview_id
-            WHERE tir.user_id = %s
+            WHERE tir.user_id = ?
             GROUP BY tir.round_id, tir.interview_id, tir.round_type, tir.language,
                      tir.prompt, tir.status, tir.created_at, tir.completed_at, tir.metadata,
                      i.interview_id, i.status, i.completed_at, i.settings
             ORDER BY tir.created_at DESC
-            LIMIT %s
+            LIMIT ?
             """,
-            (current_user["user_id"], limit),
+            (
+                ANALYSIS_STAGE_VERSION,
+                ANALYSIS_STAGE_VERSION,
+                current_user["user_id"],
+                limit,
+            ),
         )
         rows = cursor.fetchall()
         rounds = [
@@ -6508,7 +7163,7 @@ async def get_technical_rounds(
 
 @router.get("/performance")
 async def get_performance(
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -6533,7 +7188,7 @@ async def get_performance(
                 interview_payload = recorded_interview
         except Exception:
             logger.exception("Failed to build recorded interview performance fallback")
-        if not technical_payload or technical_payload.get("score_state") != "ready":
+        if not technical_payload:
             try:
                 recorded_technical = _technical_performance_payload(cursor, current_user["user_id"])
                 if recorded_technical.get("has_data"):
@@ -6542,10 +7197,7 @@ async def get_performance(
                         "source_kind": "recorded_evidence",
                         "comparison_notice": "Showing submitted tests, runs, and attempted-problem evidence while the full analysis is prepared.",
                     })
-                    technical_payload = _merge_recorded_technical_analytics(
-                        technical_payload,
-                        recorded_technical,
-                    )
+                    technical_payload = recorded_technical
             except Exception:
                 logger.exception("Failed to build recorded technical performance fallback")
         empty_interview = _dynamic_payload("interview", False, [], [])
@@ -6568,6 +7220,36 @@ async def get_performance(
         })
         interview_payload = interview_payload or empty_interview
         technical_payload = technical_payload or empty_technical
+        cursor.execute(
+            """
+            SELECT mode
+            FROM ImprovementMissions
+            WHERE user_id = ? AND status = 'active'
+            """,
+            (current_user["user_id"],),
+        )
+        improve_modes = {
+            "technical" if str(row[0] or "").lower() == "technical" else "interview"
+            for row in cursor.fetchall() or []
+        }
+        for mode, payload in (("interview", interview_payload), ("technical", technical_payload)):
+            comparable_count = int(
+                ((payload.get("comparability") or {}).get("comparable_analysis_count") or 0)
+            )
+            payload["comparison_ready"] = comparable_count >= 2
+            payload["improve_available"] = mode in improve_modes and payload.get("source") == "canonical"
+        availability["performance_ready"] = any(
+            int((availability.get("by_mode") or {}).get(mode, {}).get("ready") or 0) >= 1
+            for mode in ("interview", "technical")
+        )
+        availability["comparison_ready"] = any(
+            bool(payload.get("comparison_ready"))
+            for payload in (interview_payload, technical_payload)
+        )
+        availability["improve_available"] = any(
+            bool(payload.get("improve_available"))
+            for payload in (interview_payload, technical_payload)
+        )
         role_context = _performance_role_context(cursor, current_user["user_id"])
         round_history = _performance_round_history(
             interview_payload,
@@ -6594,187 +7276,10 @@ async def get_performance(
                 "legacy": legacy_history,
             },
             "round_history": round_history,
+            "comparison_ready": availability["comparison_ready"],
+            "improve_available": availability["improve_available"],
             "availability": availability,
         }
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-
-@router.post("/support")
-async def create_support_submission(
-    request: SupportSubmissionCreate,
-    current_user: Dict = Depends(get_current_user),
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-
-    try:
-        if request.interview_id:
-            cursor.execute(
-                "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
-                (request.interview_id, current_user["user_id"])
-            )
-            if not cursor.fetchone():
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Interview not found for this user"
-                )
-
-        cursor.execute(
-            """
-            INSERT INTO SupportSubmissions (
-                user_id, interview_id, kind, title, message, steps, rating, page_url
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING submission_id, status, created_at
-            """,
-            (
-                current_user["user_id"],
-                request.interview_id,
-                request.kind,
-                request.title,
-                request.message,
-                request.steps,
-                request.rating,
-                request.page_url,
-            )
-        )
-        row = cursor.fetchone()
-        connection.commit()
-
-        return {
-            "submission_id": row[0],
-            "status": row[1],
-            "created_at": row[2].isoformat() if row and row[2] else None,
-            "message": "Support request submitted successfully",
-        }
-
-    except HTTPException:
-        connection.rollback()
-        raise
-    except Exception:
-        connection.rollback()
-        logger.error("Failed to create support submission")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to submit support request"
-        )
-
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-
-
-
-@router.get("/support/submissions")
-async def list_support_submissions(
-    current_user: Dict = Depends(get_current_admin),
-    limit: int = Query(default=50, ge=1, le=200),
-    status_filter: Optional[str] = Query(default=None, alias="status"),
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        where_sql = ""
-        params: List[Any] = []
-        if status_filter:
-            where_sql = "WHERE s.status = %s"
-            params.append(status_filter.strip().lower())
-        cursor.execute(
-            f"""
-            SELECT s.submission_id, s.kind, s.status, s.title, s.message, s.steps,
-                   s.rating, s.interview_id, s.page_url, s.admin_notes,
-                   s.created_at, s.updated_at, l.email, COALESCE(u.full_name, '')
-            FROM SupportSubmissions s
-            JOIN UserInfo u ON s.user_id = u.user_id
-            JOIN Login l ON s.user_id = l.user_id
-            {where_sql}
-            ORDER BY s.created_at DESC
-            LIMIT %s
-            """,
-            tuple(params + [limit]),
-        )
-        submissions = []
-        for row in cursor.fetchall():
-            submissions.append({
-                "submission_id": row[0], "kind": row[1], "status": row[2],
-                "title": row[3], "message": row[4], "steps": row[5],
-                "rating": row[6], "interview_id": row[7], "page_url": row[8],
-                "admin_notes": row[9],
-                "created_at": row[10].isoformat() if row[10] else None,
-                "updated_at": row[11].isoformat() if row[11] else None,
-                "email": row[12], "full_name": row[13] or "User",
-            })
-        return {"submissions": submissions}
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-
-@router.patch("/support/submissions/{submission_id}")
-async def update_support_submission(
-    submission_id: int,
-    request: SupportSubmissionUpdate,
-    current_user: Dict = Depends(get_current_admin),
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-
-    try:
-        updates = []
-        params: List[Any] = []
-
-        if request.status is not None:
-            updates.append("status = %s")
-            params.append(request.status)
-        if request.admin_notes is not None:
-            updates.append("admin_notes = %s")
-            params.append(request.admin_notes)
-
-        if not updates:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No support submission changes provided"
-            )
-
-        params.extend([submission_id])
-        cursor.execute(
-            f"""
-            UPDATE SupportSubmissions
-            SET {", ".join(updates)}, updated_at = NOW()
-            WHERE submission_id = %s
-            RETURNING submission_id, status, admin_notes, updated_at
-            """,
-            tuple(params)
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Support submission not found"
-            )
-        connection.commit()
-
-        return {
-            "submission_id": row[0],
-            "status": row[1],
-            "admin_notes": row[2],
-            "updated_at": row[3].isoformat() if row[3] else None,
-        }
-
-    except HTTPException:
-        connection.rollback()
-        raise
-    except Exception:
-        connection.rollback()
-        logger.error("Failed to update support submission")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update support submission"
-        )
-
     finally:
         cursor.close()
         return_db_connection(connection)

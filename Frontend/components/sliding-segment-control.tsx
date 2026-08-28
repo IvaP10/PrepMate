@@ -25,6 +25,7 @@ interface SlidingSegmentControlProps<T extends string> {
   className?: string
   buttonClassName?: string
   shape?: "rounded" | "pill"
+  wrap?: boolean
 }
 
 const SLIDE_MS = 176
@@ -38,11 +39,12 @@ export function SlidingSegmentControl<T extends string>({
   className,
   buttonClassName,
   shape = "rounded",
+  wrap = false,
 }: SlidingSegmentControlProps<T>) {
   const radiusClass = shape === "pill" ? "rounded-full" : "rounded-md"
   const containerRef = useRef<HTMLDivElement>(null)
   const itemRefs = useRef(new Map<string, HTMLButtonElement>())
-  const [activeRect, setActiveRect] = useState({ x: 4, width: 0 })
+  const [activeRect, setActiveRect] = useState({ x: 4, y: 4, width: 0, height: 0 })
   const [isMoving, setIsMoving] = useState(false)
   const prevValueRef = useRef(value)
 
@@ -63,7 +65,9 @@ export function SlidingSegmentControl<T extends string>({
     const itemRect = activeItem.getBoundingClientRect()
     setActiveRect({
       x: itemRect.left - containerRect.left + container.scrollLeft,
+      y: itemRect.top - containerRect.top + container.scrollTop,
       width: itemRect.width,
+      height: itemRect.height,
     })
   }, [value])
 
@@ -92,23 +96,24 @@ export function SlidingSegmentControl<T extends string>({
       aria-label={ariaLabel}
       onScroll={measure}
       className={cn(
-        "relative flex max-w-full items-stretch gap-1 overflow-x-auto rounded-lg border border-border/50 bg-secondary/20 p-1",
-        "iv-hide-scrollbar",
+        "relative flex max-w-full items-stretch gap-1 rounded-lg border border-border/50 bg-secondary/20 p-1",
+        wrap ? "flex-wrap overflow-visible" : "overflow-x-auto iv-hide-scrollbar",
         className,
       )}
     >
       <span
         aria-hidden="true"
         className={cn(
-          "pointer-events-none absolute inset-y-1 left-0 overflow-hidden border border-primary/30 bg-primary/10 shadow-[0_6px_18px_rgba(79,70,229,0.12)] will-change-[transform,width] dark:border-primary/40 dark:bg-primary/18 dark:shadow-[0_0_24px_rgba(129,140,248,0.14)]",
+          "pointer-events-none absolute left-0 top-0 overflow-hidden border border-primary/30 bg-primary/10 shadow-[0_6px_18px_rgba(79,70,229,0.12)] will-change-[transform,width,height] dark:border-primary/40 dark:bg-primary/18 dark:shadow-[0_0_24px_rgba(129,140,248,0.14)]",
           "backdrop-blur-md transition-[transform,width,box-shadow,background-color,backdrop-filter]",
           isMoving && "border-primary/45 bg-primary/16 shadow-[0_10px_32px_rgba(79,70,229,0.22)] backdrop-blur-xl dark:bg-primary/24",
           radiusClass,
         )}
         style={{
-          transform: `translate3d(${activeRect.x}px, 0, 0)`,
+          transform: `translate3d(${activeRect.x}px, ${activeRect.y}px, 0)`,
           width: activeRect.width,
-          opacity: activeRect.width > 0 ? 1 : 0,
+          height: activeRect.height,
+          opacity: activeRect.width > 0 && activeRect.height > 0 ? 1 : 0,
           transitionDuration: isMoving ? `${SLIDE_MS}ms` : "0ms",
           transitionTimingFunction: SLIDE_EASE,
         }}

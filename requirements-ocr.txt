@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Optional scanned-PDF resume support. Selectable PDFs and DOCX files use the
+# core dependency set and do not require this heavyweight pack.
+paddlepaddle==3.2.2; python_version < "3.14"
+paddleocr==3.3.3

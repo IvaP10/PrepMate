@@ -6,7 +6,7 @@ def _resume():
         "skills": ["Python", "FastAPI", "PostgreSQL"],
         "projects": [
             {
-                "name": "InterAI",
+                "name": "PrepMate",
                 "description": "An interview platform with retrieval and adaptive questions.",
             }
         ],
@@ -30,7 +30,7 @@ def test_blueprint_is_deterministic_and_evidence_ready():
 
     assert first["blueprint_hash"] == second["blueprint_hash"]
     assert first["selection_policy"] == "deterministic_evidence_first_v1"
-    assert any("InterAI" in item["opening_question"] for item in first["battlegrounds"])
+    assert any("PrepMate" in item["opening_question"] for item in first["battlegrounds"])
     assert all(item["expected_points"] for item in first["battlegrounds"])
     assert all(item["rubric"]["unknown_dimensions_are_null"] for item in first["battlegrounds"])
     assert validate_blueprint(first) is first
@@ -110,9 +110,38 @@ def test_project_evidence_precedes_and_anchors_skill_questions():
     project_index = next(index for index, item in enumerate(sections) if item["section_id"] == "project-1")
     skill_index = next(index for index, item in enumerate(sections) if item["section_id"] == "critical-skill-1")
     assert project_index < skill_index
-    assert "InterAI" in sections[skill_index]["opening_question"]
+    assert "PrepMate" in sections[skill_index]["opening_question"]
     assert "trade-off" in sections[skill_index]["opening_question"]
     assert sections[skill_index]["opening_question"] == (
-        "What was the toughest Python trade-off you made in InterAI?"
+        "What was the toughest Python trade-off you made in PrepMate?"
     )
     assert "most important decision you made using Python" not in sections[skill_index]["opening_question"]
+
+
+def test_jd_only_requirement_is_reserved_before_generic_resume_skills_are_truncated():
+    result = compile_interview_blueprint(
+        resume_data={
+            "skills": ["Python", "React", "AWS", "Docker", "MongoDB"],
+            "projects": [
+                {"name": "Alpha", "description": "A backend platform."},
+                {"name": "Beta", "description": "A frontend application."},
+            ],
+        },
+        job_title="Backend Engineer",
+        job_description="The role requires production Redis expertise.",
+        interview_type="Mock Interview",
+        duration_minutes=30,
+        profile_type="custom",
+        focus=["mixed"],
+    )
+
+    redis_section = next(
+        section for section in result["battlegrounds"]
+        if section["label"] == "Redis"
+    )
+    assert redis_section["section_id"] == "jd-required-1"
+    assert redis_section["selection_reason"] == (
+        "Explicit job-description requirement not present in confirmed resume evidence"
+    )
+    assert "Alpha" not in redis_section["opening_question"]
+    assert result["source_summary"]["jd_signal_count"] == 1

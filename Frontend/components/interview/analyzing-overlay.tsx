@@ -2,7 +2,6 @@
 import { useEffect, useState, useRef } from "react"
 import { useRouter } from "next/navigation"
 import { API_CONFIG } from "@/lib/config"
-import { getAuthHeaders } from "@/lib/auth"
 interface AnalyzingOverlayProps {
   isVisible: boolean
   interviewId?: string
@@ -74,8 +73,6 @@ export function AnalyzingOverlay({
         const resp = await fetch(
           `${API_CONFIG.BASE_URL}/interview/${interviewId}/analysis-status`,
           {
-            credentials: "include",
-            headers: getAuthHeaders(),
           }
         )
         if (resp.ok) {

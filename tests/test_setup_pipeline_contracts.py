@@ -50,7 +50,7 @@ def test_blueprint_preview_has_stable_ids_and_never_exposes_questions():
     kwargs = {
         "resume_data": {
             "skills": ["Python", "PostgreSQL"],
-            "projects": [{"name": "InterAI", "description": "Interview evidence pipeline"}],
+            "projects": [{"name": "PrepMate", "description": "Interview evidence pipeline"}],
         },
         "job_title": "Backend Engineer",
         "job_description": "Python, PostgreSQL, Redis, and system design",
@@ -256,7 +256,7 @@ def test_modern_resume_and_job_assets_produce_interview_ready_status():
     assert "FROM JobProfiles" in cursor.queries[0][0]
 
 
-def test_selected_job_description_decrypts_postgres_binary_values():
+def test_selected_job_description_decrypts_sqlite_binary_values():
     encrypted = encrypt_data("Private backend job description").encode("utf-8")
 
     assert pre_interview._decrypt_text_blob(memoryview(encrypted)) == "Private backend job description"
@@ -453,11 +453,15 @@ class _LearningCursor:
             ]
         elif any(
             table in normalized
-            for table in ("TechnicalMistakeClusters", "ProjectKnowledgeGaps", "GeneratedExercises", "MalpracticeEvents")
+            for table in ("TechnicalMistakeClusters", "ProjectKnowledgeGaps", "GeneratedExercises", "SessionReviewEvents")
         ):
             self.rows = []
         elif "FROM Interviews i" in normalized:
             self.rows = [(5, 5)]
+        elif "FROM SessionPerformanceAnalyses" in normalized:
+            # Improve is unlocked only after repeatable Performance evidence
+            # exists for one mode, represented by the max mode count.
+            self.rows = [(2,)]
         else:
             raise AssertionError(f"Unexpected direct query: {normalized}")
 
@@ -501,3 +505,23 @@ def test_learning_snapshot_is_read_only_and_exposes_exact_next_action_ids():
     assert payload["next_action"]["exercise_id"] == "exercise-1"
     assert payload["weakness_states"][0]["lifecycle_state"] == "repeated"
     assert not any(query.startswith(("INSERT ", "UPDATE ", "DELETE ")) for query in cursor.queries)
+
+
+def test_learning_snapshot_starts_improve_after_one_report_but_keeps_comparison_pending():
+    cursor = _LearningCursor()
+    with patch.object(workspace_api, "_performance_ready_count", return_value=1), patch.object(
+        workspace_api, "_active_mission_payload", return_value=None,
+    ), patch.object(
+        workspace_api,
+        "_improvement_history_payload",
+        return_value={"skills": [], "completed_missions": [], "recent_attempts": [], "has_history": False},
+    ):
+        payload = workspace_api.build_readonly_learning_snapshot(cursor, "user-1")
+
+    assert payload["performance_ready"] is True
+    assert payload["comparison_ready"] is False
+    assert payload["analysis_availability"]["performance_ready"] is True
+    assert payload["analysis_availability"]["comparison_ready"] is False
+    assert payload["active_mission"] is None
+    assert payload["exercise_queue"] == []
+    assert payload["improve_available"] is False

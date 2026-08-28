@@ -2,7 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react"
 import Link from "next/link"
-import { ArrowLeft, Printer } from "lucide-react"
+import { ArrowLeft, Download, Loader2, Printer } from "lucide-react"
 
 import { ThemeLogo } from "@/components/theme-logo"
 
@@ -27,6 +27,8 @@ interface ReportShellProps {
     stats?: ReportStat[]
   }
   sections: Array<{ id: string; title: string }>
+  onDownloadJson?: () => void | Promise<void>
+  downloadingJson?: boolean
   children: ReactNode
 }
 
@@ -36,7 +38,7 @@ const profileLabels: Record<string, string> = {
   startup: "Startup",
 }
 
-export function ReportShell({ reportType, title, metadata, sections, children }: ReportShellProps) {
+export function ReportShell({ reportType, title, metadata, sections, onDownloadJson, downloadingJson, children }: ReportShellProps) {
   const [activeSection, setActiveSection] = useState(sections[0]?.id || "")
   const backHref = reportType === "technical" ? "/?tab=technical" : "/?tab=interview"
   const backLabel = reportType === "technical" ? "Technical" : "Interview"
@@ -71,9 +73,9 @@ export function ReportShell({ reportType, title, metadata, sections, children }:
     <main className="min-h-screen bg-background text-foreground" data-report-type={reportType}>
       <header className="border-b border-border bg-background/95" data-report-header>
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
-          <Link href="/" className="flex items-center gap-2" aria-label="InterAI home">
+          <Link href="/" className="flex items-center gap-2" aria-label="PrepMate home">
             <ThemeLogo size={34} />
-            <span className="text-base font-semibold">InterAI</span>
+          <span className="text-base font-semibold">PrepMate</span>
           </Link>
           <div className="flex items-center gap-2">
             <button
@@ -83,6 +85,15 @@ export function ReportShell({ reportType, title, metadata, sections, children }:
             >
               <Printer className="h-4 w-4" />
               Print / Save PDF
+            </button>
+            <button
+              onClick={() => void onDownloadJson?.()}
+              disabled={!onDownloadJson || downloadingJson}
+              data-report-json-export
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-card px-3 text-sm font-medium hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {downloadingJson ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+              {downloadingJson ? "Preparing JSON" : "Download JSON"}
             </button>
             <Link
               href={backHref}

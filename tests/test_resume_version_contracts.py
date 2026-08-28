@@ -7,7 +7,9 @@ import pytest
 
 os.environ.setdefault("ENVIRONMENT", "test")
 
+import database
 import pre_interview
+from local_runtime import LOCAL_USER_ID
 
 
 def _resume(confidence: str = "medium"):
@@ -129,51 +131,71 @@ def test_list_resume_versions_uses_owned_rows_and_returns_active_id():
     assert cursor.queries[0][1] == ("user-1",)
 
 
-class _DeleteCursor:
-    def __init__(self, row):
-        self.row = row
-        self.queries = []
-
-    def execute(self, query, params=None):
-        self.queries.append((" ".join(query.split()), params))
-
-    def fetchone(self):
-        return self.row
-
-    def close(self):
-        return None
-
-
-def _delete_context(row):
-    cursor = _DeleteCursor(row)
-    return cursor, _DatabaseContext(_Connection(cursor))
+def _persist_test_resume(tmp_path, monkeypatch) -> str:
+    monkeypatch.setenv("PREPMATE_DATA_DIR", str(tmp_path))
+    database.close_connection_pool()
+    payload = _resume("high")
+    persisted = pre_interview._persist_parsed_resume(
+        user_id=LOCAL_USER_ID,
+        email="candidate@example.test",
+        resume_json=payload,
+        resume_text="Synthetic resume content with Python and reliable platform engineering.",
+        content_hash="resume-delete-contract-hash",
+        source_filename="synthetic.docx",
+        parser_version="fixture-v1",
+        facts_payload={"review_version": "resume-facts-v1", "facts": []},
+    )
+    return str(persisted["resume"]["resume_id"])
 
 
-def test_delete_resume_version_removes_owned_version():
-    cursor, context = _delete_context(("resume-2",))
-
-    with patch.object(pre_interview, "get_db", return_value=context):
+def test_delete_resume_version_removes_owned_version_and_active_profile(tmp_path, monkeypatch):
+    resume_id = _persist_test_resume(tmp_path, monkeypatch)
+    try:
         result = asyncio.run(pre_interview.delete_resume_version(
-            "resume-2",
-            current_user={"user_id": "user-1"},
+            resume_id,
+            current_user={"user_id": LOCAL_USER_ID},
         ))
+        with database.get_db() as connection:
+            resume_count = connection.execute(
+                "SELECT COUNT(*) FROM ResumeVersions WHERE user_id = ?",
+                (LOCAL_USER_ID,),
+            ).fetchone()[0]
+            profile = connection.execute(
+                "SELECT full_name, resume_json, profile_json, active_resume_id FROM UserInfo WHERE user_id = ?",
+                (LOCAL_USER_ID,),
+            ).fetchone()
+    finally:
+        database.close_connection_pool()
 
-    assert result == {"success": True, "message": "Resume version deleted"}
-    assert cursor.queries[0][1] == ("user-1", "resume-2")
-    assert cursor.queries[1][0].startswith("DELETE FROM ResumeVersions")
-    assert cursor.queries[1][1] == ("user-1", "resume-2")
+    assert result["success"] is True
+    assert result["deleted_counts"]["resume_versions"] == 1
+    assert resume_count == 0
+    assert profile == ("Local user", None, None, None)
 
 
-@pytest.mark.parametrize("row", [(True, False), (False, True), (True, True)])
-def test_delete_resume_version_does_not_block_active_or_referenced_versions(row):
-    cursor, context = _delete_context(row)
+def test_delete_resume_version_rejects_an_active_interview(tmp_path, monkeypatch):
+    resume_id = _persist_test_resume(tmp_path, monkeypatch)
+    try:
+        with database.get_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO Interviews (
+                    interview_id, user_id, interview_mode, interview_type,
+                    strictness_level, status, resume_id
+                ) VALUES ('active-resume-interview', ?, 'mock', 'behavioral',
+                          'medium', 'in_progress', ?)
+                """,
+                (LOCAL_USER_ID, resume_id),
+            )
+            connection.commit()
 
-    with patch.object(pre_interview, "get_db", return_value=context):
-        result = asyncio.run(pre_interview.delete_resume_version(
-            "resume-locked",
-            current_user={"user_id": "user-1"},
-        ))
+        with pytest.raises(pre_interview.HTTPException) as rejected:
+            asyncio.run(pre_interview.delete_resume_version(
+                resume_id,
+                current_user={"user_id": LOCAL_USER_ID},
+            ))
+    finally:
+        database.close_connection_pool()
 
-    assert result == {"success": True, "message": "Resume version deleted"}
-    assert len(cursor.queries) == 2
-    assert cursor.queries[1][0].startswith("DELETE FROM ResumeVersions")
+    assert rejected.value.status_code == 409
+    assert "active interview" in str(rejected.value.detail).lower()

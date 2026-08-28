@@ -18,6 +18,11 @@ env/
 
 # ML model files (auto-downloaded on first run)
 models/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.backup-*
+settings.json
 
 # Secrets — never commit these
 key.env
@@ -67,3 +72,5 @@ Frontend/playwright-report/
 
 # Lockfiles are production inputs; commit frontend package locks.
 !Frontend/package-lock.json
+!desktop/package-lock.json
+desktop/release/

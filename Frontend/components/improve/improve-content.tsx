@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
+import Link from "next/link"
 import {
   AlertTriangle,
   ArrowDown,
@@ -55,34 +56,14 @@ type ImproveContentProps = {
   learning?: LearningDashboard | null
   loading?: boolean
   error?: string
-  setActiveNav: (nav: "improve" | "interview" | "coding" | "resume" | "performance" | "membership" | "settings") => void
+  setActiveNav: (nav: "improve" | "interview" | "coding" | "resume" | "performance" | "settings") => void
   onLearningRefresh?: () => Promise<void> | void
-  isPremium?: boolean
   navigationTarget?: ExactImproveTarget | null
   onNavigationConsumed?: () => void
 }
 
 type ActivityPhase = "before" | "during" | "feedback"
 type ImproveMode = "interview" | "technical"
-
-type SpeechRecognitionLike = {
-  continuous: boolean
-  interimResults: boolean
-  lang: string
-  onresult: ((event: any) => void) | null
-  onerror: ((event: any) => void) | null
-  onend: (() => void) | null
-  start: () => void
-  stop: () => void
-  abort: () => void
-}
-
-declare global {
-  interface Window {
-    SpeechRecognition?: new () => SpeechRecognitionLike
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike
-  }
-}
 
 function createAttemptKey() {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID()
@@ -325,6 +306,20 @@ export function ImproveContent({
               </div>
             </div>
           </div>
+          <div className="mt-4 flex flex-col gap-3 rounded-xl border border-border/70 bg-card/80 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-xs font-bold uppercase tracking-[0.12em] text-primary">What your report found</p>
+              <p className="mt-1 text-sm leading-6 text-muted-foreground">{mission.assignment_reason}</p>
+            </div>
+            {mission.report_path && (
+              <Button asChild variant="outline" className="shrink-0">
+                <Link href={mission.report_path}>
+                  Review source report
+                  <ExternalLink className="h-4 w-4" />
+                </Link>
+              </Button>
+            )}
+          </div>
           <SkillRoadmap
             nodes={mission.roadmap}
             mission={mission}
@@ -436,7 +431,7 @@ function missionPathTitle(title: string, mode: ImproveMode) {
     return `Plan and test ${skill.toLowerCase()} solutions before coding`
   }
   if (trimmed === "Explain Projects Clearly") return "Explain projects with decisions, ownership, and results"
-  if (trimmed === "Explain InterAI Convincingly") return "Explain InterAI with architecture, decisions, and results"
+  if (trimmed === "Explain PrepMate Convincingly") return "Explain PrepMate with architecture, decisions, and results"
   if (trimmed === "Defend Resume Claims") return "Support every resume claim with concrete evidence"
   if (trimmed === "Improve Communication and Conciseness") return "Answer directly, then support the answer with evidence"
   if (trimmed.startsWith("Strengthen ")) {
@@ -1257,62 +1252,19 @@ function SpokenCapture({
   onChange: (value: string) => void
   placeholder: string
 }) {
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null)
-  const [isRecording, setIsRecording] = useState(false)
-  const [micError, setMicError] = useState("")
-
-  const toggleRecording = () => {
-    if (isRecording) {
-      recognitionRef.current?.stop()
-      setIsRecording(false)
-      return
-    }
-    const Recognition = typeof window !== "undefined" ? (window.SpeechRecognition || window.webkitSpeechRecognition) : undefined
-    if (!Recognition) {
-      setMicError("Microphone transcription is unavailable in this browser. Type the transcript after speaking.")
-      return
-    }
-    const recognition = new Recognition()
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.lang = "en-US"
-    recognition.onresult = (event: any) => {
-      let transcript = ""
-      for (let index = 0; index < event.results.length; index += 1) {
-        transcript += event.results[index][0]?.transcript || ""
-      }
-      onChange(transcript.trim())
-    }
-    recognition.onerror = () => {
-      setMicError("Microphone transcription stopped. You can continue by typing the transcript.")
-      setIsRecording(false)
-    }
-    recognition.onend = () => setIsRecording(false)
-    recognitionRef.current = recognition
-    setMicError("")
-    setIsRecording(true)
-    recognition.start()
-  }
-
-  useEffect(() => {
-    return () => recognitionRef.current?.abort()
-  }, [])
-
   return (
     <div className="rounded-lg border border-border bg-background/55 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <label className="text-sm font-semibold text-foreground" htmlFor="spoken-transcript">{label}</label>
         <Button
           type="button"
-          variant={isRecording ? "default" : "outline"}
+          variant="outline"
           size="sm"
-          onClick={toggleRecording}
-          aria-pressed={isRecording}
-          aria-label={isRecording ? "Stop recording" : "Start microphone transcript"}
-          className={cn(isRecording && "animate-pulse")}
+          disabled
+          aria-label="Voice input unavailable"
         >
           <Mic className="h-4 w-4" />
-          {isRecording ? "Recording" : "Mic"}
+          Voice unavailable
         </Button>
       </div>
       <Textarea
@@ -1322,7 +1274,7 @@ function SpokenCapture({
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
       />
-      {micError && <p className="mt-2 text-xs text-amber-600 dark:text-amber-300">{micError}</p>}
+      <p className="mt-2 text-xs text-muted-foreground">Voice input is not enabled in this release. Type your answer instead.</p>
     </div>
   )
 }

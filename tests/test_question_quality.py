@@ -1,5 +1,9 @@
+import asyncio
+from types import SimpleNamespace
+
+import knowledge_map
 from knowledge_map import _followup_fallback, validate_presented_question
-from interview import _live_answer_quality, _live_retry_question
+from interview import _build_opening_script, _build_personalized_opening, _live_answer_quality, _live_retry_question
 
 
 def test_question_validator_accepts_one_natural_question():
@@ -88,3 +92,81 @@ def test_live_retry_keeps_the_original_question_instead_of_nesting_prompts():
     assert first.endswith(original)
     assert second.endswith(original)
     assert "Please answer the question directly about Project ownership" not in second
+
+
+def test_personalized_opening_anchors_to_frozen_resume_project():
+    opening = _build_personalized_opening(
+        {"name": "Maya", "job_title": "Backend Engineer"},
+        {
+            "name": "Synthetic Candidate",
+            "target_role": "Backend Engineer",
+            "projects": [{"name": "Payments Ledger"}],
+        },
+        {},
+        "mock",
+    )
+
+    assert "Payments Ledger" in opening
+    assert "personally owned" in opening
+    assert "Backend Engineer" in opening
+
+
+def test_personalized_opening_keeps_safe_fallback_without_resume_anchors():
+    opening = _build_personalized_opening(
+        {"name": "Maya", "job_title": "Backend Engineer"},
+        {"name": "Synthetic Candidate"},
+        {},
+        "mock",
+    )
+
+    assert opening == (
+        "Hi Synthetic Candidate, I am Maya. What should I know about your background and interest "
+        "in the Backend Engineer role?"
+    )
+
+
+def test_realistic_opening_separates_greeting_from_non_scored_introduction():
+    script = _build_opening_script(
+        {"name": "Ava", "job_title": "Backend Engineer"},
+        {"name": "Synthetic Candidate", "target_role": "Backend Engineer"},
+    )
+
+    assert script["greeting"].startswith("Hi Synthetic Candidate")
+    assert "explain each step" in script["greeting"]
+    assert "scoring starts with the first round question" in script["greeting"]
+    assert script["intro_question"].endswith("?")
+    assert "brief introduction" in script["intro_question"]
+
+
+def test_adaptive_followup_receives_frozen_resume_and_job_context(monkeypatch):
+    captured = {}
+
+    async def fake_complete(messages, **kwargs):
+        captured["messages"] = messages
+        captured["metadata"] = kwargs["metadata"]
+        return SimpleNamespace(
+            text="You mentioned Redis; how did you keep cache invalidation safe for payment updates?"
+        )
+
+    monkeypatch.setattr(knowledge_map, "complete_text_async", fake_complete)
+
+    result = asyncio.run(knowledge_map.generate_contextual_followup(
+        battleground_label="Caching",
+        main_question="How did you reduce database load?",
+        candidate_response="I used Redis to cache payment profiles and reduced database load by forty percent.",
+        conversation_history=[],
+        performance_score=74,
+        resume_context="Project: Payments Ledger - Built idempotent transaction processing.",
+        job_context={
+            "role": "Backend Engineer",
+            "company": "Acme",
+            "jd_summary": "Own reliable payment services.",
+        },
+    ))
+
+    prompt = captured["messages"][1]["content"]
+    assert "Payments Ledger" in prompt
+    assert "Backend Engineer" in prompt
+    assert "Acme" in prompt
+    assert "Redis" in prompt
+    assert result.startswith("You mentioned Redis")

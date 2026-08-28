@@ -14,7 +14,7 @@ export const ThemeLogo = memo(function ThemeLogo({ size = 36, className = "" }: 
     <span className={`relative inline-flex items-center justify-center ${className}`} style={{ width: containerWidth, height: containerHeight }}>
       <img
         src="/images/light.svg"
-        alt="InterAI logo"
+        alt="PrepMate logo"
         width={containerWidth}
         height={containerHeight}
         style={{ width: containerWidth, height: containerHeight }}
@@ -22,7 +22,7 @@ export const ThemeLogo = memo(function ThemeLogo({ size = 36, className = "" }: 
       />
       <img
         src="/images/logo-dark.svg"
-        alt="InterAI logo"
+        alt="PrepMate logo"
         width={containerWidth}
         height={containerHeight}
         style={{ width: containerWidth, height: containerHeight }}

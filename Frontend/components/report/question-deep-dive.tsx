@@ -44,13 +44,19 @@ function statusClass(status: string) {
   return "border-border bg-secondary text-muted-foreground"
 }
 
+export function questionScoreLabel(score: number | null | undefined, status: string) {
+  if (typeof score === "number" && Number.isFinite(score)) return `${Math.round(score)}/10`
+  if (status === "Not Answered") return "0/10"
+  return "Unable to Evaluate"
+}
+
 export function QuestionDeepDive({
   index,
   sectionId,
   question,
   response = "",
   transcript,
-  score = 0,
+  score = null,
   status = "Not Answered",
   timeUsedSeconds,
   whatCandidateAnswered,
@@ -63,7 +69,7 @@ export function QuestionDeepDive({
 }: QuestionDeepDiveProps) {
   const unanswered = status === "Not Answered"
   const answerText = transcript || response
-  const scoreLabel = status === "Unable to Evaluate" ? "Unable to Evaluate" : `${Math.round(score ?? 0)}/10`
+  const scoreLabel = questionScoreLabel(score, status)
   const good = whatWasGood.length ? whatWasGood : evidence.correctly_mentioned || []
   const reduced = whatReducedScore.length ? whatReducedScore : [
     ...(evidence.missing || []).map((item) => `Missing: ${item}`),

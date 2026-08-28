@@ -17,7 +17,7 @@
     }
   }
   try {
-    var t = localStorage.getItem("interai-theme");
+    var t = localStorage.getItem("prepmate-theme") || localStorage.getItem("interai-theme");
     if (t === "dark") {
       document.documentElement.classList.remove("light");
       document.documentElement.classList.add("dark");

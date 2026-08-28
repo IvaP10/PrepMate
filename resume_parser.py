@@ -1,7 +1,7 @@
 # ============================================================================
 # MODULE: resume_parser.py
 # PURPOSE: Extract text + links + light metadata from PDF/DOCX resumes
-#          (PyMuPDF for selectable PDFs, PaddleOCR fallback for scans, python-docx
+#          (PDFium for selectable PDFs, PaddleOCR fallback for scans, python-docx
 #          for Word documents).
 # STRUCTURE:
 #   - ResumeParseResult dataclass (lines 23-32)
@@ -9,7 +9,7 @@
 #   - _normalize_text helper + per-format parsers (later in file)
 #   - parse_resume_structured(file_path) entry point
 # ENDPOINTS: none
-# DEPENDS ON: pymupdf, paddleocr, python-docx (lazy imports)
+# DEPENDS ON: pypdfium2, paddleocr, python-docx (lazy imports)
 # CONSUMED BY: pre_interview.py
 # DATA TABLES: none (returns a dict; pre_interview.py persists into UserInfo.resume_json)
 # ============================================================================
@@ -17,13 +17,62 @@
 from __future__ import annotations
 
 import logging
+import io
 import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass, asdict
+from pathlib import PurePosixPath
 from typing import Any, Dict, Iterable, List
 
 logger = logging.getLogger("resume_parser")
+
+MAX_RESUME_PDF_PAGES = 20
+MAX_RESUME_PDF_PAGE_PIXELS = 20_000_000
+MAX_RESUME_PDF_TOTAL_PIXELS = 80_000_000
+MAX_DOCX_ARCHIVE_ENTRIES = 2_000
+MAX_DOCX_UNCOMPRESSED_BYTES = 20 * 1024 * 1024
+MAX_DOCX_COMPRESSION_RATIO = 100
+
+
+def validate_resume_bytes(content: bytes, extension: str) -> None:
+    """Validate the container before handing bytes to native document parsers."""
+    ext = str(extension or "").lower()
+    if ext == ".pdf":
+        if not content.startswith(b"%PDF-"):
+            raise ValueError("The uploaded file is not a valid PDF.")
+        return
+    if ext != ".docx" or not content.startswith(b"PK"):
+        raise ValueError("The uploaded file is not a valid DOCX archive.")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = archive.infolist()
+            names = {member.filename for member in members}
+            if "[Content_Types].xml" not in names or "word/document.xml" not in names:
+                raise ValueError("The uploaded archive is not a DOCX document.")
+            if len(members) > MAX_DOCX_ARCHIVE_ENTRIES:
+                raise ValueError("The DOCX archive contains too many files.")
+            total_uncompressed = sum(max(0, member.file_size) for member in members)
+            if total_uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
+                raise ValueError("The DOCX archive expands beyond the allowed size.")
+            for member in members:
+                member_name = member.filename.replace("\\", "/")
+                member_path = PurePosixPath(member_name)
+                if member_path.is_absolute() or ".." in member_path.parts:
+                    raise ValueError("The DOCX archive contains an unsafe file path.")
+                if member.file_size <= 0:
+                    continue
+                compressed = max(1, member.compress_size)
+                if member.file_size / compressed > MAX_DOCX_COMPRESSION_RATIO:
+                    raise ValueError("The DOCX archive has an unsafe compression ratio.")
+                if member_name.lower().endswith((".xml", ".rels")):
+                    xml_content = archive.read(member).upper()
+                    if b"<!DOCTYPE" in xml_content or b"<!ENTITY" in xml_content:
+                        raise ValueError("The DOCX archive contains unsafe XML declarations.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("The uploaded file is not a valid DOCX archive.") from exc
 
 
 @dataclass
@@ -64,40 +113,56 @@ def _extract_links(text: str) -> List[str]:
     return list(dict.fromkeys(links))
 
 
-def _page_text_pymupdf(page) -> str:
-    blocks = page.get_text("blocks") or []
-    lines: List[str] = []
-    for block in blocks:
-        if len(block) >= 5 and isinstance(block[4], str):
-            line = block[4].strip()
-            if line:
-                lines.append(line)
-    if lines:
-        return "\n".join(lines)
-    return page.get_text("text", sort=True) or ""
+def _page_text_pdfium(page) -> str:
+    text_page = page.get_textpage()
+    try:
+        return text_page.get_text_range(force_this=True) or ""
+    finally:
+        text_page.close()
 
 
-def _parse_pdf_with_pymupdf(file_path: str, *, allow_ocr: bool = True) -> ResumeParseResult:
-    import fitz
+def _parse_pdf_with_pdfium(file_path: str, *, allow_ocr: bool = True) -> ResumeParseResult:
+    import pypdfium2 as pdfium
 
-    doc = fitz.open(file_path)
-    text_pages = [_page_text_pymupdf(page) for page in doc]
-    ocr_pages: List[str] = []
-    normalized_preview = _normalize_text("\n".join(text_pages))
-    low_text_pages = [
-        index
-        for index, text in enumerate(text_pages)
-        if len((text or "").strip()) < 80
-    ]
-    if allow_ocr and (low_text_pages or len(normalized_preview) < 250):
-        ocr_pages = _ocr_pdf_pages(doc, low_text_pages or list(range(len(doc))))
-    pages = text_pages + ocr_pages
-    page_count = len(doc)
-    doc.close()
+    doc = pdfium.PdfDocument(file_path)
+    try:
+        if len(doc) <= 0 or len(doc) > MAX_RESUME_PDF_PAGES:
+            raise ValueError(f"PDF resumes must contain between 1 and {MAX_RESUME_PDF_PAGES} pages.")
+        total_pixels = 0
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            width, height = page.get_size()
+            page_pixels = int(max(0, width * 2) * max(0, height * 2))
+            if page_pixels > MAX_RESUME_PDF_PAGE_PIXELS:
+                raise ValueError("A PDF page is too large to process safely.")
+            total_pixels += page_pixels
+            page.close()
+        if total_pixels > MAX_RESUME_PDF_TOTAL_PIXELS:
+            raise ValueError("The PDF exceeds the total page pixel budget.")
+        text_pages = []
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            try:
+                text_pages.append(_page_text_pdfium(page))
+            finally:
+                page.close()
+        ocr_pages: List[str] = []
+        normalized_preview = _normalize_text("\n".join(text_pages))
+        low_text_pages = [
+            index
+            for index, text in enumerate(text_pages)
+            if len((text or "").strip()) < 80
+        ]
+        if allow_ocr and (low_text_pages or len(normalized_preview) < 250):
+            ocr_pages = _ocr_pdf_pages(doc, low_text_pages or list(range(len(doc))))
+        pages = text_pages + ocr_pages
+        page_count = len(doc)
+    finally:
+        doc.close()
     text = _normalize_text("\n".join(pages))
     if not text:
         raise ValueError("PDF text/OCR extraction returned empty text")
-    parser = "pymupdf+paddleocr" if ocr_pages else "pymupdf"
+    parser = "pypdfium2+paddleocr" if ocr_pages else "pypdfium2"
     return ResumeParseResult(
         text=text,
         parser=parser,
@@ -143,17 +208,16 @@ def _ocr_pdf_pages(doc, page_indexes: Iterable[int]) -> List[str]:
     if not ocr:
         return []
 
-    import fitz
-
     extracted: List[str] = []
     for page_index in page_indexes:
         tmp_path = ""
+        page = None
         try:
             page = doc[page_index]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.render(scale=2).to_pil()
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp_path = tmp.name
-            pix.save(tmp_path)
+            pix.save(tmp_path, format="PNG")
             result = _run_paddle_ocr(ocr, tmp_path)
             page_text = _normalize_text("\n".join(_flatten_ocr_result(result)))
             if page_text:
@@ -161,6 +225,11 @@ def _ocr_pdf_pages(doc, page_indexes: Iterable[int]) -> List[str]:
         except Exception:
             logger.debug("PaddleOCR page %s failed", page_index)
         finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
             if tmp_path and os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
@@ -214,6 +283,8 @@ def _flatten_ocr_result(value: Any) -> List[str]:
 def _parse_docx_with_python_docx(file_path: str) -> ResumeParseResult:
     from docx import Document  # type: ignore[import-not-found]
 
+    with open(file_path, "rb") as resume_file:
+        validate_resume_bytes(resume_file.read(), ".docx")
     doc = Document(file_path)
     parts = [para.text for para in doc.paragraphs if para.text and para.text.strip()]
     for table in doc.tables:
@@ -239,9 +310,12 @@ def parse_resume_structured(file_path: str, *, fast: bool = False) -> Dict[str, 
     ext = os.path.splitext(file_path)[1].lower()
     errors: List[str] = []
 
+    with open(file_path, "rb") as resume_file:
+        validate_resume_bytes(resume_file.read(), ext)
+
     try:
         if ext == ".pdf":
-            result = _parse_pdf_with_pymupdf(file_path, allow_ocr=not fast)
+            result = _parse_pdf_with_pdfium(file_path, allow_ocr=not fast)
         elif ext == ".docx":
             result = _parse_docx_with_python_docx(file_path)
         else:
@@ -250,6 +324,8 @@ def parse_resume_structured(file_path: str, *, fast: bool = False) -> Dict[str, 
         parsed["metadata"]["fast"] = fast
         parsed["metadata"]["errors"] = errors
         return parsed
+    except ValueError:
+        raise
     except Exception as exc:
         errors.append(f"parser: {type(exc).__name__}")
         logger.error("All resume parsers failed")

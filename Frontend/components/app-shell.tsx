@@ -7,8 +7,6 @@ import {
   FileText,
   BarChart3,
   Settings,
-  LogOut,
-  Flame,
   Sun,
   Moon,
   Upload,
@@ -18,11 +16,8 @@ import {
   Edit3,
   Save,
   Play,
-  CreditCard,
   Eye,
   Loader2,
-  Send,
-  Star,
   Target,
   PanelLeft,
   Copy,
@@ -35,17 +30,7 @@ import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { toast } from "sonner"
-import { safeStorageGet, safeStorageRemove, safeStorageSet } from "@/lib/safe-storage"
-import { Tabs, TabsContent } from "@/components/ui/tabs"
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog"
-import { AuthUser } from "@/lib/auth"
+import { safeStorageGet, safeStorageSet } from "@/lib/safe-storage"
 import { PremiumBackground } from "./premium-background"
 import {
   releaseTechnicalPermissions,
@@ -55,18 +40,19 @@ import {
   submitResume,
   startInterviewFromBlueprint,
   cancelInterviewSession,
-  createSupportSubmission,
-  fetchPaymentPlans,
   fetchTechnicalRoundHistory,
   fetchLearningDashboard,
   reconcilePerformance,
   prepareTechnicalRounds,
   copyInterviewJobProfile,
+  fetchLocalSettings,
 } from "@/lib/api"
 import type { ExactImproveTarget, InterviewBlueprint, InterviewProfileType, LearningDashboard, TechnicalRoundHistoryItem, TechnicalRoundSession } from "@/lib/api"
 import { useResume } from "@/context/resume-context"
 import type { ResumeData } from "@/types/resume"
 import { RESUME_MAX_FILE_BYTES } from "@/lib/config"
+import { ProviderSettings } from "@/components/settings/provider-settings"
+import { DataPrivacy } from "@/components/settings/data-privacy"
 
 const LazyMissionImproveContent = lazy(() =>
   import("@/components/improve/improve-content").then((module) => ({ default: module.ImproveContent }))
@@ -98,15 +84,12 @@ function isSupportedResumeFile(file: File) {
   )
 }
 interface AppShellProps {
-  onLogout: () => void
-  onUserUpdate?: (updates: Partial<AuthUser>) => void
   theme?: "light" | "dark"
   onToggleTheme?: () => void
-  user?: AuthUser | null
   initialTab?: string
   initialImproveTarget?: ExactImproveTarget | null
 }
-type ActiveNav = "improve" | "interview" | "coding" | "resume" | "performance" | "membership" | "settings"
+type ActiveNav = "improve" | "interview" | "coding" | "resume" | "performance" | "settings"
 const primaryNavItems: { icon: any; label: string; id: ActiveNav }[] = [
   { icon: FileText, label: "Resume", id: "resume" },
   { icon: Play, label: "Interview Round", id: "interview" },
@@ -160,9 +143,26 @@ export interface PastInterview {
     can_copy?: boolean
   } | null
 }
-function isPaidPlanType(planType?: string | null) {
-  const normalized = (planType || "starter").toLowerCase()
-  return normalized.includes("premium") || normalized.includes("pro")
+
+function safeResumeLink(value: string, kind: "linkedin" | "github" | "portfolio") {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(/^https:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`)
+    if (parsed.protocol !== "https:") return null
+    const host = parsed.hostname.toLowerCase()
+    if (kind === "linkedin" && host !== "linkedin.com" && !host.endsWith(".linkedin.com")) return null
+    if (kind === "github" && host !== "github.com" && !host.endsWith(".github.com")) return null
+    return parsed.toString()
+  } catch {
+    return null
+  }
+}
+
+function ResumeExternalLink({ value, kind }: { value: string; kind: "linkedin" | "github" | "portfolio" }) {
+  const href = safeResumeLink(value, kind)
+  if (!href) return <span className="truncate text-sm text-muted-foreground">Invalid or unsafe link</span>
+  return <a href={href} target="_blank" rel="noopener noreferrer" className="truncate text-sm text-primary hover:underline">{value}</a>
 }
 
 function mapResumeDataToDashboard(data: ResumeData): DashboardResumeData {
@@ -251,22 +251,6 @@ function normalizeTechnicalSessions(data: {
 
 export { InterviewContent, ResumeContent }
 
-function isPlanStartError(message: string) {
-  const lower = message.toLowerCase()
-  return (
-    lower.includes("limit reached") ||
-    lower.includes("no interviews remaining") ||
-    lower.includes("no credits") ||
-    lower.includes("technical rounds are locked") ||
-    lower.includes("requires the premium plan") ||
-    lower.includes("require the premium plan") ||
-    lower.includes("require the pro or premium plan") ||
-    lower.includes("your plan includes") ||
-    lower.includes("purchase") ||
-    lower.includes("upgrade")
-  )
-}
-
 function isProfileStartError(message: string) {
   const lower = message.toLowerCase()
   return lower.includes("profile") || lower.includes("missing")
@@ -297,13 +281,6 @@ function InterviewContent({
   const [profileRevision, setProfileRevision] = useState(0)
   const [copyingInterviewId, setCopyingInterviewId] = useState<string | number | null>(null)
   const [copiedInterviewIds, setCopiedInterviewIds] = useState<Set<string | number>>(() => new Set())
-  const openBillingSettings = () => {
-    if (typeof window !== "undefined") {
-      safeStorageSet("session", "settings_tab", "billing")
-    }
-    setActiveNav("settings")
-  }
-
   const loadTechnicalRounds = useCallback(async () => {
     if (mode !== "technical") return
     setLoadingTechnicalRounds(true)
@@ -337,7 +314,7 @@ function InterviewContent({
         createClientIdempotencyKey("mock-start"),
         {
           input_mode: runtime.inputMode,
-          camera_mode: "required",
+          camera_mode: "optional",
           preflight_id: preflightId,
         },
       )
@@ -345,17 +322,14 @@ function InterviewContent({
       if (!interviewId) throw new Error("The server did not return an interview ID.")
       setMockStartMessage("Opening interview room")
       const params = new URLSearchParams({
-        mode: "mock-voice",
+        mode: runtime.inputMode === "voice" ? "mock-voice" : "mock-ai",
         input: runtime.inputMode,
-        camera: "required",
+        camera: "optional",
       })
       router.push(`/interview/${interviewId}?${params.toString()}`)
     } catch (error: any) {
       const msg = error?.message || "Failed to start mock interview."
-      if (isPlanStartError(msg)) {
-        toast.error(msg)
-        openBillingSettings()
-      } else if (isProfileStartError(msg)) {
+      if (isProfileStartError(msg)) {
         toast.error(msg)
         setActiveNav("resume")
       } else {
@@ -384,7 +358,7 @@ function InterviewContent({
       const response = await startInterviewFromBlueprint(
         blueprint.blueprint_id,
         createClientIdempotencyKey("technical-start"),
-        { input_mode: "text", camera_mode: "required", preflight_id: preflightId },
+        { input_mode: "text", camera_mode: "optional", preflight_id: preflightId },
       )
       interviewId = response.interview_id || response.session_id
       if (!interviewId) throw new Error("The server did not return an interview ID.")
@@ -402,10 +376,7 @@ function InterviewContent({
       await releaseTechnicalPermissions()
       const msg = error?.message || "Failed to start technical interview."
       setTechnicalPermissionError(msg)
-      if (isPlanStartError(msg)) {
-        toast.error(msg)
-        openBillingSettings()
-      } else if (isProfileStartError(msg)) {
+      if (isProfileStartError(msg)) {
         toast.error(msg)
         setActiveNav("resume")
       } else {
@@ -417,7 +388,14 @@ function InterviewContent({
     }
   }
 
-  const formatDate = (value: string | null) => value ? new Date(value).toLocaleDateString() : "Not recorded"
+  const formatDate = (value: string | null) => value
+    ? new Date(value).toLocaleDateString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+      })
+    : "Not recorded"
 
   const formatActivityDate = (value: string | null | undefined) => {
     if (!value) return "Not recorded"
@@ -635,9 +613,9 @@ function InterviewContent({
       ) : (
       <div className="dashboard-card overflow-hidden p-0">
         <div className={!hasPastInterviews ? "p-5" : "border-b border-border/20 p-6"}>
-          <h3 className="text-base font-semibold text-foreground">Past Interviews</h3>
+          <h3 className="text-base font-semibold text-foreground">Recent Interviews</h3>
           {!hasPastInterviews && (
-            <p className="mt-1 text-sm text-muted-foreground">Your completed interview rounds will appear here.</p>
+            <p className="mt-1 text-sm text-muted-foreground">Your recent interview attempts will appear here.</p>
           )}
         </div>
         {hasPastInterviews && <div className="max-w-full overflow-x-auto">
@@ -1034,7 +1012,7 @@ function ResumeContent() {
                   {isEditing ? (
                     <Input value={editData.linkedin} onChange={(e) => setEditData({ ...editData, linkedin: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
-                    <a href={resumeData.linkedin} target="_blank" rel="noreferrer" className="truncate text-sm text-primary hover:underline">{resumeData.linkedin}</a>
+                    <ResumeExternalLink value={resumeData.linkedin} kind="linkedin" />
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
@@ -1042,7 +1020,7 @@ function ResumeContent() {
                   {isEditing ? (
                     <Input value={editData.github} onChange={(e) => setEditData({ ...editData, github: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
-                    <a href={resumeData.github} target="_blank" rel="noreferrer" className="truncate text-sm text-primary hover:underline">{resumeData.github}</a>
+                    <ResumeExternalLink value={resumeData.github} kind="github" />
                   )}
                 </div>
                 <div className="flex flex-col gap-1.5">
@@ -1050,7 +1028,7 @@ function ResumeContent() {
                   {isEditing ? (
                     <Input value={editData.portfolio} onChange={(e) => setEditData({ ...editData, portfolio: e.target.value })} className="h-9 bg-secondary/50" />
                   ) : (
-                    <a href={resumeData.portfolio} target="_blank" rel="noreferrer" className="truncate text-sm text-primary hover:underline">{resumeData.portfolio}</a>
+                    <ResumeExternalLink value={resumeData.portfolio} kind="portfolio" />
                   )}
                 </div>
               </div>
@@ -1303,492 +1281,18 @@ function ResumeContent() {
 }
 
 
-function SettingsContent({
-  onOpenLogout,
-  onOpenMembership,
-  user,
-  onUserUpdate,
-}: {
-  onOpenLogout: () => void
-  onOpenMembership: () => void
-  user?: AuthUser | null
-  onUserUpdate?: (updates: Partial<AuthUser>) => void
-}) {
-  const [bugTitle, setBugTitle] = useState("")
-  const [bugMessage, setBugMessage] = useState("")
-  const [bugSteps, setBugSteps] = useState("")
-  const [bugInterviewId, setBugInterviewId] = useState("")
-  const [feedbackMessage, setFeedbackMessage] = useState("")
-  const [feedbackRating, setFeedbackRating] = useState<number>(0)
-  const [submittingBug, setSubmittingBug] = useState(false)
-  const [submittingFeedback, setSubmittingFeedback] = useState(false)
-
-  const submitBugReport = async () => {
-    if (!bugTitle.trim() || !bugMessage.trim()) {
-      toast.error("Add a title and a clear bug description.")
-      return
-    }
-
-    try {
-      setSubmittingBug(true)
-      await createSupportSubmission({
-        kind: "bug",
-        title: bugTitle.trim(),
-        message: bugMessage.trim(),
-        steps: bugSteps.trim() || undefined,
-        interview_id: bugInterviewId.trim() || undefined,
-        page_url: typeof window !== "undefined" ? window.location.pathname : undefined,
-      })
-      toast.success("Bug report submitted.")
-      setBugTitle("")
-      setBugMessage("")
-      setBugSteps("")
-      setBugInterviewId("")
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to submit bug report.")
-    } finally {
-      setSubmittingBug(false)
-    }
-  }
-
-  const submitFeedback = async () => {
-    if (!feedbackMessage.trim()) {
-      toast.error("Add some feedback before sending.")
-      return
-    }
-
-    try {
-      setSubmittingFeedback(true)
-      await createSupportSubmission({
-        kind: "feedback",
-        message: feedbackMessage.trim(),
-        rating: feedbackRating || undefined,
-        page_url: typeof window !== "undefined" ? window.location.pathname : undefined,
-      })
-      toast.success("Feedback sent.")
-      setFeedbackMessage("")
-      setFeedbackRating(0)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to send feedback.")
-    } finally {
-      setSubmittingFeedback(false)
-    }
-  }
-
-  const [AccountTab, setAccountTab] = useState<any>(null)
-  const [NotificationsTab, setNotificationsTab] = useState<any>(null)
-  const [BillingTab, setBillingTab] = useState<any>(null)
-  const [PrivacyTab, setPrivacyTab] = useState<any>(null)
-
-  useEffect(() => {
-    import("@/components/settings/account-tab").then(m => setAccountTab(() => m.AccountTab))
-    import("@/components/settings/notifications-tab").then(m => setNotificationsTab(() => m.NotificationsTab))
-    import("@/components/settings/billing-tab").then(m => setBillingTab(() => m.BillingTab))
-    import("@/components/settings/privacy-tab").then(m => setPrivacyTab(() => m.PrivacyTab))
-  }, [])
-
-  const [settingsTab, setSettingsTab] = useState<
-    "account" | "notifications" | "billing" | "privacy" | "support"
-  >(() => {
-    if (typeof window === "undefined") return "account"
-    return safeStorageGet("session", "settings_tab") === "billing" ? "billing" : "account"
-  })
-
-  useEffect(() => {
-    if (typeof window === "undefined") return
-    const requested = safeStorageGet("session", "settings_tab")
-    if (requested === "billing") {
-      setSettingsTab("billing")
-      safeStorageRemove("session", "settings_tab")
-    }
-  }, [])
-
-  const settingsTabOptions = [
-    { value: "account" as const, label: "Account" },
-    { value: "notifications" as const, label: "Notifications" },
-    { value: "billing" as const, label: "Billing" },
-    { value: "privacy" as const, label: "Privacy & Data" },
-    { value: "support" as const, label: "Support" },
-  ]
-
+function SettingsContent() {
   return (
     <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
-      <Tabs value={settingsTab} onValueChange={(value) => setSettingsTab(value as typeof settingsTab)} className="w-full">
-        <SlidingSegmentControl
-          ariaLabel="Settings sections"
-          options={settingsTabOptions}
-          value={settingsTab}
-          onValueChange={setSettingsTab}
-          className="dashboard-tabs mb-6 w-full max-w-full gap-1 rounded-2xl border-0 bg-card p-1.5 shadow-[0_14px_36px_rgba(15,23,42,0.06)] dark:shadow-[0_16px_38px_rgba(0,0,0,0.2)]"
-          buttonClassName="h-9 px-3.5"
-        />
-        <TabsContent value="account">
-          {AccountTab ? <AccountTab user={user} onAccountDeleted={onOpenLogout} onAccountUpdated={onUserUpdate} /> : <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}
-        </TabsContent>
-        <TabsContent value="notifications">
-          {NotificationsTab ? <NotificationsTab /> : <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}
-        </TabsContent>
-        <TabsContent value="billing">
-          {BillingTab ? <BillingTab user={user} onOpenMembership={onOpenMembership} /> : <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}
-        </TabsContent>
-        <TabsContent value="privacy">
-          {PrivacyTab ? <PrivacyTab /> : <div className="flex justify-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>}
-        </TabsContent>
-        <TabsContent value="support">
-          <div className="space-y-6">
-            <div className="dashboard-card">
-              <h3 className="mb-1 text-sm font-semibold text-foreground">Report a Bug</h3>
-              <p className="mb-5 text-xs text-muted-foreground">Found something broken? Send it into the support inbox with enough detail to reproduce it. Valid bug reports can earn a reward.</p>
-              <div className="space-y-4">
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Bug Title</Label>
-                  <Input value={bugTitle} onChange={(event) => setBugTitle(event.target.value)} placeholder="e.g. Report page breaks after completing a mock interview" className="h-9" />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Description</Label>
-                  <Textarea value={bugMessage} onChange={(event) => setBugMessage(event.target.value)} placeholder="Describe what happened, what you expected, and what actually occurred..." rows={5} />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Steps to Reproduce (optional)</Label>
-                  <Textarea value={bugSteps} onChange={(event) => setBugSteps(event.target.value)} placeholder={"1. Go to...\n2. Click on...\n3. See error..."} rows={4} />
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Interview ID (optional)</Label>
-                  <Input value={bugInterviewId} onChange={(event) => setBugInterviewId(event.target.value)} placeholder="Attach the interview ID if this bug is tied to one session" className="h-9" />
-                </div>
-                <Button className="gap-2" onClick={submitBugReport} disabled={submittingBug}>
-                  {submittingBug ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  Submit Bug Report
-                </Button>
-              </div>
-            </div>
-
-            <div className="dashboard-card">
-              <h3 className="mb-1 text-sm font-semibold text-foreground">Send Feedback</h3>
-              <p className="mb-5 text-xs text-muted-foreground">Tell us what is helping, what is weak, and what students need more of.</p>
-              <div className="space-y-4">
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">How would you rate your experience?</Label>
-                  <div className="flex gap-1">
-                    {[1, 2, 3, 4, 5].map((n) => (
-                      <button key={n} type="button" onClick={() => setFeedbackRating(n)} aria-label={`Rate ${n} out of 5`} aria-pressed={feedbackRating === n}
-                        className={`group flex h-10 w-10 items-center justify-center rounded-lg border transition-all ${feedbackRating >= n ? "border-primary/40 bg-primary/10" : "border-border/40 bg-secondary/20 hover:bg-primary/10 hover:border-primary/30"}`}>
-                        <Star className={`h-4 w-4 transition-colors ${feedbackRating >= n ? "fill-primary text-primary" : "text-muted-foreground group-hover:text-primary"}`} />
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="flex flex-col gap-1.5">
-                  <Label className="text-xs text-muted-foreground">Your Feedback</Label>
-                  <Textarea value={feedbackMessage} onChange={(event) => setFeedbackMessage(event.target.value)} placeholder="What do you love? What could be better? Any features you'd like to see?" rows={5} />
-                </div>
-                <Button className="gap-2" onClick={submitFeedback} disabled={submittingFeedback}>
-                  {submittingFeedback ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                  Send Feedback
-                </Button>
-              </div>
-            </div>
-
-            {user?.is_admin && (
-              <div className="dashboard-card">
-                <h3 className="text-sm font-semibold text-foreground">Admin Inbox</h3>
-                <p className="mt-1 text-xs text-muted-foreground">Your account has admin access. Open the hidden support inbox route.</p>
-                <Button className="mt-4" variant="outline" onClick={() => window.location.assign("/admin/bugs")}>
-                  Open Support Inbox
-                </Button>
-              </div>
-            )}
-          </div>
-        </TabsContent>
-      </Tabs>
-    </div>
-  )
-}
-function MembershipContent() {
-  const router = useRouter()
-  const [billing, setBilling] = useState<"monthly" | "annual">("monthly")
-  const [plans, setPlans] = useState<any[]>([])
-  const [checkoutReady, setCheckoutReady] = useState(true)
-  const isAnnual = billing === "annual"
-  useEffect(() => {
-    fetchPaymentPlans()
-      .then((data) => {
-        setPlans(Array.isArray(data) ? data : data.plans || [])
-        setCheckoutReady(Array.isArray(data) ? true : data.checkout_ready !== false)
-      })
-      .catch(() => setPlans([]))
-  }, [])
-  const planByType = Object.fromEntries(plans.map((plan) => [plan.plan_type, plan]))
-
-  interface FeatureItem {
-    text: string
-    included: boolean
-    upgradeText?: string
-  }
-
-  const starterFeatures: FeatureItem[] = [
-    ...(planByType.starter?.features || [
-      "1 AI Mock Interview per week",
-      "Personalised Performance Report",
-      "Targeted Improve drills",
-    ]).map((feature: any) => typeof feature === "string" ? { text: feature, included: true } : feature),
-    { text: "Technical Assessments", included: false, upgradeText: "Pro" },
-  ]
-
-  const proFeatures: FeatureItem[] = [
-    ...(planByType.pro?.features || [
-      "3 AI Mock Interviews per week",
-      "1 Technical Assessment per week",
-      "Custom Mock Interview (JD-Based)",
-      "Personalised Performance Reports",
-    ]).map((feature: any) => typeof feature === "string" ? { text: feature, included: true } : feature),
-    { text: "Custom Technical Round (JD-Based)", included: false, upgradeText: "Premium" },
-  ]
-
-  const premiumFeatures: FeatureItem[] = (planByType.premium?.features || [
-    "5 AI Mock Interviews per week",
-    "3 Technical Assessments per week",
-    "Custom Mock Interview (JD-Based)",
-    "Custom Technical Round (JD-Based)",
-  ]).map((feature: any) => typeof feature === "string" ? { text: feature, included: true } : feature)
-
-  const proPricing = { monthly: planByType.pro?.amount || 999, annual: Math.round((planByType.pro_annual?.amount || 9588) / 12), annualBilled: planByType.pro_annual?.amount || 9588 }
-  const premiumPricing = { monthly: planByType.premium?.amount || 1499, annual: Math.round((planByType.premium_annual?.amount || 14388) / 12), annualBilled: planByType.premium_annual?.amount || 14388 }
-
-  const fmt = (n: number) => `₹${n.toLocaleString("en-IN")}`
-  const selectedProType = isAnnual ? "pro_annual" : "pro"
-  const selectedPremiumType = isAnnual ? "premium_annual" : "premium"
-  const purchaseLabel = (planType: string, upgradeLabel: string) => {
-    const state = planByType[planType]?.purchase_state
-    if (state === "current") return "Current plan"
-    if (state === "unavailable") return "Available after current term"
-    return checkoutReady ? upgradeLabel : "Checkout unavailable"
-  }
-  const canPurchase = (planType: string) => checkoutReady && planByType[planType]?.purchase_state === "upgrade"
-
-  return (
-    <div className="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6 md:p-8">
-      <div className="mb-6 rounded-xl card-elevated p-7">
-        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-          <div>
-            <h2 className="mt-2 text-2xl font-semibold tracking-tight text-foreground">Plans for every stage of prep.</h2>
-            <p className="mt-3 text-sm font-medium text-primary">
-              Early Bird: register by 31 August 2026 to get Premium free for 30 days.
-            </p>
-          </div>
-          <div className="flex flex-wrap gap-2 text-xs font-medium text-muted-foreground">
-            <span className="rounded-md border border-border/50 bg-secondary/20 px-3 py-1.5">Cancel anytime</span>
-            <span className="rounded-md border border-border/50 bg-secondary/20 px-3 py-1.5">No commitment</span>
-          </div>
+      <div className="mx-auto max-w-2xl space-y-6">
+        <div className="flex items-center justify-between rounded-lg border border-border/60 bg-secondary/20 px-4 py-3 text-sm">
+          <span className="text-muted-foreground">PrepMate 0.1.0-alpha.1 · local desktop app</span>
+          <a className="text-primary underline" href="/about">About and release details</a>
         </div>
-      </div>
-
-
-      <div className="dashboard-card mb-6 flex items-center justify-center gap-3">
-        <span className={`text-sm font-medium transition-colors ${!isAnnual ? "text-foreground" : "text-muted-foreground"}`}>Monthly</span>
-        <button
-          onClick={() => setBilling(isAnnual ? "monthly" : "annual")}
-          className="relative h-7 w-[52px] rounded-full bg-secondary border border-border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-          aria-label="Toggle billing cycle"
-        >
-          <span className={`absolute top-0.5 left-0.5 h-6 w-6 rounded-full bg-primary shadow-md transition-transform duration-300 ${isAnnual ? "translate-x-[24px]" : "translate-x-0"}`} />
-        </button>
-        <span className={`text-sm font-medium transition-colors ${isAnnual ? "text-foreground" : "text-muted-foreground"}`}>Annual</span>
-        <span className={`ml-1 inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-bold transition-all duration-300 ${isAnnual ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 scale-100 opacity-100" : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 scale-90 opacity-0 pointer-events-none"}`}>
-          Save 20%
-        </span>
-      </div>
-
-      <div className="grid gap-4 lg:grid-cols-3">
-
-
-        <div className="flex flex-col rounded-xl card-elevated p-7">
-          <div className="mb-5">
-              <h3 className="text-lg font-semibold text-foreground">Free</h3>
-          </div>
-          <div className="mb-3">
-            <div className="flex items-baseline gap-1">
-              <span className="text-3xl font-bold tracking-tight text-foreground">Free</span>
-            </div>
-          </div>
-          <div className="flex-1 space-y-2.5">
-            {starterFeatures.map((f) => (
-              <div key={f.text} className="flex items-start gap-2.5 text-sm">
-                {f.included ? (
-                  <>
-                    <Check className="h-4 w-4 shrink-0 text-emerald-500 mt-0.5" />
-                    <span className="text-foreground">{f.text}</span>
-                  </>
-                ) : (
-                  <>
-                    <X className="h-4 w-4 shrink-0 text-rose-500/80 mt-0.5" />
-                    <span className="text-muted-foreground/50 line-through decoration-muted-foreground/30">
-                      {f.text}
-                      <span className="text-xs ml-1.5 font-bold text-rose-500/70 not-italic">({f.upgradeText})</span>
-                    </span>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-          <Button className="mt-6 w-full rounded-lg" variant="outline" disabled={planByType.starter?.purchase_state !== "current"} onClick={() => router.push("/?tab=interview")}>
-            {planByType.starter?.purchase_state === "current" ? "Current plan" : "Available after current term"}
-          </Button>
-        </div>
-
-
-        <div className="dashboard-card flex flex-col ring-1 ring-primary/25">
-          <div className="mb-5 flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-lg font-semibold text-foreground">Pro</h3>
-            </div>
-            <span className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-bold text-primary">Most popular</span>
-          </div>
-          <div className="mb-3">
-            <div className="flex items-baseline gap-2">
-              <span className={`font-bold tracking-tight transition-all duration-500 ease-out ${
-                isAnnual
-                  ? "text-lg text-muted-foreground line-through opacity-60"
-                  : "text-3xl text-foreground"
-              }`}>
-                {fmt(proPricing.monthly)}
-              </span>
-              <span className={`font-bold tracking-tight transition-all duration-500 ease-out origin-left ${
-                isAnnual
-                  ? "text-3xl text-foreground opacity-100 translate-x-0 max-w-[150px] scale-100"
-                  : "text-lg text-transparent opacity-0 -translate-x-2 max-w-0 scale-75 pointer-events-none"
-              } overflow-hidden whitespace-nowrap`}>
-                {fmt(proPricing.annual)}
-              </span>
-              <span className="text-sm text-muted-foreground">/ month</span>
-            </div>
-            {isAnnual && <p className="mt-1 text-xs font-medium text-muted-foreground">billed {fmt(proPricing.annualBilled)} / year</p>}
-          </div>
-          <div className="flex-1 space-y-2.5">
-            {proFeatures.map((f) => (
-              <div key={f.text} className="flex items-start gap-2.5 text-sm">
-                {f.included ? (
-                  <>
-                    <Check className="h-4 w-4 shrink-0 text-emerald-500 mt-0.5" />
-                    <span className="text-foreground">{f.text}</span>
-                  </>
-                ) : (
-                  <>
-                    <X className="h-4 w-4 shrink-0 text-rose-500/80 mt-0.5" />
-                    <span className="text-muted-foreground/50 line-through decoration-muted-foreground/30">
-                      {f.text}
-                      <span className="text-xs ml-1.5 font-bold text-rose-500/70 not-italic">({f.upgradeText})</span>
-                    </span>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-          <Button className="mt-6 w-full rounded-lg" variant="default" disabled={!canPurchase(selectedProType)} onClick={() => router.push(`/checkout?plan=${selectedProType}`)}>
-            {purchaseLabel(selectedProType, "Upgrade to Pro")}
-          </Button>
-        </div>
-
-
-        <div className="flex flex-col rounded-xl card-elevated p-7">
-          <div className="mb-5 flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-lg font-semibold text-foreground">Premium</h3>
-            </div>
-            <span className="shrink-0 rounded-md bg-primary/10 px-2.5 py-1 text-xs font-semibold text-primary">Full package</span>
-          </div>
-          <div className="mb-3">
-            <div className="flex items-baseline gap-2">
-              <span className={`font-bold tracking-tight transition-all duration-500 ease-out ${
-                isAnnual
-                  ? "text-lg text-muted-foreground line-through opacity-60"
-                  : "text-3xl text-foreground"
-              }`}>
-                {fmt(premiumPricing.monthly)}
-              </span>
-              <span className={`font-bold tracking-tight transition-all duration-500 ease-out origin-left ${
-                isAnnual
-                  ? "text-3xl text-foreground opacity-100 translate-x-0 max-w-[150px] scale-100"
-                  : "text-lg text-transparent opacity-0 -translate-x-2 max-w-0 scale-75 pointer-events-none"
-              } overflow-hidden whitespace-nowrap`}>
-                {fmt(premiumPricing.annual)}
-              </span>
-              <span className="text-sm text-muted-foreground">/ month</span>
-            </div>
-            {isAnnual && <p className="mt-1 text-xs font-medium text-muted-foreground">billed {fmt(premiumPricing.annualBilled)} / year</p>}
-          </div>
-          <div className="mb-5 rounded-lg border border-primary/20 bg-primary/5 px-3 py-2 text-xs font-medium text-primary">
-            Register by 31 August 2026 and your first 30 days of Premium are free.
-          </div>
-          <div className="flex-1 space-y-2.5">
-            {premiumFeatures.map((f) => (
-              <div key={f.text} className="flex items-start gap-2.5 text-sm">
-                {f.included ? (
-                  <>
-                    <Check className="h-4 w-4 shrink-0 text-emerald-500 mt-0.5" />
-                    <span className="text-foreground">{f.text}</span>
-                  </>
-                ) : (
-                  <>
-                    <X className="h-4 w-4 shrink-0 text-rose-500/80 mt-0.5" />
-                    <span className="text-muted-foreground/50 line-through decoration-muted-foreground/30">
-                      {f.text}
-                      <span className="text-xs ml-1.5 font-bold text-rose-500/70 not-italic">({f.upgradeText})</span>
-                    </span>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-          <Button className="mt-6 w-full rounded-lg" variant="default" disabled={!canPurchase(selectedPremiumType)} onClick={() => router.push(`/checkout?plan=${selectedPremiumType}`)}>
-            {purchaseLabel(selectedPremiumType, "Upgrade to Premium")}
-          </Button>
-        </div>
+        <ProviderSettings />
+        <DataPrivacy />
       </div>
     </div>
-  )
-}
-function LogoutModal({
-  open,
-  onOpenChange,
-  onConfirm
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  onConfirm: () => void
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm border-border bg-card">
-        <DialogHeader>
-          <DialogTitle className="text-lg font-bold text-foreground">
-            Are you sure you want to log out?
-          </DialogTitle>
-          <DialogDescription className="mt-2 text-sm text-muted-foreground">
-            Your progress and history are safely stored. You can log back in anytime.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter className="mt-4 flex gap-3">
-          <Button
-            variant="outline"
-            className="flex-1"
-            onClick={() => onOpenChange(false)}
-          >
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            className="flex-1"
-            onClick={() => {
-              onOpenChange(false)
-              onConfirm()
-            }}
-          >
-            Log Out
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }
 
@@ -1817,7 +1321,7 @@ function StartPreparationOverlay({
   )
 }
 
-export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme, user, initialTab, initialImproveTarget = null }: AppShellProps) {
+export function AppShell({ theme = "dark", onToggleTheme, initialTab, initialImproveTarget = null }: AppShellProps) {
   const normalizeNav = (value?: string | null): ActiveNav | null => {
     switch (value) {
       case "dashboard":
@@ -1834,8 +1338,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
       case "resume":
       case "settings":
         return value
-      case "membership":
-        return "membership"
       default:
         return null
     }
@@ -1859,36 +1361,19 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
     setRefreshTrigger((value) => value + 1)
     safeStorageSet("session", "dashboard_tab", nav)
   }
-  const [showLogout, setShowLogout] = useState(false)
-  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
-  const accountMenuRef = useRef<HTMLDivElement>(null)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sidebarHovered, setSidebarHovered] = useState(false)
   const isExpanded = !sidebarCollapsed || sidebarHovered
-  useEffect(() => {
-    if (!accountMenuOpen) return
-    const closeOnOutsideClick = (event: MouseEvent) => {
-      if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false)
-    }
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setAccountMenuOpen(false)
-    }
-    document.addEventListener("mousedown", closeOnOutsideClick)
-    document.addEventListener("keydown", closeOnEscape)
-    return () => {
-      document.removeEventListener("mousedown", closeOnOutsideClick)
-      document.removeEventListener("keydown", closeOnEscape)
-    }
-  }, [accountMenuOpen])
   const { justParsed } = useResume()
   const [learning, setLearning] = useState<LearningDashboard | null>(null)
   const [learningLoading, setLearningLoading] = useState(true)
   const [learningError, setLearningError] = useState("")
   const learningReconcileAttemptedRef = useRef(false)
   const [interviews, setInterviews] = useState<PastInterview[]>([])
-  const [streakDays, setStreakDays] = useState(0)
   const [improveTarget, setImproveTarget] = useState<ExactImproveTarget | null>(initialImproveTarget)
+  const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null)
+  const navigationItems = primaryNavItems
   useEffect(() => {
     if (typeof window === "undefined") return
     if (activeNav !== "improve") {
@@ -1948,18 +1433,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
           setLearningError(learningResult.error)
         }
         if (activityData && activityData.activities) {
-          const activityDates = new Set(
-            activityData.activities
-              .filter((act: any) => act.created_at)
-              .map((act: any) => new Date(act.created_at).toDateString())
-          )
-          let streak = 0
-          const cursorDate = new Date()
-          while (activityDates.has(cursorDate.toDateString())) {
-            streak += 1
-            cursorDate.setDate(cursorDate.getDate() - 1)
-          }
-          setStreakDays(streak)
           setInterviews(
             activityData.activities.map((act: any) => ({
               id: act.id || act.interview_id || act.entity_id,
@@ -1983,18 +1456,36 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
         setLearningLoading(false)
       }
     }
-    if (activeNav === "improve" || activeNav === "interview" || activeNav === "coding") {
+    if (activeNav === "improve" || activeNav === "interview" || activeNav === "coding" || activeNav === "performance") {
       loadDashboardData()
     }
   }, [activeNav, refreshTrigger])
 
+  useEffect(() => {
+    let cancelled = false
+    void fetchLocalSettings()
+      .then((settings) => {
+        if (!cancelled) setProviderConfigured(Boolean(settings.has_api_key || settings.requires_api_key === false))
+      })
+      .catch(() => undefined)
+    return () => { cancelled = true }
+  }, [activeNav])
+
   // Poll for generating reports dynamically
   useEffect(() => {
-    const hasGenerating = interviews.some((i) => i.cta?.nav === "generating")
+    const isGeneratingReport = (interview: PastInterview) => {
+      const status = String(interview.status || "").toLowerCase()
+      return interview.cta?.nav === "report" && (
+        ["analysis_pending", "analysis_queued", "analysis_running", "analyzing", "uploading"].includes(status)
+        || String(interview.cta?.label || "").toLowerCase().includes("progress")
+      )
+    }
+    const hasGenerating = interviews.some(isGeneratingReport)
     if (!hasGenerating) return
 
     let isPolling = true
     const interval = setInterval(async () => {
+      if (document.hidden) return
       try {
         const { fetchRecentActivity } = await import("@/lib/api")
         const activityData = await fetchRecentActivity().catch(() => null)
@@ -2017,9 +1508,9 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
 
           // Check if any generating interview changed to something else
           const statusChanged = interviews.some((oldInt) => {
-            if (oldInt.cta?.nav !== "generating") return false
+            if (!isGeneratingReport(oldInt)) return false
             const newInt = newInterviews.find((n: any) => n.id === oldInt.id)
-            return newInt && newInt.cta?.nav !== "generating"
+            return newInt && !isGeneratingReport(newInt)
           })
 
           if (statusChanged) {
@@ -2050,24 +1541,10 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
       case "coding": return "Technical Round"
       case "resume": return "Resume"
       case "performance": return "Performance"
-      case "membership": return "Membership"
       case "settings": return "Settings"
       default: return "Interview Round"
     }
   }
-  const isPaidPlan = isPaidPlanType(user?.plan_type)
-  const accountName = user?.name?.trim() || user?.email?.split("@")[0] || "User"
-  const accountInitials = accountName
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join("") || "U"
-  const accountMenuItems: { icon: any; label: string; id: ActiveNav }[] = [
-    { icon: CreditCard, label: "Subscription", id: "membership" },
-    { icon: Settings, label: "Settings", id: "settings" },
-  ]
-
   return (
     <>
       <PremiumBackground theme={theme} mode="base" />
@@ -2094,7 +1571,7 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                   ? "ml-3 max-w-[120px] translate-x-0 opacity-100 delay-[120ms] duration-[180ms]"
                   : "ml-0 max-w-0 -translate-x-2 opacity-0 delay-0 duration-150 pointer-events-none"
               }`}>
-                <span className="text-lg font-bold text-foreground">InterAI</span>
+                <span className="text-lg font-bold text-foreground">PrepMate</span>
               </span>
             </a>
             {!sidebarCollapsed ? (
@@ -2128,7 +1605,7 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
           <div className="flex flex-1 flex-col p-2">
             <SlidingSidebarNav
               ariaLabel="Main navigation"
-              items={primaryNavItems}
+              items={navigationItems}
               activeId={activeNav}
               onSelect={setActiveNav}
               collapsed={!isExpanded}
@@ -2155,7 +1632,7 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               className="flex items-center gap-1.5 transition-opacity hover:opacity-80"
             >
               <ThemeLogo size={36} />
-              <span className="text-lg font-bold text-foreground">InterAI</span>
+              <span className="text-lg font-bold text-foreground">PrepMate</span>
             </a>
             <Button
               variant="ghost"
@@ -2170,7 +1647,7 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
           <div className="flex flex-1 flex-col p-3">
             <SlidingSidebarNav
               ariaLabel="Main navigation"
-              items={primaryNavItems}
+              items={navigationItems}
               activeId={activeNav}
               onSelect={(id) => {
                 setActiveNav(id)
@@ -2208,10 +1685,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
               <h1 className="text-lg font-semibold text-foreground">{getPageTitle()}</h1>
             </div>
             <div className="flex items-center gap-4">
-              <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-foreground">
-                <Flame className="h-3.5 w-3.5 text-orange-500" />
-                <span>{streakDays} day{streakDays === 1 ? "" : "s"}</span>
-              </div>
               {onToggleTheme && (
                 <Button
                   variant="ghost"
@@ -2223,103 +1696,27 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                   {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
                 </Button>
               )}
-              <div ref={accountMenuRef} className="relative z-[1000]">
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={() => setAccountMenuOpen((open) => !open)}
-                  className="h-10 w-10 rounded-full border border-border bg-card p-0 hover:bg-accent"
-                  aria-label="Open account menu"
-                  aria-expanded={accountMenuOpen}
-                  aria-haspopup="menu"
-                >
-                  {user?.avatar_url ? (
-                    <img src={user.avatar_url} alt={accountName} className="h-full w-full rounded-full object-cover" />
-                  ) : (
-                    <span className="text-xs font-bold text-primary">{accountInitials}</span>
-                  )}
-                </Button>
-                {accountMenuOpen && (
-                  <div
-                    className={`absolute right-0 top-[calc(100%+0.5rem)] z-[1001] max-h-[calc(100dvh-5rem)] w-[min(260px,calc(100vw-1.5rem))] overflow-y-auto rounded-xl border shadow-xl ${
-                      theme === "dark"
-                        ? "border-white/10 bg-[#2f2f2f] text-white shadow-black/40"
-                        : "border-slate-200 bg-white text-slate-950 shadow-slate-900/15"
-                    }`}
-                    role="menu"
-                  >
-                    <div className="flex w-full items-center gap-2.5 px-3 pb-3 pt-3 text-left">
-                      <div className={`flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full ring-1 ${
-                        theme === "dark" ? "bg-[#1e1e1e] ring-white/10" : "bg-slate-100 ring-slate-200"
-                      }`}>
-                        {user?.avatar_url ? (
-                          <img src={user.avatar_url} alt={accountName} className="h-full w-full object-cover" />
-                        ) : (
-                          <span className={`text-sm font-bold ${theme === "dark" ? "text-white/80" : "text-slate-600"}`}>
-                            {accountInitials}
-                          </span>
-                        )}
-                      </div>
-                      <div className="min-w-0">
-                        <p className="truncate text-base font-semibold leading-5">
-                          {accountName}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="space-y-0.5 px-1.5 pb-1.5">
-                      {accountMenuItems.map(({ icon: Icon, label, id }) => {
-                        const selected = activeNav === id
-                        return (
-                          <button
-                            key={label}
-                            type="button"
-                            role="menuitem"
-                            aria-current={selected ? "page" : undefined}
-                            onClick={() => {
-                              setActiveNav(id)
-                              setAccountMenuOpen(false)
-                            }}
-                            className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium transition-colors ${
-                              selected
-                                ? theme === "dark"
-                                  ? "bg-white/[0.09] text-white"
-                                  : "bg-slate-100 text-slate-950"
-                                : theme === "dark"
-                                  ? "text-white/65 hover:bg-white/[0.06] hover:text-white"
-                                  : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
-                            }`}
-                          >
-                            <Icon className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                            <span>{label}</span>
-                          </button>
-                        )
-                      })}
-
-                      <button
-                        type="button"
-                        role="menuitem"
-                        aria-label="Log out"
-                        onClick={() => {
-                          setAccountMenuOpen(false)
-                          setShowLogout(true)
-                        }}
-                        className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium transition-colors ${
-                          theme === "dark"
-                            ? "text-red-400 hover:bg-red-400/10"
-                            : "text-red-600 hover:bg-red-50"
-                        }`}
-                      >
-                        <LogOut className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                        <span>Sign Out</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setActiveNav("settings")}
+                className="h-10 w-10 rounded-full border border-border bg-card p-0 hover:bg-accent"
+                aria-label="Open local settings"
+              >
+                <Settings className="h-4 w-4 text-muted-foreground" />
+              </Button>
             </div>
           </header>
           <>
+            {providerConfigured === false && activeNav !== "settings" && (
+              <div className="flex items-start justify-between gap-4 border-b border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100 md:px-8">
+                <div>
+                  <p className="font-semibold">Finish local setup before starting a round</p>
+                  <p className="mt-1 text-xs leading-5 opacity-85">Choose a provider or loopback model endpoint in Settings. PrepMate will test the connection before saving it.</p>
+                </div>
+                <Button size="sm" variant="outline" onClick={() => setActiveNav("settings")}>Open Settings</Button>
+              </div>
+            )}
             {(() => {
               switch (activeNav) {
                 case "improve":
@@ -2331,7 +1728,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                         error={learningError}
                         setActiveNav={setActiveNav}
                         onLearningRefresh={refreshLearning}
-                        isPremium={isPaidPlan}
                         navigationTarget={improveTarget}
                         onNavigationConsumed={() => {
                           setImproveTarget(null)
@@ -2359,10 +1755,8 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
                       <LazyPerformanceContent onOpenPractice={(tab) => setActiveNav(tab)} />
                     </Suspense>
                   )
-                case "membership":
-                  return <MembershipContent />
                 case "settings":
-                  return <SettingsContent onOpenLogout={() => setShowLogout(true)} onOpenMembership={() => setActiveNav("membership")} user={user} onUserUpdate={onUserUpdate} />
+                  return <SettingsContent />
                 default:
                   return null
               }
@@ -2370,7 +1764,6 @@ export function AppShell({ onLogout, onUserUpdate, theme = "dark", onToggleTheme
           </>
         </main>
       </div>
-      <LogoutModal open={showLogout} onOpenChange={setShowLogout} onConfirm={onLogout} />
     </>
   )
 }

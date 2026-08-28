@@ -11,6 +11,8 @@ interface InterviewControlsProps {
   onToggleCaptions?: () => void
   endLabel?: string
   cameraLocked?: boolean
+  microphoneAvailable?: boolean
+  captionsAvailable?: boolean
 }
 export function InterviewControls({
   variant = "bar",
@@ -23,23 +25,27 @@ export function InterviewControls({
   onToggleCaptions,
   endLabel = "End Interview",
   cameraLocked = false,
+  microphoneAvailable = true,
+  captionsAvailable = true,
 }: InterviewControlsProps) {
   const toggleCaptions = onToggleCaptions || (() => {})
   const captionsTitle = captionsEnabled ? "Hide captions" : "Show captions"
   if (variant === "meet") {
     return (
       <div className="flex items-center gap-3">
-        <button
-          onClick={onToggleMic}
-          className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-200 ${
-            isMicOn
-              ? "bg-secondary hover:bg-accent text-foreground"
-              : "bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-          }`}
-          title={isMicOn ? "Turn off microphone" : "Turn on microphone"}
-        >
-          {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
-        </button>
+        {microphoneAvailable && (
+          <button
+            onClick={onToggleMic}
+            className={`w-12 h-12 rounded-full flex items-center justify-center transition-all duration-200 ${
+              isMicOn
+                ? "bg-secondary hover:bg-accent text-foreground"
+                : "bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+            }`}
+            title={isMicOn ? "Turn off microphone" : "Turn on microphone"}
+          >
+            {isMicOn ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
+          </button>
+        )}
         <button
           onClick={onToggleVideo}
           disabled={cameraLocked}
@@ -48,18 +54,20 @@ export function InterviewControls({
               ? "bg-secondary hover:bg-accent text-foreground"
               : "bg-destructive hover:bg-destructive/90 text-destructive-foreground"
           }`}
-          title={cameraLocked ? "Camera is required during the interview" : isVideoOn ? "Turn off camera" : "Turn on camera"}
+          title={cameraLocked ? "Camera coaching is unavailable" : isVideoOn ? "Turn off camera" : "Turn on optional camera coaching"}
         >
           {isVideoOn ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
         </button>
-        <button
-          onClick={toggleCaptions}
-          className="w-12 h-12 rounded-full bg-secondary hover:bg-accent text-foreground flex items-center justify-center transition-all duration-200"
-          title={captionsTitle}
-          aria-pressed={captionsEnabled}
-        >
-          <Captions className="h-5 w-5" />
-        </button>
+        {captionsAvailable && (
+          <button
+            onClick={toggleCaptions}
+            className="w-12 h-12 rounded-full bg-secondary hover:bg-accent text-foreground flex items-center justify-center transition-all duration-200"
+            title={captionsTitle}
+            aria-pressed={captionsEnabled}
+          >
+            <Captions className="h-5 w-5" />
+          </button>
+        )}
         <div className="w-px h-8 bg-border mx-1" />
         <button
           onClick={onEndCall}

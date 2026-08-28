@@ -14,7 +14,7 @@ from analysis_pipeline import (
     SESSION_PERFORMANCE_VERSION,
     enqueue_analysis,
 )
-from auth import get_current_user
+from local_runtime import local_user
 from database import async_execute
 
 router = APIRouter(prefix="/api/analysis", tags=["Analysis"])
@@ -64,7 +64,7 @@ def _encode_reconcile_cursor(completed_at: datetime, interview_id: str) -> str:
 async def reconcile_performance(
     cursor: Optional[str] = Query(default=None),
     limit: int = Query(default=25, ge=1, le=100),
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     cursor_value = cursor if isinstance(cursor, str) else None
     limit_value = limit if isinstance(limit, int) else 25
@@ -73,27 +73,45 @@ async def reconcile_performance(
         """
         SELECT i.interview_id, COALESCE(i.completed_at, i.created_at) AS ordering_time
         FROM Interviews i
-        WHERE i.user_id = %s
+        WHERE i.user_id = ?
           AND i.status IN ('analysis_pending', 'analysis_running', 'completed', 'partial', 'failed')
           AND i.attempt_status = 'completed'
           AND (
-              %s::timestamp IS NULL
+              ? IS NULL
               OR (COALESCE(i.completed_at, i.created_at), i.interview_id)
-                 < (%s::timestamp, %s)
+                 < (?, ?)
           )
           AND NOT EXISTS (
               SELECT 1 FROM SessionPerformanceAnalyses spa
               WHERE spa.interview_id = i.interview_id
                 AND spa.user_id = i.user_id
-                AND spa.schema_version = %s
-                AND spa.producer_version = %s
+                AND spa.schema_version = ?
+                AND spa.producer_version = ?
                 AND spa.status = 'ready'
                 AND spa.is_current = TRUE
                 AND spa.analysis_json_encrypted IS NOT NULL
                 AND spa.evidence_index_encrypted IS NOT NULL
+                AND EXISTS (
+                    SELECT 1
+                    FROM ReportArtifacts artifact
+                    WHERE artifact.analysis_id = spa.analysis_id
+                      AND artifact.interview_id = spa.interview_id
+                      AND artifact.user_id = spa.user_id
+                      AND artifact.audience = 'candidate'
+                      AND artifact.status IN ('completed', 'partial')
+                      AND artifact.payload_encrypted IS NOT NULL
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM ReportSideEffectOutbox side_effect
+                    WHERE side_effect.analysis_id = spa.analysis_id
+                      AND side_effect.interview_id = spa.interview_id
+                      AND side_effect.user_id = spa.user_id
+                      AND side_effect.event_type = 'improve_sync'
+                )
           )
         ORDER BY COALESCE(i.completed_at, i.created_at) DESC, i.interview_id DESC
-        LIMIT %s
+        LIMIT ?
         """,
         (
             current_user["user_id"],
@@ -155,17 +173,17 @@ async def reconcile_performance(
         "ready_count": counts.get("ready", 0) + counts.get("report_ready", 0),
         "next_cursor": next_cursor,
         "has_more": next_cursor is not None,
-        "processing_sla_minutes": 15,
+        "processing_sla_minutes": 60,
     }
 
 
 @router.post("/trigger")
-async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict = Depends(get_current_user)):
+async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict = Depends(local_user)):
     interview = await async_execute(
         """
         SELECT interview_id, user_id, status, report_json, report_json_encrypted, analysis_job_id
         FROM Interviews
-        WHERE interview_id = %s AND user_id = %s
+        WHERE interview_id = ? AND user_id = ?
         """,
         (request.interview_id, current_user["user_id"]),
         fetchone=True,
@@ -177,10 +195,10 @@ async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict =
         SELECT EXISTS (
             SELECT 1
             FROM SessionPerformanceAnalyses
-            WHERE interview_id = %s
-              AND user_id = %s
+            WHERE interview_id = ?
+              AND user_id = ?
               AND schema_version = 'session-performance-v4'
-              AND producer_version = %s
+              AND producer_version = ?
               AND status = 'ready'
               AND is_current = TRUE
               AND analysis_json_encrypted IS NOT NULL
@@ -209,14 +227,14 @@ async def trigger_analysis(request: AnalysisTriggerRequest, current_user: Dict =
     await async_execute(
         """
         UPDATE Interviews
-        SET analysis_job_id = %s,
+        SET analysis_job_id = ?,
             status = CASE
                 WHEN status IN ('completed', 'report_ready', 'partial', 'failed')
                      AND report_json IS NULL AND report_json_encrypted IS NULL
                 THEN 'analysis_pending'
                 ELSE status
             END
-        WHERE interview_id = %s AND user_id = %s
+        WHERE interview_id = ? AND user_id = ?
           AND status IN ('analysis_pending', 'analysis_running', 'completed', 'report_ready', 'partial', 'failed')
         """,
         (job_id, request.interview_id, current_user["user_id"]),

@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("ENVIRONMENT", "test")
 
 from mission_priority import MISSION_PRIORITY_WEIGHTS, calculate_mission_priority
-from weakness_engine import derive_weakness_lifecycle, infer_root_cause
+from weakness_engine import _observation_summary, derive_weakness_lifecycle, infer_root_cause
 
 
 def _observation(
@@ -80,6 +80,18 @@ def test_root_cause_stays_possible_until_two_independent_supports_exist():
     }
 
 
+def test_report_backed_observation_summary_names_the_answer_problem():
+    summary = _observation_summary({
+        "question": "Tell me about a backend decision you owned.",
+        "score": 42,
+        "flags": ["weak_structure", "unsupported_or_unspecific"],
+    }, "behavioral:ownership")
+
+    assert "Tell me about a backend decision you owned" in summary
+    assert "direct, well-structured response" in summary
+    assert "concrete action, result, or example" in summary
+
+
 def test_mission_priority_uses_the_plan_weights_exactly():
     assert MISSION_PRIORITY_WEIGHTS == {
         "role_relevance": 0.30,
@@ -96,4 +108,3 @@ def test_mission_priority_uses_the_plan_weights_exactly():
         "recency": 20,
     })
     assert result["priority_score"] == 70.0
-

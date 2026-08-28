@@ -35,21 +35,17 @@ import {
   getTechnicalPermissionState,
   markPreflightCompleted,
   releaseTechnicalPermissions,
-  requestTechnicalFullscreen,
-  requestTechnicalMedia,
-  requestTechnicalScreenShare,
+  requestTechnicalMicrophone,
 } from "@/lib/technical-permissions"
 import { requiresSavedJobProfile } from "@/lib/interview-setup-policy"
 import { rememberRecoveryGraceSeconds } from "@/lib/session-integrity"
 
 type SetupMode = "interview" | "technical"
-type CompileStage = "idle" | "fullscreen" | "readiness" | "camera" | "screen" | "blueprint" | "preflight" | "starting"
+type CompileStage = "idle" | "readiness" | "microphone" | "blueprint" | "preflight" | "starting"
 
 const compileStageLabels: Record<Exclude<CompileStage, "idle">, string> = {
-  fullscreen: "Opening full screen...",
   readiness: "Checking service readiness...",
-  camera: "Checking camera and microphone...",
-  screen: "Waiting for full-screen sharing...",
+  microphone: "Checking microphone...",
   blueprint: "Building your interview...",
   preflight: "Verifying setup...",
   starting: "Starting your round...",
@@ -129,6 +125,8 @@ export function InterviewSetupWizard({
   const [deleteCandidate, setDeleteCandidate] = useState<JobProfile | null>(null)
   const [profileError, setProfileError] = useState("")
   const interviewMode = "mock" as const
+  const [inputMode, setInputMode] = useState<"voice" | "text">("text")
+  const [voiceAvailable, setVoiceAvailable] = useState(false)
   const [compiling, setCompiling] = useState(false)
   const [compileError, setCompileError] = useState("")
   const [compileStage, setCompileStage] = useState<CompileStage>("idle")
@@ -145,8 +143,10 @@ export function InterviewSetupWizard({
       setServiceReadiness("checking")
       setServiceReadinessMessage("")
       try {
-        const readiness = await fetchFlowPreflight(flow, { force: readinessRetry > 0 })
+        const selectedInput = technical ? "text" : inputMode
+        const readiness = await fetchFlowPreflight(flow, { force: readinessRetry > 0, inputMode: selectedInput })
         if (cancelled) return
+        setVoiceAvailable(Boolean(readiness.checks.provider?.healthy && readiness.checks.provider?.voice_transcription))
         setServiceReadiness(readiness.ready ? "ready" : "blocked")
         setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
         if (readiness.ready) {
@@ -162,7 +162,7 @@ export function InterviewSetupWizard({
     return () => {
       cancelled = true
     }
-  }, [readinessRetry, technical])
+  }, [inputMode, readinessRetry, technical])
 
   useEffect(() => {
     let cancelled = false
@@ -358,31 +358,20 @@ export function InterviewSetupWizard({
       if (requiresSavedJobProfile(profileType) && !compiledJobProfileId) {
         throw new Error("Add or select a saved profile before starting this round.")
       }
-      if (!navigator.onLine) {
-        throw new Error(`A network connection is required before the ${technical ? "Technical Round" : "Interview Round"} can start.`)
-      }
       const flow = technical ? "technical" : "interview"
-      const fullscreenRequest = technical ? requestTechnicalFullscreen() : null
+      const selectedInput = technical ? "text" : inputMode
       setReadinessFeedbackVisible(true)
-      if (technical) {
-        setCompileStage("fullscreen")
-        const fullscreen = await fullscreenRequest
-        if (!fullscreen?.ok) throw new Error(fullscreen?.message || "Fullscreen is required before the technical round can start.")
-      }
       setCompileStage("readiness")
-      const readiness = await fetchFlowPreflight(flow, { force: serviceReadiness === "blocked" })
+      const readiness = await fetchFlowPreflight(flow, { force: serviceReadiness === "blocked", inputMode: selectedInput })
       setServiceReadiness(readiness.ready ? "ready" : "blocked")
       setServiceReadinessMessage(readiness.ready ? "" : readiness.message)
       if (!readiness.ready) throw new Error(readiness.message)
       rememberRecoveryGraceSeconds(readiness.recovery_grace_seconds)
-      if (technical) {
-        setCompileStage("screen")
-        const screen = await requestTechnicalScreenShare()
-        if (!screen.ok) throw new Error(screen.message)
+      if (selectedInput === "voice") {
+        setCompileStage("microphone")
+        const microphone = await requestTechnicalMicrophone()
+        if (!microphone.ok) throw new Error(microphone.message)
       }
-      setCompileStage("camera")
-      const media = await requestTechnicalMedia()
-      if (!media.ok) throw new Error(media.message)
 
       setCompileStage("blueprint")
       const payload: InterviewBlueprintRequest = {
@@ -399,17 +388,18 @@ export function InterviewSetupWizard({
       const persisted = await persistBrowserPreflight({
         blueprint_id: next.blueprint_id,
         flow,
-        camera_ready: permissionState.cameraReady,
-        microphone_ready: permissionState.microphoneReady,
-        microphone_level_detected: permissionState.microphoneReady,
-        screen_share_ready: permissionState.screenShareReady,
-        network_ready: navigator.onLine,
+        input_mode: selectedInput,
+        camera_ready: false,
+        microphone_ready: selectedInput === "voice" && permissionState.microphoneReady,
+        microphone_level_detected: selectedInput === "voice" && permissionState.microphoneReady,
+        screen_share_ready: false,
+        network_ready: true,
       })
       markPreflightCompleted()
       setCompileStage("starting")
       onReady(next, {
-        inputMode: technical ? "text" : "voice",
-        cameraEnabled: true,
+        inputMode: selectedInput,
+        cameraEnabled: false,
         interviewMode,
       }, persisted.preflight_id)
     } catch (err: any) {
@@ -423,11 +413,6 @@ export function InterviewSetupWizard({
 
   return (
     <div className="space-y-5">
-      <div>
-        <h3 className="text-lg font-semibold text-foreground">
-          {technical ? "Technical Round" : "Interview Round"}
-        </h3>
-      </div>
       {loadingAssets ? (
         <div className="flex min-h-36 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-primary" /></div>
       ) : (
@@ -460,6 +445,35 @@ export function InterviewSetupWizard({
                 })}
               </div>
             </div>
+
+            {!technical && (
+              <div className="space-y-2">
+                <p className="text-sm font-medium text-foreground">Answer format</p>
+                <div className="grid gap-2 sm:grid-cols-2" role="radiogroup" aria-label="Interview answer format">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={inputMode === "text"}
+                    onClick={() => setInputMode("text")}
+                    className={`rounded-xl border p-3 text-left ${inputMode === "text" ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
+                  >
+                    <span className="block text-sm font-semibold text-foreground">Type answers</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">Recommended. No microphone permission.</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={inputMode === "voice"}
+                    disabled={!voiceAvailable}
+                    onClick={() => setInputMode("voice")}
+                    className={`rounded-xl border p-3 text-left disabled:cursor-not-allowed disabled:opacity-50 ${inputMode === "voice" ? "border-primary bg-primary/10" : "border-border bg-background hover:border-primary/50"}`}
+                  >
+                    <span className="block text-sm font-semibold text-foreground">Speak answers</span>
+                    <span className="mt-1 block text-xs text-muted-foreground">Uses the configured transcription provider and asks for microphone access.</span>
+                  </button>
+                </div>
+              </div>
+            )}
 
             {profileType === "custom" && (
               <div className="space-y-3 rounded-xl border border-border/60 bg-secondary/10 p-4">

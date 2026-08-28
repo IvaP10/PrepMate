@@ -1,7 +1,7 @@
 # ============================================================================
 # MODULE: technical_mode.py
 # PURPOSE: Validated DSA problem-bank rounds, code execution, whiteboard
-#          saves, and anti-cheat event logging.
+#          saves, and optional self-review signal logging.
 # STRUCTURE:
 #   - Pydantic request models
 #   - AI problem generation and validation helpers
@@ -11,13 +11,12 @@
 #   - POST /rounds/{round_id}/run           -> execute custom input via code runner
 #   - GET  /runs/{run_id}                   -> poll case execution state
 #   - POST /rounds/{round_id}/whiteboard    -> persist whiteboard JSON (381)
-#   - POST /anti-cheat                      -> log AntiCheatEvents row (398)
-# DEPENDS ON: auth, config, database (async_execute), interview_profiles,
-#             learning_engine
+#   - POST /self-review-signal              -> log optional coaching signal
+# DEPENDS ON: config, database (async_execute), interview_profiles,
+#             learning_engine, local_execution, local_runtime
 # CONSUMED BY: app.py, Frontend/app/interview/[id]/technical/page.tsx
 # DATA TABLES: TechnicalInterviewRounds, TechnicalRunEvents,
-#              TechnicalMistakeClusters, AntiCheatEvents
-#              (Phase 2 merges AntiCheatEvents -> InterviewEvents)
+#              TechnicalMistakeClusters, optional self-review signal storage
 # ============================================================================
 
 from __future__ import annotations
@@ -28,20 +27,16 @@ import asyncio
 import time
 import uuid
 import logging
-import ipaddress
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
-from urllib.parse import urlparse
-
-import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from auth import get_current_user
+from local_runtime import local_user
 from config import settings
 from database import async_execute, get_db_connection, return_db_connection
-from entitlements import is_technical_interview_type, normalize_technical_profile
+from interview_capabilities import is_technical_interview_type, normalize_technical_profile
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
 from interview_profiles import (
     TECHNICAL_MINUTES_PER_QUESTION,
@@ -51,39 +46,15 @@ from interview_profiles import (
 )
 from learning_engine import build_error_signature, ingest_technical_run
 from llm_router import LLMRoutingError, complete_json_async
+from local_cache import get_local_cache
 from prompt_security import data_block
-from rate_limiter import UserRateLimiter
-from security_utils import decrypt_data, decrypt_json, encrypt_data
+from security_utils import decrypt_data, decrypt_json, decrypt_json_field, encrypt_data
 
 logger = logging.getLogger("technical_mode")
 
 router = APIRouter(prefix="/api/technical", tags=["Technical Interview"])
 
-INTEGRITY_WARNING_THRESHOLD = 5
-INTEGRITY_WARNING_EVENT_TYPES = {
-    "tab_switch",
-    "window_blur",
-    "fullscreen_exit",
-    "screen_share_stopped",
-    "face_missing",
-    "camera_obstructed",
-    "technical_permission_failed",
-    "interview_permission_failed",
-    "large_paste",
-    "paste_blocked",
-    "drop_blocked",
-    "mobile_phone_detected",
-    "multiple_people_detected",
-    "large_code_jump",
-    "screen_not_monitor",
-    "no_clarification_before_coding",
-    "suspicious_clipboard_pattern",
-}
-INTEGRITY_SEVERE_ONLY_EVENT_TYPES = {
-    "suspicious_fast_submit",
-    "visible_output_hardcode",
-    "session_flagged",
-}
+INTEGRITY_WARNING_THRESHOLD = 0
 TERMINAL_TECHNICAL_INTERVIEW_STATUSES = {
     "analysis_pending",
     "analysis_queued",
@@ -101,6 +72,10 @@ TERMINAL_TECHNICAL_INTERVIEW_STATUSES = {
     "failed",
     "analyzed",
 }
+
+
+class TechnicalProblemReservationConflict(RuntimeError):
+    """A concurrent attempt reserved a problem after selection but before freeze."""
 
 
 SUPPORTED_LANGUAGES = "python|javascript|cpp|java"
@@ -147,6 +122,8 @@ class WhiteboardSaveRequest(BaseModel):
 class DraftSaveRequest(BaseModel):
     code: str = Field(default="", max_length=20000)
     language: str = Field(pattern=f"^({SUPPORTED_LANGUAGES})$")
+    editor_revision: Optional[int] = Field(default=None, ge=0)
+    editor_hash: Optional[str] = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
 
 
 class TechnicalResponseRequest(BaseModel):
@@ -165,7 +142,7 @@ class TechnicalWorkflowRequest(BaseModel):
 
 
 
-class AntiCheatEventRequest(BaseModel):
+class SelfReviewSignalRequest(BaseModel):
     interview_id: str
     event_type: str = Field(max_length=50)
     payload: Dict[str, Any] = Field(default_factory=dict)
@@ -198,11 +175,6 @@ HIDDEN_TEST_TAGS = [
     "boundary_index",
 ]
 AI_GENERATION_MAX_ATTEMPTS = 1
-VISIBLE_RUN_RATE_LIMITER = UserRateLimiter(
-    max_calls=10,
-    time_window=60,
-    redis_prefix="technical_visible_run",
-)
 EXECUTION_JOB_VERSION = "technical-execution-v1"
 ROUND_SPEC_VERSION = "technical-round-spec-v1"
 MAX_EXECUTION_OUTPUT_BYTES = 64 * 1024
@@ -362,44 +334,12 @@ def _technical_generation_cache_key(profile_type: str, interview_id: str, genera
 
 
 async def _load_cached_generation(cache_key: str) -> Optional[Dict[str, Any]]:
-    try:
-        row = await async_execute(
-            """
-            SELECT payload
-            FROM LLMCache
-            WHERE cache_key = %s
-              AND (expires_at IS NULL OR expires_at > NOW())
-            """,
-            (cache_key,),
-            fetchone=True,
-        )
-    except Exception:
-        return None
-    if not row:
-        return None
-    payload = _json_value(row[0], {})
+    payload = get_local_cache().get(cache_key)
     return payload if isinstance(payload, dict) else None
 
 
 async def _save_cached_generation(cache_key: str, payload: Dict[str, Any]) -> None:
-    try:
-        await async_execute(
-            """
-            INSERT INTO LLMCache (cache_key, event_type, payload, expires_at)
-            VALUES (%s, 'technical_problem_generation', %s, %s)
-            ON CONFLICT (cache_key) DO UPDATE SET
-                payload = EXCLUDED.payload,
-                expires_at = EXCLUDED.expires_at,
-                created_at = NOW()
-            """,
-            (
-                cache_key,
-                json.dumps(payload),
-                datetime.now(timezone.utc) + timedelta(days=1),
-            ),
-        )
-    except Exception:
-        logger.warning("Technical problem generation cache write skipped")
+    get_local_cache().set(cache_key, payload, ex=24 * 60 * 60)
 
 
 def _safe_json_value(value: Any, fallback: Any) -> Any:
@@ -572,7 +512,7 @@ async def _load_technical_generation_context(
             SELECT resume_payload_encrypted, job_context_encrypted,
                    blueprint_context_encrypted, profile_type
             FROM AttemptContextSnapshots
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
             """,
             (interview_id, user_id),
             fetchone=True,
@@ -587,7 +527,9 @@ async def _load_technical_generation_context(
                    i.questions_data, i.resume_id, i.job_profile_id,
                    rv.resume_payload_encrypted, rv.resume_json,
                    jp.job_description_encrypted, jp.role, jp.company,
-                   jp.tech_stack, jp.normalized_requirements
+                   jp.tech_stack, jp.normalized_requirements,
+                   jp.normalized_requirements_encrypted,
+                   i.questions_data_encrypted
             FROM Interviews i
             LEFT JOIN InterviewBlueprints ib
               ON ib.blueprint_id = i.blueprint_id AND ib.user_id = i.user_id
@@ -595,7 +537,7 @@ async def _load_technical_generation_context(
               ON rv.resume_id = i.resume_id AND rv.user_id = i.user_id
             LEFT JOIN JobProfiles jp
               ON jp.profile_id = i.job_profile_id AND jp.user_id = i.user_id
-            WHERE i.interview_id = %s AND i.user_id = %s
+            WHERE i.interview_id = ? AND i.user_id = ?
             """,
             (interview_id, user_id),
             fetchone=True,
@@ -620,7 +562,11 @@ async def _load_technical_generation_context(
             except Exception:
                 logger.warning("Frozen blueprint payload could not be decrypted")
         if not frozen_blueprint:
-            frozen_blueprint = _json_value(frozen_row[1], {}) or _json_value(frozen_row[2], {}) or {}
+            frozen_blueprint = (
+                _json_value(frozen_row[1], {})
+                or decrypt_json_field(frozen_row[13], frozen_row[2], {})
+                or {}
+            )
         if frozen_row[5]:
             try:
                 resume_json = json.loads(_decrypt_storage_blob(frozen_row[5]))
@@ -637,6 +583,11 @@ async def _load_technical_generation_context(
         frozen_company = str(frozen_row[9] or "")
         frozen_tech_stack = _string_list(_json_value(frozen_row[10], []), 18)
         requirements_value = _json_value(frozen_row[11], {})
+        if frozen_row[12]:
+            try:
+                requirements_value = json.loads(_decrypt_storage_blob(frozen_row[12]))
+            except Exception:
+                logger.warning("Frozen job requirements could not be decrypted")
         frozen_requirements = requirements_value if isinstance(requirements_value, dict) else {}
 
     if snapshot_row:
@@ -665,15 +616,15 @@ async def _load_technical_generation_context(
     if not resume_json:
         legacy_profile = await async_execute(
             """
-            SELECT resume_json, profile_json, external_profile_signals
-            FROM UserInfo WHERE user_id = %s
+            SELECT resume_json, profile_json
+            FROM UserInfo WHERE user_id = ?
             """,
             (user_id,), fetchone=True,
         )
         if legacy_profile:
             resume_json = _safe_json_value(legacy_profile[0], {}) or {}
             profile_json = _safe_json_value(legacy_profile[1], {}) or {}
-            external_signals = _safe_json_value(legacy_profile[2], {}) or {}
+            external_signals = {}
     if not isinstance(resume_json, dict):
         resume_json = {}
     if not isinstance(profile_json, dict):
@@ -710,7 +661,7 @@ async def _load_technical_generation_context(
                 """
                 SELECT mistake_type, mistake_key, occurrence_count, evidence
                 FROM TechnicalMistakeClusters
-                WHERE user_id = %s
+                WHERE user_id = ?
                 ORDER BY occurrence_count DESC, last_seen_at DESC
                 LIMIT 8
                 """,
@@ -734,7 +685,7 @@ async def _load_technical_generation_context(
                 """
                 SELECT weakness_type, skill_key, title, evidence_summary, priority_score
                 FROM ImprovementMissions
-                WHERE user_id = %s AND status IN ('active', 'awaiting_validation')
+                WHERE user_id = ? AND status IN ('active', 'awaiting_validation')
                 ORDER BY priority_score DESC, updated_at DESC
                 LIMIT 6
                 """,
@@ -1062,7 +1013,7 @@ async def _validate_reference_solution(problem: Dict[str, Any], all_cases: List[
     ]
     results = await asyncio.gather(*tasks)
     for index, (case, result) in enumerate(zip(all_cases, results), start=1):
-        verdict = _judge0_verdict(result)
+        verdict = _execution_verdict(result)
         if verdict != "Accepted":
             raise ValueError(f"reference solution failed case {index}: {verdict}")
         stdout_normalized = result.get("stdout", "")
@@ -1660,7 +1611,11 @@ async def _generate_ai_problem_set(
             last_error,
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not prepare technical problems: {exc}") from exc
+        logger.exception("Validated Technical fallback preparation failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not prepare validated technical problems. Please retry.",
+        ) from exc
 
 
 def _prompt_from_metadata(metadata: Dict[str, Any]) -> str:
@@ -1686,6 +1641,55 @@ def _decrypt_storage_blob(value: Any) -> str:
 
 def _encrypted_json_text(value: Any) -> str:
     return encrypt_data(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def _bank_entry_contract_errors(item: Dict[str, Any]) -> List[str]:
+    """Validate the persisted public problem contract before candidate use."""
+    errors: List[str] = []
+    round_type = str(item.get("round_type") or "").strip().lower()
+    if round_type not in {
+        "coding", "debugging", "dsa", "technical_concept", "system_design",
+        "ml", "backend", "database", "os", "network", "oop",
+    }:
+        errors.append("round_type")
+    if not str(item.get("problem_id") or "").strip():
+        errors.append("problem_id")
+    if len(str(item.get("title") or "").strip()) < 3:
+        errors.append("title")
+    if len(str(item.get("statement") or "").strip()) < 80:
+        errors.append("statement")
+    if str(item.get("difficulty") or "").strip().lower() not in {"easy", "medium", "hard"}:
+        errors.append("difficulty")
+
+    if round_type in {"coding", "debugging", "dsa"}:
+        visible = item.get("visible_tests")
+        hidden = item.get("hidden_tests")
+        if not isinstance(visible, list) or len(visible) != 3:
+            errors.append("visible_tests")
+            visible = []
+        if not isinstance(hidden, list) or len(hidden) != 7:
+            errors.append("hidden_tests")
+            hidden = []
+        inputs: List[str] = []
+        for case in [*visible, *hidden]:
+            if not isinstance(case, dict):
+                errors.append("test_case_shape")
+                continue
+            stdin = str(case.get("stdin") or "")
+            expected = str(case.get("expected") or "")
+            if not stdin.strip() or not expected.strip():
+                errors.append("test_case_io")
+            inputs.append(stdin)
+        if len(inputs) != len(set(inputs)):
+            errors.append("duplicate_test_input")
+        if not str(item.get("expected_time_complexity") or "").strip():
+            errors.append("expected_time_complexity")
+        if not str(item.get("expected_space_complexity") or "").strip():
+            errors.append("expected_space_complexity")
+        supported_languages = _string_list(item.get("supported_languages") or [], 20)
+        if not supported_languages or not set(supported_languages).intersection(SUPPORTED_LANGUAGE_NAMES):
+            errors.append("supported_languages")
+    return sorted(set(errors))
 
 
 async def _load_active_problem_bank() -> List[Dict[str, Any]]:
@@ -1724,7 +1728,7 @@ async def _load_active_problem_bank() -> List[Dict[str, Any]]:
         except Exception:
             logger.warning("Skipping problem bank entry with unreadable hidden tests: %s", row[0])
             continue
-        bank.append({
+        entry = {
             "problem_id": str(row[0]),
             "problem_family_id": str(row[1] or row[0]),
             "version": int(row[2] or 1),
@@ -1743,7 +1747,19 @@ async def _load_active_problem_bank() -> List[Dict[str, Any]]:
             "validator_version": str(row[15] or "unknown"),
             "validation_result": validation,
             "source": "problem_bank",
-        })
+        }
+        contract_errors = _bank_entry_contract_errors(entry)
+        if contract_errors:
+            logger.warning(
+                "Skipping invalid active problem bank entry %s (%s)",
+                row[0],
+                ",".join(contract_errors),
+            )
+            continue
+        if settings.ENVIRONMENT == "production" and validation.get("sandbox_execution_verified") is not True:
+            logger.warning("Skipping non-sandbox-verified production problem bank entry: %s", row[0])
+            continue
+        bank.append(entry)
     return bank
 
 
@@ -1762,10 +1778,10 @@ async def _load_used_problem_history(
         rows = await async_execute(
             """
             SELECT problem_id,
-                   COALESCE(round_spec->>'problem_family_id', problem_id)
+                   COALESCE(json_extract(round_spec, '$.problem_family_id'), problem_id)
             FROM TechnicalInterviewRounds
-            WHERE user_id = %s
-              AND interview_id <> %s
+            WHERE user_id = ?
+              AND interview_id <> ?
               AND problem_id IS NOT NULL
             ORDER BY created_at DESC, round_id DESC
             """,
@@ -1856,6 +1872,13 @@ def _difficulty_rank(value: Any) -> int:
     return {"easy": 1, "medium": 2, "hard": 3}.get(str(value or "").strip().lower(), 2)
 
 
+_SELECTION_STOPWORDS = {
+    "and", "are", "but", "for", "from", "has", "have", "into", "its", "job",
+    "role", "that", "the", "their", "this", "with", "will", "you", "your",
+    "build", "engineer", "engineering", "software", "system", "systems",
+}
+
+
 def _selection_terms(context: Dict[str, Any]) -> set[str]:
     values: List[str] = []
     values.extend(_string_list(context.get("technical_topics") or [], 24))
@@ -1865,11 +1888,51 @@ def _selection_terms(context: Dict[str, Any]) -> set[str]:
     for weakness in context.get("mistake_history") or []:
         if isinstance(weakness, dict):
             values.extend([str(weakness.get("key") or ""), str(weakness.get("title") or "")])
-    return {
+    terms = {
         token
         for value in values
         for token in re.findall(r"[a-z0-9+#.]{2,}", value.lower())
     }
+    return {
+        token for token in terms
+        if token not in _SELECTION_STOPWORDS and (len(token) >= 3 or token in {"go", "c#", "c++"})
+    }
+
+
+def _bank_entry_supports_profile(item: Dict[str, Any], profile_type: str) -> bool:
+    spec_json = item.get("spec_json") if isinstance(item.get("spec_json"), dict) else {}
+    allowed_profiles = _string_list(
+        spec_json.get("profile_types") or item.get("profile_types") or [], 8
+    )
+    return not allowed_profiles or profile_type in allowed_profiles
+
+
+def _bank_entry_context_matches(item: Dict[str, Any], context: Dict[str, Any]) -> List[str]:
+    candidate_text = " ".join([
+        str(item.get("title") or ""),
+        str(item.get("statement") or ""),
+        " ".join(_string_list(item.get("taxonomy_keys") or [], 30)),
+        " ".join(_string_list(item.get("prerequisite_keys") or [], 30)),
+    ]).lower()
+    candidate_terms = set(re.findall(r"[a-z0-9+#.]{2,}", candidate_text))
+    return sorted(_selection_terms(context).intersection(candidate_terms))[:10]
+
+
+def _selection_context_hash(context: Dict[str, Any]) -> str:
+    payload = {
+        "blueprint_hash": context.get("blueprint_hash"),
+        "job_title": context.get("job_title"),
+        "target_skills": _string_list(context.get("target_skills") or [], 18),
+        "technical_topics": _string_list(context.get("technical_topics") or [], 20),
+        "mistake_keys": [
+            str(item.get("key") or item.get("title") or "")[:120]
+            for item in (context.get("mistake_history") or [])[:8]
+            if isinstance(item, dict)
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
 
 
 def _bank_candidate_score(
@@ -1887,14 +1950,7 @@ def _bank_candidate_score(
     )
     if allowed_profiles:
         score += 35 if profile_type in allowed_profiles else -100
-    terms = _selection_terms(context)
-    candidate_text = " ".join([
-        str(item.get("title") or ""),
-        str(item.get("statement") or ""),
-        " ".join(_string_list(item.get("taxonomy_keys") or [], 30)),
-        " ".join(_string_list(item.get("prerequisite_keys") or [], 30)),
-    ]).lower()
-    score += min(60, sum(6 for term in terms if term in candidate_text))
+    score += min(60, 6 * len(_bank_entry_context_matches(item, context)))
     tie_breaker = hashlib.sha256(
         "|".join([
             str(context.get("blueprint_hash") or context.get("interview_id") or ""),
@@ -2048,15 +2104,27 @@ async def _round_templates_for_profile(
     context = {**(generation_context or {}), "profile_type": normalized}
     selected_language = _selected_programming_language(context)
     selected_starter = _starter_code_by_language()[selected_language]
-    round_types = (
-        ["coding"]
-        if settings.TECHNICAL_CODING_ONLY
-        else _normalize_round_types(context.get("technical_round_types"))
+    from local_execution import executor_status
+
+    runner = executor_status()
+    language_capability = (runner.get("languages") or {}).get(selected_language) or {}
+    execution_available = bool(
+        runner.get("healthy")
+        and runner.get("isolated")
+        and language_capability.get("available")
     )
+    if execution_available:
+        round_types = (
+            ["coding"]
+            if settings.TECHNICAL_CODING_ONLY
+            else _normalize_round_types(context.get("technical_round_types"))
+        )
+    else:
+        round_types = ["technical_concept", "system_design"]
     question_count = max(1, min(12, int(context.get("question_count") or len(round_types))))
     requested_types = [round_types[index % len(round_types)] for index in range(question_count)]
     bank = await _load_active_problem_bank()
-    authored_coding = await _authored_coding_specs(normalized, context)
+    authored_coding: Optional[List[Dict[str, Any]]] = None
     authored_index = 0
     templates: List[Dict[str, Any]] = []
     total_duration = max(10, min(120, int(context.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES))) * 60
@@ -2068,6 +2136,20 @@ async def _round_templates_for_profile(
     )
     used_problem_ids: set[str] = set()
     used_problem_families: set[str] = set()
+    context_hash = _selection_context_hash(context)
+
+    async def next_authored_coding_spec() -> Dict[str, Any]:
+        nonlocal authored_coding, authored_index
+        if authored_coding is None:
+            authored_coding = await _authored_coding_specs(normalized, context)
+        if not authored_coding:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Technical fallback content is unavailable.",
+            )
+        spec = dict(authored_coding[authored_index % len(authored_coding)])
+        authored_index += 1
+        return spec
 
     def is_unused_this_session(item: Dict[str, Any]) -> bool:
         problem_id = str(item.get("problem_id") or "")
@@ -2075,11 +2157,13 @@ async def _round_templates_for_profile(
         return problem_id not in used_problem_ids and problem_family not in used_problem_families
 
     for index, round_type in enumerate(requested_types, start=1):
+        history_reuse_required = False
         expected_difficulty = _expected_tier_difficulty(normalized, index, context)
         expected_rating = _expected_tier_rating(normalized, index, context)
         supported = [
             item for item in bank
             if item.get("round_type") == round_type
+            and _bank_entry_supports_profile(item, normalized)
             and (
                 not item.get("supported_languages")
                 or selected_language in _string_list(item.get("supported_languages"), 20)
@@ -2111,24 +2195,31 @@ async def _round_templates_for_profile(
             # prefer a new problem within this session before reusing history.
             if selected is None:
                 selected = next((item for item in supported if is_unused_this_session(item)), None)
+                history_reuse_required = selected is not None
             if selected is None:
                 if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                     raise HTTPException(
                         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                         detail="The validated technical problem bank has no unused problem for this round.",
                     )
-                selected = supported[0]
-            spec = dict(selected)
-            used_problem_ids.add(str(spec.get("problem_id")))
-            used_problem_families.add(str(spec.get("problem_family_id") or spec.get("problem_id") or ""))
+                if round_type == "coding":
+                    spec = await next_authored_coding_spec()
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="The validated technical problem bank has no unused problem for this round.",
+                    )
+            else:
+                spec = dict(selected)
+                used_problem_ids.add(str(spec.get("problem_id")))
+                used_problem_families.add(str(spec.get("problem_family_id") or spec.get("problem_id") or ""))
         elif round_type == "coding":
             if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=f"Technical {normalized.replace('_', ' ')} coding content is not ready for the required {expected_difficulty} tier.",
                 )
-            spec = dict(authored_coding[authored_index % len(authored_coding)])
-            authored_index += 1
+            spec = await next_authored_coding_spec()
         elif round_type == "debugging":
             if not settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK:
                 raise HTTPException(
@@ -2189,6 +2280,9 @@ async def _round_templates_for_profile(
             "expected_points": expected_points,
             "rubric": rubric,
             "validator_version": spec.get("validator_version") or "authored-v1",
+            "selection_context_hash": context_hash,
+            "selection_context_match_count": len(_bank_entry_context_matches(spec, context)),
+            "history_reuse_required": history_reuse_required,
             "workflow": (
                 ["clarification", "approach", "coding", "visible_tests", "final_submission", "complexity", "explanation", "followup"]
                 if round_type in {"coding", "debugging"}
@@ -2245,22 +2339,6 @@ def _should_regenerate_rounds(
             return True
     return False
 
-FILE_NAMES = {
-    "python": "main.py",
-    "javascript": "main.js",
-    "java": "Main.java",
-    "cpp": "main.cpp",
-}
-
-PISTON_LANGUAGE_ALIASES = {
-    "python": {"python", "python3", "py"},
-    "javascript": {"javascript", "js", "node", "nodejs"},
-    "java": {"java"},
-    "cpp": {"cpp", "c++", "g++", "clang++", "gcc"},
-}
-PISTON_RUNTIME_CACHE: Dict[str, Dict[str, str]] = {}
-
-
 def _json_value(value: Any, fallback: Any) -> Any:
     if value is None:
         return fallback
@@ -2279,68 +2357,36 @@ def _code_excerpt(code: str, limit: int = 3000) -> str:
     return text[:limit].rsplit("\n", 1)[0]
 
 
-def _is_private_piston_url(value: Optional[str]) -> bool:
-    """Accept only loopback/private addresses or Docker-style service names."""
-    raw = str(value or "").strip()
-    if not raw:
-        return False
-    try:
-        parsed = urlparse(raw)
-        host = (parsed.hostname or "").strip().lower()
-    except Exception:
-        return False
-    if parsed.scheme not in {"http", "https"} or not host:
-        return False
-    if host == "emkc.org" or host.endswith(".emkc.org"):
-        return False
-    if host in {"localhost", "host.docker.internal"} or "." not in host:
-        return True
-    try:
-        address = ipaddress.ip_address(host)
-        return bool(address.is_private or address.is_loopback or address.is_link_local)
-    except ValueError:
-        return host.endswith((".local", ".internal"))
-
-
 def _active_executor_name() -> str:
-    if _is_private_piston_url(settings.PISTON_API_URL):
-        return "isolated_sandbox"
-    return "unavailable"
+    from local_execution import executor_status
+
+    return str(executor_status().get("executor") or "unavailable")
 
 
 def _public_executor_label(executor: str) -> str:
-    if executor == "isolated_sandbox":
-        return "Isolated sandbox"
-    if executor == "unavailable":
-        return "Unavailable"
-    return "Code runner"
+    labels = {
+        "macos-seatbelt": "macOS local sandbox",
+        "linux-bubblewrap": "Linux local sandbox",
+        "unavailable": "Unavailable",
+    }
+    return labels.get(executor, "Local code sandbox")
 
 
 def _executor_status_payload() -> Dict[str, Any]:
-    executor = _active_executor_name()
-    available = executor != "unavailable"
+    from local_execution import executor_status
+
+    status_payload = executor_status()
+    executor = str(status_payload.get("executor") or "unavailable")
+    available = bool(status_payload.get("healthy") and status_payload.get("isolated"))
     return {
         "executor": executor,
         "executor_label": _public_executor_label(executor),
         "executor_available": available,
-        "executor_status": "configured" if available else "unavailable",
-        "executor_unavailable_reason": (
-            None
-            if available
-            else "The private isolated code sandbox is not configured."
-        ),
+        "executor_status": "available" if available else "unavailable",
+        "executor_unavailable_reason": None if available else str(status_payload.get("reason") or "A supported local sandbox is required."),
+        "available_languages": list(status_payload.get("available_languages") or []),
+        "language_capabilities": status_payload.get("languages") or {},
     }
-
-
-def _require_executor_available() -> None:
-    if _active_executor_name() == "unavailable":
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Code execution is unavailable. Configure the private isolated sandbox; "
-                "public runners and backend host execution are disabled."
-            ),
-        )
 
 
 def _generation_summary(rows: List[Any]) -> Dict[str, Any]:
@@ -2577,15 +2623,255 @@ def _serialize_round_rows(rows: List[Any]) -> List[Dict[str, Any]]:
     return serialized
 
 
+def _normalize_editor_source(value: Any) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _source_differs_from_starter(source: Any, starter_code: Any) -> bool:
+    return _normalize_editor_source(source) != _normalize_editor_source(starter_code)
+
+
+def _editor_revision_from_metadata(metadata: Any) -> Optional[int]:
+    value = metadata.get("editor_revision") if isinstance(metadata, dict) else None
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        revision = int(value)
+    except (TypeError, ValueError):
+        return None
+    return revision if revision >= 0 else None
+
+
+async def _serialize_round_rows_with_candidate_state(
+    rows: List[Any],
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    """Attach only the owning candidate's latest encrypted draft and run.
+
+    Frozen round rows deliberately do not mutate as the editor changes. Drafts
+    and executions are append-only evidence, so resuming a round must project
+    the latest owned records back into the browser instead of resetting the
+    editor to starter code.
+    """
+    serialized = _serialize_round_rows(rows)
+    round_ids = [str(item.get("round_id") or "") for item in serialized if item.get("round_id")]
+    if not round_ids:
+        return serialized
+
+    by_round = {str(item["round_id"]): item for item in serialized}
+    round_placeholders = ",".join(["?"] * len(round_ids))
+    draft_rows = await async_execute(
+        """
+        SELECT snapshot.round_id, snapshot.language,
+               snapshot.source_code_encrypted, snapshot.created_at,
+               snapshot.metadata, snapshot.source_chars, snapshot.code_hash
+        FROM TechnicalCodeSnapshots snapshot
+        WHERE snapshot.user_id = ?
+          AND snapshot.round_id IN ({round_placeholders})
+          AND snapshot.source_code_encrypted IS NOT NULL
+        ORDER BY snapshot.round_id, snapshot.created_at DESC, snapshot.snapshot_id DESC
+        """.format(round_placeholders=round_placeholders),
+        (user_id, *round_ids),
+        fetchall=True,
+    )
+    hydrated_rounds: set[str] = set()
+    for row in draft_rows or []:
+        round_id = str(row[0])
+        item = by_round.get(round_id)
+        if not item or round_id in hydrated_rounds:
+            continue
+        try:
+            draft_code = _decrypt_storage_blob(row[2])
+        except Exception:
+            safe_round = hashlib.sha256(round_id.encode("utf-8")).hexdigest()[:12]
+            logger.warning("Could not restore encrypted Technical draft for round %s", safe_round)
+            continue
+        metadata = _json_value(row[4], {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        candidate_edited = _source_differs_from_starter(
+            draft_code,
+            str(item.get("starter_code") or ""),
+        )
+        # The most recent snapshot is authoritative even when it represents an
+        # explicit reset to starter code. Do not fall through to an older edit.
+        hydrated_rounds.add(round_id)
+        item["draft_saved_at"] = (
+            row[3].isoformat() if row[3] and hasattr(row[3], "isoformat") else row[3]
+        )
+        item["draft_editor_revision"] = _editor_revision_from_metadata(metadata)
+        item["draft_editor_hash"] = str(row[6] or hashlib.sha256(draft_code.encode("utf-8")).hexdigest())
+        item["draft_candidate_edited"] = candidate_edited
+        if not candidate_edited:
+            continue
+        item["draft_code"] = draft_code
+        item["draft_language"] = str(row[1] or item.get("language") or "python")
+        item["draft_source_chars"] = int(row[5] or 0)
+
+    latest_jobs = await async_execute(
+        """
+        WITH ranked_jobs AS (
+            SELECT job.job_id, job.round_id, job.action, job.suite, job.language,
+                   job.status, job.result_json, job.error_message,
+                   job.retry_count, job.source_hash,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY job.round_id
+                       ORDER BY job.created_at DESC, job.job_id DESC
+                   ) AS job_rank
+            FROM TechnicalExecutionJobs job
+            WHERE job.user_id = ?
+              AND job.round_id IN ({round_placeholders})
+        )
+        SELECT job_id, round_id, action, suite, language,
+               status, result_json, error_message, retry_count, source_hash
+        FROM ranked_jobs
+        WHERE job_rank = 1
+        """.format(round_placeholders=round_placeholders),
+        (user_id, *round_ids),
+        fetchall=True,
+    )
+    for row in latest_jobs or []:
+        item = by_round.get(str(row[1]))
+        if item:
+            item["latest_run"] = _execution_job_public_from_row(row)
+    return serialized
+
+
 TECHNICAL_ROUND_SELECT = """
     SELECT round_id, round_type, language, prompt, starter_code, whiteboard_json, status, metadata,
            created_at, completed_at, round_spec_id, problem_id, round_number, round_spec,
            duration_seconds, deadline_at, mode, max_submissions,
            problem_version, workflow_state, whiteboard_encrypted, started_at
     FROM TechnicalInterviewRounds
-    WHERE interview_id = %s AND user_id = %s
+    WHERE interview_id = ? AND user_id = ?
     ORDER BY round_number, created_at, round_id
 """
+
+TECHNICAL_ATTEMPT_AGGREGATE_SELECT = """
+    SELECT lifecycle_state, lifecycle_revision, round_count, open_round_count,
+           submitted_round_count, round_states, started_at, deadline_at, completed_at
+    FROM TechnicalAttemptAggregates
+    WHERE interview_id = ? AND user_id = ?
+"""
+
+
+def _derived_technical_attempt_state(rounds: List[Dict[str, Any]]) -> Dict[str, Any]:
+    terminal = {"submitted", "completed", "expired", "cancelled"}
+    statuses = [str(item.get("status") or "active").lower() for item in rounds]
+    open_count = sum(status not in terminal for status in statuses)
+    submitted_count = sum(status in {"submitted", "awaiting_explanation"} for status in statuses)
+    if not rounds:
+        lifecycle_state = "preparing"
+    elif statuses and all(status == "pending" for status in statuses):
+        lifecycle_state = "preparing"
+    elif open_count:
+        lifecycle_state = "active"
+    elif statuses and all(status == "expired" for status in statuses):
+        lifecycle_state = "expired"
+    elif statuses and all(status == "cancelled" for status in statuses):
+        lifecycle_state = "cancelled"
+    else:
+        lifecycle_state = "completed"
+    return {
+        "lifecycle_state": lifecycle_state,
+        "lifecycle_revision": 0,
+        "round_count": len(rounds),
+        "open_round_count": open_count,
+        "submitted_round_count": submitted_count,
+        "round_states": [
+            {
+                "round_id": item.get("round_id"),
+                "round_number": item.get("round_number"),
+                "round_type": item.get("round_type"),
+                "status": item.get("status"),
+            }
+            for item in rounds
+        ],
+        "started_at": None,
+        "deadline_at": None,
+        "completed_at": None,
+        "persisted": False,
+    }
+
+
+async def _load_technical_attempt_state(
+    interview_id: str,
+    user_id: str,
+    rounds: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Load the server-owned, revisioned aggregate with a migration-safe fallback."""
+    try:
+        row = await async_execute(
+            TECHNICAL_ATTEMPT_AGGREGATE_SELECT,
+            (interview_id, user_id),
+            fetchone=True,
+        )
+    except Exception:
+        logger.warning("Technical attempt aggregate could not be loaded", exc_info=True)
+        row = None
+    if not row:
+        return _derived_technical_attempt_state(rounds)
+    serialized_statuses = [str(item.get("status") or "").lower() for item in rounds]
+    if serialized_statuses and all(item == "pending" for item in serialized_statuses):
+        # A trigger created by an older migration can still project pending
+        # frozen rounds as active.  The child rows are authoritative until the
+        # explicit activation endpoint changes them.
+        return {
+            "lifecycle_state": "preparing",
+            "lifecycle_revision": int(row[1] or 1),
+            "round_count": len(rounds),
+            "open_round_count": len(rounds),
+            "submitted_round_count": 0,
+            "round_states": [
+                {
+                    "round_id": item.get("round_id"),
+                    "round_number": item.get("round_number"),
+                    "round_type": item.get("round_type"),
+                    "status": item.get("status"),
+                }
+                for item in rounds
+            ],
+            "started_at": None,
+            "deadline_at": None,
+            "completed_at": None,
+            "persisted": True,
+        }
+    return {
+        "lifecycle_state": str(row[0] or "preparing"),
+        "lifecycle_revision": int(row[1] or 1),
+        "round_count": int(row[2] or 0),
+        "open_round_count": int(row[3] or 0),
+        "submitted_round_count": int(row[4] or 0),
+        "round_states": _json_value(row[5], []),
+        "started_at": row[6].isoformat() if hasattr(row[6], "isoformat") else row[6],
+        "deadline_at": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
+        "completed_at": row[8].isoformat() if hasattr(row[8], "isoformat") else row[8],
+        "persisted": True,
+    }
+
+
+def _problem_reservation_conflicts(
+    templates: List[Dict[str, Any]],
+    history_rows: List[Any],
+) -> List[str]:
+    historical_ids = {str(row[0] or "") for row in history_rows if row and row[0]}
+    historical_families = {
+        str((row[1] if len(row) > 1 else None) or row[0] or "")
+        for row in history_rows
+        if row and (row[0] or (len(row) > 1 and row[1]))
+    }
+    conflicts: List[str] = []
+    for template in templates:
+        problem_id = str(template.get("problem_id") or "")
+        if not problem_id:
+            continue
+        round_spec = template.get("round_spec") if isinstance(template.get("round_spec"), dict) else {}
+        if round_spec.get("history_reuse_required") is True:
+            continue
+        family_id = str(round_spec.get("problem_family_id") or problem_id)
+        if problem_id in historical_ids or family_id in historical_families:
+            conflicts.append(problem_id)
+    return sorted(set(conflicts))
 
 
 def _persist_frozen_round_templates_sync(
@@ -2596,29 +2882,42 @@ def _persist_frozen_round_templates_sync(
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
-        cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"technical:{interview_id}",))
+        cursor.execute("BEGIN IMMEDIATE")
         cursor.execute(TECHNICAL_ROUND_SELECT, (interview_id, user_id))
         existing = cursor.fetchall() or []
         if existing:
             connection.commit()
             return existing
 
-        session_started_at = datetime.now(timezone.utc).replace(tzinfo=None)
         cursor.execute(
-            "SELECT deadline_at FROM Interviews WHERE interview_id = %s AND user_id = %s FOR UPDATE",
+            """
+            SELECT problem_id, COALESCE(json_extract(round_spec, '$.problem_family_id'), problem_id)
+            FROM TechnicalInterviewRounds
+            WHERE user_id = ?
+              AND interview_id <> ?
+              AND problem_id IS NOT NULL
+            """,
+            (user_id, interview_id),
+        )
+        reservation_conflicts = _problem_reservation_conflicts(templates, cursor.fetchall() or [])
+        if reservation_conflicts:
+            raise TechnicalProblemReservationConflict(
+                "A concurrent Technical attempt reserved one of the selected problem families."
+            )
+
+        session_created_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        cursor.execute(
+            "SELECT interview_id FROM Interviews WHERE interview_id = ? AND user_id = ?",
             (interview_id, user_id),
         )
-        interview_deadline = (cursor.fetchone() or [None])[0]
-        for template_index, template in enumerate(templates):
-            round_started_at = session_started_at if template_index == 0 else None
-            deadline_at = (
-                session_started_at + timedelta(seconds=int(template["duration_seconds"]))
-                if template_index == 0
-                else None
-            )
-            if deadline_at and interview_deadline:
-                deadline_at = min(deadline_at, interview_deadline)
-            round_status = "active" if template_index == 0 else "pending"
+        if not cursor.fetchone():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+        for template in templates:
+            # Problems are fully validated and frozen here, but the clock and
+            # actionability begin only after the candidate sees the briefing.
+            round_started_at = None
+            deadline_at = None
+            round_status = "pending"
             cursor.execute(
                 """
                 INSERT INTO TechnicalInterviewRounds (
@@ -2628,8 +2927,8 @@ def _persist_frozen_round_templates_sync(
                     deadline_at, mode, max_submissions, problem_version,
                     workflow_state, status, started_at, created_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?)
                 ON CONFLICT (interview_id, round_number) DO NOTHING
                 """,
                 (
@@ -2653,7 +2952,7 @@ def _persist_frozen_round_templates_sync(
                     template.get("problem_version"),
                     round_status,
                     round_started_at,
-                    session_started_at,
+                    session_created_at,
                 ),
             )
         cursor.execute(TECHNICAL_ROUND_SELECT, (interview_id, user_id))
@@ -2673,7 +2972,7 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
         """
         SELECT interview_id, settings, job_title, status, interview_type, deadline_at
         FROM Interviews
-        WHERE interview_id = %s AND user_id = %s
+        WHERE interview_id = ? AND user_id = ?
         """,
         (interview_id, user_id),
         fetchone=True,
@@ -2696,6 +2995,24 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
         (interview_id, user_id),
         fetchall=True,
     )
+    if existing and all(str(row[6] or "").lower() == "pending" for row in existing):
+        # Keep the aggregate truthful even when a pre-activation database
+        # trigger was installed before the explicit briefing contract.
+        try:
+            await async_execute(
+                """
+                UPDATE TechnicalAttemptAggregates
+                SET lifecycle_state = 'preparing',
+                    started_at = NULL,
+                    deadline_at = NULL,
+                    completed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE interview_id = ? AND user_id = ?
+                """,
+                (interview_id, user_id),
+            )
+        except Exception:
+            logger.warning("Could not reconcile pending Technical aggregate", exc_info=True)
     target_duration_seconds = max(
         600,
         min(7200, int(settings_json.get("duration_minutes") or TECHNICAL_TOTAL_DURATION_MINUTES) * 60),
@@ -2711,8 +3028,10 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
         "profile_label": stored_context.get("profile_label") or profile_type.replace("_", " ").title(),
     }
     if interview_status in TERMINAL_TECHNICAL_INTERVIEW_STATUSES:
+        serialized_rounds = await _serialize_round_rows_with_candidate_state(existing or [], user_id)
         return {
-            "rounds": _serialize_round_rows(existing or []),
+            "rounds": serialized_rounds,
+            "attempt": await _load_technical_attempt_state(interview_id, user_id, serialized_rounds),
             "generation": _generation_summary(existing or []),
             **_executor_status_payload(),
             "prepared": bool(existing),
@@ -2723,8 +3042,10 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
             "interview_status": interview_status,
         }
     if existing:
+        serialized_rounds = await _serialize_round_rows_with_candidate_state(existing, user_id)
         return {
-            "rounds": _serialize_round_rows(existing),
+            "rounds": serialized_rounds,
+            "attempt": await _load_technical_attempt_state(interview_id, user_id, serialized_rounds),
             "generation": _generation_summary(existing),
             **_executor_status_payload(),
             "prepared": True,
@@ -2741,18 +3062,29 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
         settings_json,
         interview[2] or settings_json.get("job_title") or "",
     )
-    templates = await _round_templates_for_profile(
-        profile_type,
-        interview_id,
-        user_id,
-        generation_context,
-    )
-    existing = await asyncio.to_thread(
-        _persist_frozen_round_templates_sync,
-        interview_id,
-        user_id,
-        templates,
-    )
+    templates: List[Dict[str, Any]] = []
+    for reservation_attempt in range(3):
+        templates = await _round_templates_for_profile(
+            profile_type,
+            interview_id,
+            user_id,
+            generation_context,
+        )
+        try:
+            existing = await asyncio.to_thread(
+                _persist_frozen_round_templates_sync,
+                interview_id,
+                user_id,
+                templates,
+            )
+            break
+        except TechnicalProblemReservationConflict:
+            if reservation_attempt >= 2:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Another attempt reserved these questions. Retry Technical preparation.",
+                ) from None
+            continue
     try:
         await _record_technical_event(
             interview_id,
@@ -2768,8 +3100,10 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
         )
     except Exception:
         pass
+    serialized_rounds = await _serialize_round_rows_with_candidate_state(existing, user_id)
     return {
-        "rounds": _serialize_round_rows(existing),
+        "rounds": serialized_rounds,
+        "attempt": await _load_technical_attempt_state(interview_id, user_id, serialized_rounds),
         "generation": _generation_summary(existing),
         **_executor_status_payload(),
         "prepared": True,
@@ -2782,14 +3116,145 @@ async def _ensure_technical_rounds(interview_id: str, user_id: str) -> Dict[str,
 
 
 
+def _activate_technical_session_sync(
+    interview_id: str,
+    user_id: str,
+    target_duration_seconds: int,
+) -> Dict[str, Any]:
+    """Atomically start the Technical clock and make frozen rounds actionable."""
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT status, interview_type, settings, started_at, deadline_at
+            FROM Interviews
+            WHERE interview_id = ? AND user_id = ?
+            """,
+            (interview_id, user_id),
+        )
+        interview = cursor.fetchone()
+        if not interview:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+        if not is_technical_interview_type(str(interview[1] or "")):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Only Technical Interview sessions can be activated.",
+            )
+        if str(interview[0] or "").lower() in TERMINAL_TECHNICAL_INTERVIEW_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This Technical session is no longer available for activation.",
+            )
+
+        cursor.execute(
+            """
+            SELECT round_id, status, started_at, deadline_at
+            FROM TechnicalInterviewRounds
+            WHERE interview_id = ? AND user_id = ?
+            ORDER BY round_number, created_at, round_id
+            """,
+            (interview_id, user_id),
+        )
+        rounds = cursor.fetchall() or []
+        if not rounds:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Technical problems are not prepared yet. Return to the briefing and try again.",
+            )
+
+        pending_rounds = [row for row in rounds if str(row[1] or "").lower() == "pending"]
+        if pending_rounds:
+            # Pending rows are deliberately frozen before activation.  Ignore
+            # any legacy parent timestamp and start the server-owned clock at
+            # the explicit briefing action.
+            activation_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            deadline_at = activation_at + timedelta(
+                seconds=max(600, int(target_duration_seconds))
+            )
+        else:
+            existing_started = next((row[2] for row in rounds if row[2]), None)
+            existing_deadline = next((row[3] for row in rounds if row[3]), None)
+            activation_at = interview[3] or existing_started or datetime.now(timezone.utc).replace(tzinfo=None)
+            deadline_at = interview[4] or existing_deadline or activation_at + timedelta(
+                seconds=max(600, int(target_duration_seconds))
+            )
+        settings_json = _json_value(interview[2], {})
+        if not isinstance(settings_json, dict):
+            settings_json = {}
+        settings_json.update({
+            "technical_activated_at": activation_at.isoformat(),
+            "started_at": activation_at.isoformat(),
+            "deadline_at": deadline_at.isoformat(),
+            "technical_activation_version": "briefing-activation-v1",
+        })
+        cursor.execute(
+            """
+            UPDATE Interviews
+            SET started_at = ?,
+                deadline_at = ?,
+                settings = ?
+            WHERE interview_id = ? AND user_id = ?
+            """,
+            (activation_at, deadline_at, json.dumps(settings_json), interview_id, user_id),
+        )
+        cursor.execute(
+            """
+            UPDATE TechnicalInterviewRounds
+            SET status = 'active',
+                started_at = COALESCE(started_at, ?),
+                deadline_at = COALESCE(deadline_at, ?)
+            WHERE interview_id = ? AND user_id = ? AND status = 'pending'
+            """,
+            (activation_at, deadline_at, interview_id, user_id),
+        )
+        connection.commit()
+        return {"started_at": activation_at, "deadline_at": deadline_at}
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+        return_db_connection(connection)
+
+
 @router.post("/sessions/{interview_id}/prepare")
-async def prepare_technical_rounds(interview_id: str, current_user: Dict = Depends(get_current_user)):
+async def prepare_technical_rounds(interview_id: str, current_user: Dict = Depends(local_user)):
     prepared = await _ensure_technical_rounds(interview_id, current_user["user_id"])
     return {"status": "ready", **prepared}
 
 
+@router.post("/sessions/{interview_id}/activate")
+async def activate_technical_session(interview_id: str, current_user: Dict = Depends(local_user)):
+    prepared = await _ensure_technical_rounds(interview_id, current_user["user_id"])
+    if prepared.get("read_only"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This Technical session is read-only.",
+        )
+    activation = await asyncio.to_thread(
+        _activate_technical_session_sync,
+        interview_id,
+        current_user["user_id"],
+        int(prepared.get("target_duration_seconds") or TECHNICAL_TOTAL_DURATION_MINUTES * 60),
+    )
+    activated = await _ensure_technical_rounds(interview_id, current_user["user_id"])
+    return {
+        "status": "active",
+        "active": True,
+        "activation": {
+            "started_at": activation["started_at"].isoformat(),
+            "deadline_at": activation["deadline_at"].isoformat(),
+        },
+        **activated,
+    }
+
+
 @router.get("/sessions/{interview_id}/rounds")
-async def get_or_create_rounds(interview_id: str, current_user: Dict = Depends(get_current_user)):
+async def get_or_create_rounds(interview_id: str, current_user: Dict = Depends(local_user)):
     return await _ensure_technical_rounds(interview_id, current_user["user_id"])
 
 
@@ -2895,7 +3360,7 @@ def _execution_job_public_from_row(row: Any) -> Dict[str, Any]:
         "memory_kb": int(result.get("memory_kb") or 0),
         "locked": bool(result.get("locked")),
         "submits_left": result.get("submits_left"),
-        "executor": "isolated_sandbox",
+        "executor": _active_executor_name(),
         "error": _public_execution_error(status_value, retry_count),
         "retry_count": retry_count,
         **_execution_contract_fields(
@@ -2923,7 +3388,7 @@ async def _existing_execution_job(
     source_hash: str,
 ) -> Optional[Dict[str, Any]]:
     row = await async_execute(
-        EXECUTION_JOB_SELECT + " WHERE user_id = %s AND idempotency_key = %s",
+        EXECUTION_JOB_SELECT + " WHERE user_id = ? AND idempotency_key = ?",
         (user_id, idempotency_key),
         fetchone=True,
     )
@@ -2962,14 +3427,15 @@ def _enqueue_execution_job_sync(
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
+        cursor.execute("BEGIN IMMEDIATE")
         cursor.execute(
-            EXECUTION_JOB_SELECT + " WHERE user_id = %s AND idempotency_key = %s FOR UPDATE",
+            EXECUTION_JOB_SELECT + " WHERE user_id = ? AND idempotency_key = ?",
             (user_id, idempotency_key),
         )
         existing = cursor.fetchone()
         if existing:
             cursor.execute(
-                "SELECT source_hash, interview_id FROM TechnicalExecutionJobs WHERE job_id = %s",
+                "SELECT source_hash, interview_id FROM TechnicalExecutionJobs WHERE job_id = ?",
                 (existing[0],),
             )
             contract = cursor.fetchone()
@@ -2984,7 +3450,7 @@ def _enqueue_execution_job_sync(
                     detail="Idempotency key was already used for a different technical action.",
                 )
             connection.commit()
-            return existing
+            return (*existing, True)
 
         cursor.execute(
             """
@@ -2994,8 +3460,7 @@ def _enqueue_execution_job_sync(
             JOIN Interviews i
               ON i.interview_id = tir.interview_id
              AND i.user_id = tir.user_id
-            WHERE tir.round_id = %s AND tir.user_id = %s
-            FOR UPDATE
+            WHERE tir.round_id = ? AND tir.user_id = ?
             """,
             (round_row[0], user_id),
         )
@@ -3009,10 +3474,15 @@ def _enqueue_execution_job_sync(
             deadline = interview_deadline
         if deadline and datetime.now(timezone.utc) >= deadline:
             cursor.execute(
-                "UPDATE TechnicalInterviewRounds SET status = 'expired', completed_at = COALESCE(completed_at, NOW()) WHERE round_id = %s",
+                "UPDATE TechnicalInterviewRounds SET status = 'expired', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) WHERE round_id = ?",
                 (round_row[0],),
             )
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Time has expired for this technical round.")
+        if round_status == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Activate the Technical round after the briefing before running code.",
+            )
         if round_status != "active":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This technical round is not accepting this action.")
 
@@ -3027,7 +3497,7 @@ def _enqueue_execution_job_sync(
                 """
                 SELECT COUNT(*)
                 FROM TechnicalExecutionJobs
-                WHERE round_id = %s AND user_id = %s AND action = 'submit'
+                WHERE round_id = ? AND user_id = ? AND action = 'submit'
                   AND status IN ('queued', 'leased', 'running', 'completed')
                 """,
                 (round_row[0], user_id),
@@ -3037,7 +3507,7 @@ def _enqueue_execution_job_sync(
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Submit limit reached for this problem")
             submits_left = max(0, max_submissions - used - 1)
             cursor.execute(
-                "UPDATE TechnicalInterviewRounds SET status = 'submitting' WHERE round_id = %s AND user_id = %s",
+                "UPDATE TechnicalInterviewRounds SET status = 'submitting' WHERE round_id = ? AND user_id = ?",
                 (round_row[0], user_id),
             )
 
@@ -3056,7 +3526,7 @@ def _enqueue_execution_job_sync(
             "cases": [],
             "locked": lock_submission,
             "submits_left": submits_left,
-            "executor": "isolated_sandbox",
+            "executor": "local_process",
             "editor_revision": request.editor_revision,
             "editor_hash": source_hash,
         }
@@ -3067,7 +3537,7 @@ def _enqueue_execution_job_sync(
                 source_chars, code_hash, source_excerpt, source_code,
                 source_code_encrypted, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, '[encrypted]', '[encrypted]', %s, %s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '[encrypted]', '[encrypted]', ?, ?)
             """,
             (
                 str(uuid.uuid4()), round_row[0], round_row[1], user_id, request.language,
@@ -3090,10 +3560,10 @@ def _enqueue_execution_job_sync(
                 source_hash, cases_json, cases_encrypted, status, next_attempt_at,
                 result_json, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, '[]'::jsonb, %s, 'queued', NOW(), %s, NOW(), NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, '[]', ?, 'queued', CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             RETURNING job_id, round_id, action, suite, language, status,
-                      result_json, error_message, retry_count
+                      result_json, error_message, retry_count, source_hash
             """,
             (
                 job_id,
@@ -3113,7 +3583,7 @@ def _enqueue_execution_job_sync(
         )
         inserted = cursor.fetchone()
         connection.commit()
-        return inserted
+        return (*inserted, False)
     except HTTPException:
         connection.rollback()
         raise
@@ -3155,13 +3625,6 @@ async def _queue_execution_job(
     )
     if replay:
         return replay
-    if not lock_submission:
-        allowed = await VISIBLE_RUN_RATE_LIMITER.check_limit(f"{user_id}:{round_row[0]}")
-        if not allowed:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Visible test limit reached. Wait a minute before running again.",
-            )
     row = await asyncio.to_thread(
         _enqueue_execution_job_sync,
         round_row=round_row,
@@ -3175,28 +3638,29 @@ async def _queue_execution_job(
         visible_total=visible_total,
         hidden_total=hidden_total,
     )
+    idempotent_replay = bool(row[10]) if len(row) > 10 else False
     payload = _execution_job_public_from_row(row)
     payload["idempotency_key"] = idempotency_key
-    payload["idempotent_replay"] = False
-    await _record_technical_event(
-        round_row[1],
-        round_row[0],
-        user_id,
-        f"{action}_queued",
-        {"run_id": payload["run_id"], "suite": suite, "language": request.language},
-    )
+    payload["idempotent_replay"] = idempotent_replay
+    if not idempotent_replay:
+        await _record_technical_event(
+            round_row[1],
+            round_row[0],
+            user_id,
+            f"{action}_queued",
+            {"run_id": payload["run_id"], "suite": suite, "language": request.language},
+        )
     return payload
 
 
 @router.post("/rounds/{round_id}/run", status_code=status.HTTP_202_ACCEPTED)
-async def run_code(round_id: str, request: CodeRunRequest, current_user: Dict = Depends(get_current_user)):
+async def run_code(round_id: str, request: CodeRunRequest, current_user: Dict = Depends(local_user)):
     round_row = await _load_round_for_user(round_id, current_user["user_id"])
     await _ensure_round_action_allowed(round_row, current_user["user_id"], "run")
     if str(round_row[2]) not in {"coding", "debugging", "dsa"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This round does not execute code.")
     if request.language != str(round_row[14] if len(round_row) > 14 else request.language):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Language must match the frozen round spec.")
-    _require_executor_available()
     return await _queue_execution_job(
         round_row=round_row,
         user_id=current_user["user_id"],
@@ -3213,19 +3677,18 @@ async def run_code(round_id: str, request: CodeRunRequest, current_user: Dict = 
 
 
 @router.post("/rounds/{round_id}/test", status_code=status.HTTP_202_ACCEPTED)
-async def run_visible_tests(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(get_current_user)):
+async def run_visible_tests(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(local_user)):
     return await _start_test_suite_job(round_id, request, current_user, suite="visible", lock_submission=False)
 
 
 @router.post("/rounds/{round_id}/custom-run", status_code=status.HTTP_202_ACCEPTED)
-async def run_custom_input(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(get_current_user)):
+async def run_custom_input(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(local_user)):
     round_row = await _load_round_for_user(round_id, current_user["user_id"])
     await _ensure_round_action_allowed(round_row, current_user["user_id"], "custom_run")
     if str(round_row[2]) not in {"coding", "debugging", "dsa"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This round does not execute code.")
     if request.language != str(round_row[14] if len(round_row) > 14 else request.language):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Language must match the frozen round spec.")
-    _require_executor_available()
     custom_input = request.custom_input if request.custom_input is not None else request.stdin or ""
     return await _queue_execution_job(
         round_row=round_row,
@@ -3243,14 +3706,14 @@ async def run_custom_input(round_id: str, request: TechnicalTestRequest, current
 
 
 @router.post("/rounds/{round_id}/submit", status_code=status.HTTP_202_ACCEPTED)
-async def submit_solution(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(get_current_user)):
+async def submit_solution(round_id: str, request: TechnicalTestRequest, current_user: Dict = Depends(local_user)):
     return await _start_test_suite_job(round_id, request, current_user, suite="full", lock_submission=True)
 
 
 @router.get("/runs/{run_id}")
-async def get_run_status(run_id: str, current_user: Dict = Depends(get_current_user)):
+async def get_run_status(run_id: str, current_user: Dict = Depends(local_user)):
     durable = await async_execute(
-        EXECUTION_JOB_SELECT + " WHERE job_id = %s AND user_id = %s",
+        EXECUTION_JOB_SELECT + " WHERE job_id = ? AND user_id = ?",
         (run_id, current_user["user_id"]),
         fetchone=True,
     )
@@ -3262,7 +3725,7 @@ async def get_run_status(run_id: str, current_user: Dict = Depends(get_current_u
         """
         SELECT run_id, round_id, language, stdout, stderr, exit_code, runtime_ms, hidden_validation_result
         FROM TechnicalRunEvents
-        WHERE run_id = %s AND user_id = %s
+        WHERE run_id = ? AND user_id = ?
         """,
         (run_id, current_user["user_id"]),
         fetchone=True,
@@ -3333,16 +3796,23 @@ def _persist_technical_response_raw_sync(
         if is_followup:
             cursor.execute(
                 """
-                SELECT ir.response_id, assessment.assessment_json
+                SELECT ir.response_id,
+                       (
+                           SELECT assessment_json_encrypted
+                           FROM ResponseAssessments
+                           WHERE response_id = ir.response_id
+                           ORDER BY created_at DESC, assessment_id DESC
+                           LIMIT 1
+                       ) AS assessment_json_encrypted,
+                       (
+                           SELECT assessment_json
+                           FROM ResponseAssessments
+                           WHERE response_id = ir.response_id
+                           ORDER BY created_at DESC, assessment_id DESC
+                           LIMIT 1
+                       ) AS assessment_json
                 FROM InterviewResponses ir
-                JOIN LATERAL (
-                    SELECT assessment_json
-                    FROM ResponseAssessments
-                    WHERE response_id = ir.response_id
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                ) assessment ON TRUE
-                WHERE ir.interview_id = %s AND ir.question_id = %s
+                WHERE ir.interview_id = ? AND ir.question_id = ?
                 ORDER BY ir.created_at DESC
                 LIMIT 1
                 """,
@@ -3351,7 +3821,7 @@ def _persist_technical_response_raw_sync(
             parent = cursor.fetchone()
             if not parent or (request.parent_response_id and str(parent[0]) != request.parent_response_id):
                 raise HTTPException(status_code=409, detail="The targeted follow-up is not available.")
-            parent_assessment = _json_value(parent[1], {})
+            parent_assessment = decrypt_json_field(parent[1], parent[2], {})
             decision = parent_assessment.get("decision") if isinstance(parent_assessment, dict) else {}
             if not isinstance(decision, dict) or decision.get("action") != "targeted_followup":
                 raise HTTPException(status_code=409, detail="The targeted follow-up is not available.")
@@ -3372,8 +3842,8 @@ def _persist_technical_response_raw_sync(
                 provenance, generation_metadata, difficulty_level, is_followup,
                 parent_question_id, question_spec_id, expected_point_ids
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'frozen_technical_spec', %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'frozen_technical_spec', ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (question_id) DO NOTHING
             """,
             (
@@ -3405,24 +3875,32 @@ def _persist_technical_response_raw_sync(
         )
         cursor.execute(
             """
-            SELECT ir.response_id, ra.assessment_json, ir.raw_answer_hash,
+            SELECT ir.response_id,
+                   (
+                       SELECT assessment_json_encrypted
+                       FROM ResponseAssessments
+                       WHERE response_id = ir.response_id
+                       ORDER BY created_at DESC, assessment_id DESC
+                       LIMIT 1
+                   ) AS assessment_json_encrypted,
+                   (
+                       SELECT assessment_json
+                       FROM ResponseAssessments
+                       WHERE response_id = ir.response_id
+                       ORDER BY created_at DESC, assessment_id DESC
+                       LIMIT 1
+                   ) AS assessment_json,
+                   ir.raw_answer_hash,
                    ir.evidence_hash, ir.question_id
             FROM InterviewResponses ir
-            LEFT JOIN LATERAL (
-                SELECT assessment_json
-                FROM ResponseAssessments
-                WHERE response_id = ir.response_id
-                ORDER BY created_at DESC
-                LIMIT 1
-            ) ra ON TRUE
-            WHERE ir.interview_id = %s AND ir.idempotency_key = %s
+            WHERE ir.interview_id = ? AND ir.idempotency_key = ?
             """,
             (round_row[1], request.idempotency_key),
         )
         existing = cursor.fetchone()
         if existing:
             attempted_hash = hashlib.sha256(request.response_text.strip().encode("utf-8")).hexdigest()
-            if str(existing[4]) != question_id or (existing[2] and str(existing[2]) != attempted_hash):
+            if str(existing[5]) != question_id or (existing[3] and str(existing[3]) != attempted_hash):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Idempotency key was already used for a different response.",
@@ -3432,9 +3910,9 @@ def _persist_technical_response_raw_sync(
                 "response_id": str(existing[0]),
                 "question_id": question_id,
                 "duplicate": True,
-                "assessment": _json_value(existing[1], None),
-                "raw_hash": str(existing[2] or attempted_hash),
-                "evidence_hash": str(existing[3] or attempted_hash),
+                "assessment": decrypt_json_field(existing[1], existing[2], None),
+                "raw_hash": str(existing[3] or attempted_hash),
+                "evidence_hash": str(existing[4] or attempted_hash),
                 "rubric": rubric,
                 "expected_points": expected_points,
                 "taxonomy_keys": taxonomy_keys,
@@ -3446,8 +3924,7 @@ def _persist_technical_response_raw_sync(
             """
             SELECT status, deadline_at
             FROM TechnicalInterviewRounds
-            WHERE round_id = %s AND user_id = %s
-            FOR UPDATE
+            WHERE round_id = ? AND user_id = ?
             """,
             (round_row[0], user_id),
         )
@@ -3457,11 +3934,17 @@ def _persist_technical_response_raw_sync(
         deadline = _coerce_deadline_utc(locked_round[1])
         if deadline and datetime.now(timezone.utc) >= deadline:
             cursor.execute(
-                "UPDATE TechnicalInterviewRounds SET status = 'expired', completed_at = COALESCE(completed_at, NOW()) WHERE round_id = %s",
+                "UPDATE TechnicalInterviewRounds SET status = 'expired', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) WHERE round_id = ?",
                 (round_row[0],),
             )
             raise HTTPException(status_code=status.HTTP_410_GONE, detail="Time has expired for this technical round.")
-        if str(locked_round[0] or "active").lower() != "active":
+        locked_status = str(locked_round[0] or "active").lower()
+        if locked_status == "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Activate the Technical round after the briefing before recording an explanation.",
+            )
+        if locked_status != "active":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This technical round is already closed.")
 
         answer = request.response_text.strip()
@@ -3481,8 +3964,8 @@ def _persist_technical_response_raw_sync(
                 evidence_hash, answer_text_encrypted, transcript_encrypted,
                 raw_answer_hash, input_mode, timing_json, created_at
             )
-            VALUES (%s, %s, %s, '[encrypted]', %s, %s, %s, %s, %s, %s,
-                    %s, 'text', %s, NOW())
+            VALUES (?, ?, ?, '[encrypted]', ?, ?, ?, ?, ?, ?,
+                    ?, 'text', ?, CURRENT_TIMESTAMP)
             ON CONFLICT (interview_id, idempotency_key) DO NOTHING
             RETURNING response_id
             """,
@@ -3506,7 +3989,7 @@ def _persist_technical_response_raw_sync(
         inserted = cursor.fetchone()
         if not inserted:
             cursor.execute(
-                "SELECT response_id FROM InterviewResponses WHERE interview_id = %s AND idempotency_key = %s",
+                "SELECT response_id FROM InterviewResponses WHERE interview_id = ? AND idempotency_key = ?",
                 (round_row[1], request.idempotency_key),
             )
             response_id = str(cursor.fetchone()[0])
@@ -3550,9 +4033,10 @@ def _commit_technical_response_assessment_sync(
             """
             INSERT INTO ResponseAssessments (
                 assessment_id, response_id, interview_id, evaluator_version,
-                evidence_hash, overall_score, assessment_json, created_at
+                evidence_hash, overall_score, assessment_json,
+                assessment_json_encrypted, created_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (response_id, evaluator_version, evidence_hash) DO NOTHING
             """,
             (
@@ -3562,7 +4046,8 @@ def _commit_technical_response_assessment_sync(
                 EVALUATION_VERSION,
                 evidence_hash,
                 assessment.get("overall_score") if isinstance(assessment.get("overall_score"), (int, float)) else None,
-                json.dumps(assessment),
+                json.dumps({"encrypted": True}),
+                encrypt_data(json.dumps(assessment)).encode("utf-8"),
             ),
         )
         assessment_inserted = cursor.rowcount > 0
@@ -3579,7 +4064,7 @@ def _commit_technical_response_assessment_sync(
                     user_id, interview_id, round_id, evidence_type, content, payload,
                     content_encrypted, evidence_hash
                 )
-                VALUES (%s, %s, %s, 'technical_response', '[encrypted]', %s, %s, %s)
+                VALUES (?, ?, ?, 'technical_response', '[encrypted]', ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -3599,8 +4084,8 @@ def _commit_technical_response_assessment_sync(
             cursor.execute(
                 """
                 UPDATE TechnicalInterviewRounds
-                SET status = 'submitted', completed_at = COALESCE(completed_at, NOW())
-                WHERE round_id = %s AND user_id = %s AND status = 'active'
+                SET status = 'submitted', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+                WHERE round_id = ? AND user_id = ? AND status = 'active'
                 """,
                 (round_row[0], user_id),
             )
@@ -3672,7 +4157,7 @@ def _public_technical_assessment(assessment: Dict[str, Any], mode: str) -> Dict[
 async def submit_technical_response(
     round_id: str,
     request: TechnicalResponseRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     round_row = await _load_round_for_user(round_id, current_user["user_id"])
     if str(round_row[2]) in {"coding", "debugging", "dsa"}:
@@ -3700,7 +4185,6 @@ async def submit_technical_response(
         "question_type": str(round_row[2]),
         "taxonomy_keys": raw.get("taxonomy_keys") or [],
         "semantic_analysis_enabled": True,
-        "semantic_budget_available": True,
     }
     rubric = {
         **(raw.get("rubric") or {}),
@@ -3767,14 +4251,34 @@ async def submit_technical_response(
 
 
 @router.post("/events")
-async def record_technical_event(request: TechnicalEventRequest, current_user: Dict = Depends(get_current_user)):
+async def record_technical_event(request: TechnicalEventRequest, current_user: Dict = Depends(local_user)):
     interview = await async_execute(
-        "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
-        (request.interview_id, current_user["user_id"]),
+        """
+        SELECT 1
+        FROM Interviews interview
+        WHERE interview.interview_id = ?
+          AND interview.user_id = ?
+          AND (
+            ? IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM TechnicalInterviewRounds round
+                WHERE round.round_id = ?
+                  AND round.interview_id = interview.interview_id
+                  AND round.user_id = interview.user_id
+            )
+          )
+        """,
+        (
+            request.interview_id,
+            current_user["user_id"],
+            request.round_id,
+            request.round_id,
+        ),
         fetchone=True,
     )
     if not interview:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview or technical round not found")
     await _record_technical_event(request.interview_id, request.round_id, current_user["user_id"], request.event_type, request.payload)
     if request.event_type in {
         "paste",
@@ -3788,18 +4292,18 @@ async def record_technical_event(request: TechnicalEventRequest, current_user: D
         "screen_share_stopped",
         "technical_permission_failed",
         "large_code_jump",
-        "suspicious_fast_submit",
-        "visible_output_hardcode",
+        "fast_submit",
+        "visible_output_pattern",
         "mobile_phone_detected",
         "multiple_people_detected",
         "screen_not_monitor",
         "no_clarification_before_coding",
-        "suspicious_clipboard_pattern",
+        "clipboard_pattern",
     }:
         await async_execute(
             """
-            INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO SelfReviewEvents (interview_id, user_id, event_type, payload)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 request.interview_id,
@@ -3811,21 +4315,19 @@ async def record_technical_event(request: TechnicalEventRequest, current_user: D
                 }),
             ),
         )
-        severity = "severe" if request.event_type in INTEGRITY_SEVERE_ONLY_EVENT_TYPES else "medium"
-        await _record_proctoring_flag(request.interview_id, current_user["user_id"], request.event_type, severity, request.payload)
     return {"success": True}
 
 
 @router.post("/rounds/{round_id}/whiteboard")
-async def save_whiteboard(round_id: str, request: WhiteboardSaveRequest, current_user: Dict = Depends(get_current_user)):
+async def save_whiteboard(round_id: str, request: WhiteboardSaveRequest, current_user: Dict = Depends(local_user)):
     round_row = await _load_round_for_user(round_id, current_user["user_id"])
     await _ensure_round_action_allowed(round_row, current_user["user_id"], "whiteboard")
     updated = await async_execute(
         """
         UPDATE TechnicalInterviewRounds
-        SET whiteboard_json = '{"encrypted":true}'::jsonb,
-            whiteboard_encrypted = %s
-        WHERE round_id = %s AND user_id = %s
+        SET whiteboard_json = '{"encrypted":true}',
+            whiteboard_encrypted = ?
+        WHERE round_id = ? AND user_id = ?
         RETURNING round_id
         """,
         (
@@ -3841,38 +4343,20 @@ async def save_whiteboard(round_id: str, request: WhiteboardSaveRequest, current
 
 
 def _activate_next_round_locked(cursor: Any, interview_id: str, user_id: str) -> Optional[str]:
+    # Activation starts every frozen problem together.  Submitting one
+    # problem must never silently start another server clock.
     cursor.execute(
         """
         SELECT round_id
         FROM TechnicalInterviewRounds
-        WHERE interview_id = %s AND user_id = %s AND status = 'pending'
-        ORDER BY round_number
+        WHERE interview_id = ? AND user_id = ? AND status = 'active'
+        ORDER BY round_number, round_id
         LIMIT 1
-        FOR UPDATE
         """,
         (interview_id, user_id),
     )
     next_row = cursor.fetchone()
-    if not next_row:
-        return None
-    cursor.execute(
-        """
-        UPDATE TechnicalInterviewRounds round
-        SET status = 'active', started_at = NOW(),
-            deadline_at = LEAST(
-                NOW() + (round.duration_seconds * INTERVAL '1 second'),
-                COALESCE(interview.deadline_at, NOW() + (round.duration_seconds * INTERVAL '1 second'))
-            )
-        FROM Interviews interview
-        WHERE round.round_id = %s
-          AND round.interview_id = interview.interview_id
-          AND round.user_id = interview.user_id
-        RETURNING round.round_id
-        """,
-        (next_row[0],),
-    )
-    activated = cursor.fetchone()
-    return str(activated[0]) if activated else None
+    return str(next_row[0]) if next_row else None
 
 
 def _persist_workflow_evidence_sync(
@@ -3888,8 +4372,7 @@ def _persist_workflow_evidence_sync(
             SELECT round_id, interview_id, round_type, status, deadline_at,
                    workflow_state, round_number
             FROM TechnicalInterviewRounds
-            WHERE round_id = %s AND user_id = %s
-            FOR UPDATE
+            WHERE round_id = ? AND user_id = ?
             """,
             (round_id, user_id),
         )
@@ -3900,12 +4383,17 @@ def _persist_workflow_evidence_sync(
         round_status = str(row[3] or "active").lower()
         if round_type not in {"coding", "debugging", "dsa"}:
             raise HTTPException(status_code=409, detail="Workflow evidence applies only to coding or debugging rounds.")
-        if round_status in {"pending", "submitted", "completed", "expired", "cancelled"}:
+        if round_status == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Activate the Technical round after the briefing before recording workflow evidence.",
+            )
+        if round_status in {"submitted", "completed", "expired", "cancelled"}:
             raise HTTPException(status_code=409, detail="This technical round is not accepting workflow evidence.")
         deadline = _coerce_deadline_utc(row[4])
         if deadline and datetime.now(timezone.utc) >= deadline:
             cursor.execute(
-                "UPDATE TechnicalInterviewRounds SET status='expired', completed_at=COALESCE(completed_at,NOW()) WHERE round_id=%s",
+                "UPDATE TechnicalInterviewRounds SET status='expired', completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE round_id=?",
                 (round_id,),
             )
             raise HTTPException(status_code=410, detail="Time has expired for this technical round.")
@@ -3914,7 +4402,7 @@ def _persist_workflow_evidence_sync(
             """
             SELECT evidence_id
             FROM TechnicalReasoningEvidence
-            WHERE user_id = %s AND round_id = %s AND idempotency_key = %s
+            WHERE user_id = ? AND round_id = ? AND idempotency_key = ?
             """,
             (user_id, round_id, request.idempotency_key),
         )
@@ -3955,7 +4443,7 @@ def _persist_workflow_evidence_sync(
             INSERT INTO TechnicalReasoningEvidence (
                 user_id, interview_id, round_id, evidence_type, content, payload,
                 content_encrypted, idempotency_key, evidence_hash
-            ) VALUES (%s, %s, %s, %s, '[encrypted]', %s, %s, %s, %s)
+            ) VALUES (?, ?, ?, ?, '[encrypted]', ?, ?, ?, ?)
             """,
             (
                 user_id, row[1], round_id, f"workflow_{request.stage}",
@@ -3976,10 +4464,10 @@ def _persist_workflow_evidence_sync(
         cursor.execute(
             """
             UPDATE TechnicalInterviewRounds
-            SET workflow_state = %s,
-                status = %s,
-                completed_at = CASE WHEN %s = 'submitted' THEN COALESCE(completed_at, NOW()) ELSE completed_at END
-            WHERE round_id = %s AND user_id = %s
+            SET workflow_state = ?,
+                status = ?,
+                completed_at = CASE WHEN ? = 'submitted' THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END
+            WHERE round_id = ? AND user_id = ?
             """,
             (json.dumps(workflow_state), next_status, next_status, round_id, user_id),
         )
@@ -4010,7 +4498,7 @@ def _persist_workflow_evidence_sync(
 async def submit_workflow_evidence(
     round_id: str,
     request: TechnicalWorkflowRequest,
-    current_user: Dict = Depends(get_current_user),
+    current_user: Dict = Depends(local_user),
 ):
     return await asyncio.to_thread(
         _persist_workflow_evidence_sync,
@@ -4021,63 +4509,34 @@ async def submit_workflow_evidence(
 
 
 @router.post("/rounds/{round_id}/save-draft")
-async def save_draft(round_id: str, request: DraftSaveRequest, current_user: Dict = Depends(get_current_user)):
+async def save_draft(round_id: str, request: DraftSaveRequest, current_user: Dict = Depends(local_user)):
     round_row = await _load_round_for_user(round_id, current_user["user_id"])
     await _ensure_round_action_allowed(round_row, current_user["user_id"], "save_draft")
     if request.language != str(round_row[14] if len(round_row) > 14 else request.language):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Language must match the frozen round spec.")
-    await _record_code_snapshot(
+    return await asyncio.to_thread(
+        _persist_draft_snapshot_sync,
         round_row,
         current_user["user_id"],
-        request.language,
-        request.code,
-        {"event": "save_draft"}
+        request,
     )
-    return {"success": True}
 
 
 
 async def _count_integrity_warnings(interview_id: str) -> int:
-    row = await async_execute(
-        """
-        SELECT COUNT(*)
-        FROM MalpracticeEvents
-        WHERE interview_id = %s
-          AND severity = 'warning'
-          AND event_type = ANY(%s)
-        """,
-        (interview_id, list(INTEGRITY_WARNING_EVENT_TYPES)),
-        fetchone=True,
-    )
-    return int(row[0] or 0) if row else 0
+    # Kept as a compatibility helper for older clients. Coaching signals are
+    # descriptive only and never accumulate warnings or affect scoring.
+    return 0
 
 
 async def _flag_technical_interview(interview_id: str, user_id: str, warning_count: int) -> None:
-    row = await async_execute(
-        "SELECT settings FROM Interviews WHERE interview_id = %s AND user_id = %s",
-        (interview_id, user_id),
-        fetchone=True,
-    )
-    if not row:
-        return
-    settings_json = row[0] or {}
-    if isinstance(settings_json, str):
-        settings_json = json.loads(settings_json)
-    if not isinstance(settings_json, dict):
-        settings_json = {}
-    settings_json["integrity_status"] = "flagged"
-    settings_json["integrity_warning_count"] = warning_count
-    settings_json["integrity_flagged_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    await async_execute(
-        "UPDATE Interviews SET settings = %s WHERE interview_id = %s AND user_id = %s",
-        (json.dumps(settings_json), interview_id, user_id),
-    )
+    return None
 
 
 @router.get("/sessions/{interview_id}/integrity")
-async def get_technical_integrity(interview_id: str, current_user: Dict = Depends(get_current_user)):
+async def get_technical_integrity(interview_id: str, current_user: Dict = Depends(local_user)):
     interview = await async_execute(
-        "SELECT settings FROM Interviews WHERE interview_id = %s AND user_id = %s",
+        "SELECT settings FROM Interviews WHERE interview_id = ? AND user_id = ?",
         (interview_id, current_user["user_id"]),
         fetchone=True,
     )
@@ -4086,21 +4545,18 @@ async def get_technical_integrity(interview_id: str, current_user: Dict = Depend
     settings_json = interview[0] or {}
     if isinstance(settings_json, str):
         settings_json = json.loads(settings_json)
-    warning_count = await _count_integrity_warnings(interview_id)
-    flagged = (
-        isinstance(settings_json, dict) and settings_json.get("integrity_status") == "flagged"
-    )
     return {
-        "warning_count": warning_count,
-        "threshold": INTEGRITY_WARNING_THRESHOLD,
-        "flagged": flagged,
+        "warning_count": 0,
+        "threshold": None,
+        "flagged": False,
+        "mode": "self_review",
     }
 
 
-@router.post("/anti-cheat")
-async def record_anti_cheat_event(request: AntiCheatEventRequest, current_user: Dict = Depends(get_current_user)):
+@router.post("/self-review-signal")
+async def record_self_review_signal(request: SelfReviewSignalRequest, current_user: Dict = Depends(local_user)):
     interview = await async_execute(
-        "SELECT 1 FROM Interviews WHERE interview_id = %s AND user_id = %s",
+        "SELECT 1 FROM Interviews WHERE interview_id = ? AND user_id = ?",
         (request.interview_id, current_user["user_id"]),
         fetchone=True,
     )
@@ -4108,70 +4564,25 @@ async def record_anti_cheat_event(request: AntiCheatEventRequest, current_user: 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview not found")
     await async_execute(
         """
-        INSERT INTO AntiCheatEvents (interview_id, user_id, event_type, payload)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO SelfReviewEvents (interview_id, user_id, event_type, payload)
+        VALUES (?, ?, ?, ?)
         """,
         (
             request.interview_id,
             current_user["user_id"],
-            request.event_type,
+            f"self_review:{request.event_type[:48]}",
             json.dumps({
                 **_safe_event_metadata(request.payload),
                 "encrypted_payload": encrypt_data(json.dumps(request.payload, separators=(",", ":"), ensure_ascii=False, default=str)),
             }),
         ),
     )
-    if request.event_type in INTEGRITY_SEVERE_ONLY_EVENT_TYPES:
-        severity = "severe"
-    elif request.event_type in INTEGRITY_WARNING_EVENT_TYPES:
-        severity = "warning"
-    else:
-        severity = "warning"
-    await async_execute(
-        """
-        INSERT INTO MalpracticeEvents (interview_id, user_id, event_type, severity, payload)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (
-            request.interview_id,
-            current_user["user_id"],
-            request.event_type,
-            severity,
-            json.dumps({
-                **_safe_event_metadata(request.payload),
-                "encrypted_payload": encrypt_data(json.dumps(request.payload, separators=(",", ":"), ensure_ascii=False, default=str)),
-            }),
-        ),
-    )
-    await _record_proctoring_flag(
-        request.interview_id,
-        current_user["user_id"],
-        request.event_type,
-        "high" if severity == "severe" else "medium",
-        request.payload,
-    )
-    warning_count = await _count_integrity_warnings(request.interview_id)
-    flagged = warning_count >= INTEGRITY_WARNING_THRESHOLD
-    if flagged:
-        await _flag_technical_interview(request.interview_id, current_user["user_id"], warning_count)
-        await async_execute(
-            """
-            INSERT INTO MalpracticeEvents (interview_id, user_id, event_type, severity, payload)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (
-                request.interview_id,
-                current_user["user_id"],
-                "session_flagged",
-                "severe",
-                json.dumps({"warning_count": warning_count, "threshold": INTEGRITY_WARNING_THRESHOLD}),
-            ),
-        )
     return {
         "success": True,
-        "warning_count": warning_count,
-        "threshold": INTEGRITY_WARNING_THRESHOLD,
-        "flagged": flagged,
+        "warning_count": 0,
+        "threshold": None,
+        "flagged": False,
+        "mode": "self_review",
     }
 
 
@@ -4182,10 +4593,11 @@ async def _load_round_for_user(round_id: str, user_id: str):
                tir.created_at, tir.completed_at, i.status AS interview_status, i.settings,
                tir.round_spec, tir.deadline_at, tir.mode, tir.max_submissions,
                tir.language, tir.duration_seconds, tir.round_spec_id,
-               tir.workflow_state, tir.problem_version, i.deadline_at AS interview_deadline
+               tir.workflow_state, tir.problem_version, i.deadline_at AS interview_deadline,
+               tir.starter_code
         FROM TechnicalInterviewRounds tir
         JOIN Interviews i ON i.interview_id = tir.interview_id AND i.user_id = tir.user_id
-        WHERE tir.round_id = %s AND tir.user_id = %s
+        WHERE tir.round_id = ? AND tir.user_id = ?
         """,
         (round_id, user_id),
         fetchone=True,
@@ -4215,23 +4627,12 @@ async def _ensure_round_action_allowed(round_row, user_id: str, action: str) -> 
             detail="This interview is no longer accepting technical round changes.",
         )
 
-    if settings_json.get("integrity_status") == "flagged" and action != "save_draft":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This technical round is locked after repeated integrity warnings.",
-        )
-
     if round_status in {"submitted", "submitting", "completed"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="This technical round has already been submitted.",
         )
-    if round_status == "pending":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Complete the current technical round before starting this one.",
-        )
-    if round_status == "awaiting_explanation" and action not in {"save_draft"}:
+    if round_status == "awaiting_explanation":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="The final code is locked. Complete the complexity and final explanation steps.",
@@ -4241,12 +4642,6 @@ async def _ensure_round_action_allowed(round_row, user_id: str, action: str) -> 
             status_code=status.HTTP_410_GONE,
             detail="This technical round is closed.",
         )
-    if round_status == "flagged" and action != "save_draft":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This technical round is locked.",
-        )
-
     persisted_deadline = _coerce_deadline_utc(round_row[11] if len(round_row) > 11 else None)
     interview_deadline = _coerce_deadline_utc(round_row[19] if len(round_row) > 19 else None)
     if interview_deadline and (not persisted_deadline or interview_deadline < persisted_deadline):
@@ -4263,14 +4658,19 @@ async def _ensure_round_action_allowed(round_row, user_id: str, action: str) -> 
         await async_execute(
             """
             UPDATE TechnicalInterviewRounds
-            SET status = 'expired', completed_at = COALESCE(completed_at, NOW())
-            WHERE round_id = %s AND user_id = %s AND status NOT IN ('submitted', 'expired', 'cancelled')
+            SET status = 'expired', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+            WHERE round_id = ? AND user_id = ? AND status NOT IN ('submitted', 'expired', 'cancelled')
             """,
             (round_row[0], user_id),
         )
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Time has expired for this technical round.",
+        )
+    if round_status == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Activate the Technical round after the briefing before editing.",
         )
 
 
@@ -4350,7 +4750,20 @@ async def _start_test_suite_job(
     frozen_language = str(round_row[14] if len(round_row) > 14 else request.language)
     if request.language != frozen_language:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Language must match the frozen round spec.")
-    _require_executor_available()
+    from local_execution import executor_status
+
+    runner = executor_status()
+    language_capability = (runner.get("languages") or {}).get(frozen_language) or {}
+    if not (
+        runner.get("healthy")
+        and runner.get("isolated")
+        and language_capability.get("available")
+    ):
+        reason = language_capability.get("reason") or runner.get("reason") or "A supported runtime and OS sandbox are required."
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Code execution is unavailable for {frozen_language}: {reason}",
+        )
     cases, visible_total, hidden_total = _frozen_round_cases(round_row, suite)
     if not cases:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No test cases are available for this problem")
@@ -4369,17 +4782,9 @@ async def _start_test_suite_job(
 
 
 async def _execute_code(language: str, code: str, stdin: str) -> Dict[str, Any]:
-    _require_executor_available()
-    try:
-        return await _execute_piston(language, code, stdin)
-    except HTTPException:
-        raise
-    except Exception:
-        logger.warning("Private isolated sandbox execution failed", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The private code execution service is temporarily unavailable.",
-        ) from None
+    from local_execution import execute_local
+
+    return await execute_local(language, code, stdin)
 
 
 def _bound_execution_output(
@@ -4409,107 +4814,13 @@ def _bound_execution_output(
     return bounded_stdout, bounded_stderr, True
 
 
-async def _resolve_piston_runtime(language: str) -> Dict[str, str]:
-    if language in PISTON_RUNTIME_CACHE:
-        return PISTON_RUNTIME_CACHE[language]
-    aliases = PISTON_LANGUAGE_ALIASES.get(language)
-    if not aliases:
-        raise HTTPException(status_code=400, detail="Unsupported language")
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
-            headers = {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"} if settings.PISTON_API_TOKEN else {}
-            async with session.get(settings.PISTON_API_URL.rstrip("/") + "/runtimes", headers=headers) as response:
-                if response.status >= 400:
-                    raise HTTPException(status_code=502, detail="Could not load code runtimes")
-                runtimes = await response.json()
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=502, detail="Code execution service unavailable") from None
-    for runtime in runtimes:
-        names = {runtime.get("language"), *(runtime.get("aliases") or [])}
-        if aliases & {str(name).lower() for name in names if name}:
-            resolved = {"language": runtime["language"], "version": runtime["version"]}
-            PISTON_RUNTIME_CACHE[language] = resolved
-            return resolved
-    raise HTTPException(status_code=502, detail=f"No code runtime for {language}")
-
-
-async def _execute_piston(language: str, code: str, stdin: str) -> Dict[str, Any]:
-    runtime = await _resolve_piston_runtime(language)
-    payload = {
-        "language": runtime["language"],
-        "version": runtime["version"],
-        "files": [{"name": FILE_NAMES[language], "content": code}],
-        "stdin": stdin or "",
-        "compile_timeout": 10000,
-        "run_timeout": 2000,
-        "compile_cpu_time": 10000,
-        "run_cpu_time": 2000,
-        "compile_memory_limit": 256 * 1024 * 1024,
-        "run_memory_limit": 256 * 1024 * 1024,
-    }
-    started = time.time()
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=settings.PISTON_TIMEOUT_SECONDS)) as session:
-            headers = {"Authorization": f"Bearer {settings.PISTON_API_TOKEN}"} if settings.PISTON_API_TOKEN else {}
-            async with session.post(settings.PISTON_API_URL.rstrip("/") + "/execute", json=payload, headers=headers) as response:
-                if response.status == status.HTTP_429_TOO_MANY_REQUESTS:
-                    raise HTTPException(
-                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                        detail="Code execution capacity is full; retry with backoff.",
-                    )
-                if response.status == status.HTTP_503_SERVICE_UNAVAILABLE:
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail="The private code execution service is temporarily unavailable.",
-                    )
-                if response.status >= 400:
-                    raise HTTPException(status_code=502, detail="Code execution service failed")
-                result = await response.json()
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=502, detail="Code execution service unavailable") from None
-    run = result.get("run") or {}
-    compile_result = result.get("compile") or {}
-    stdout = str(run.get("stdout") or "")
-    stderr = str(run.get("stderr") or compile_result.get("stderr") or compile_result.get("output") or "")
-    stdout, stderr, truncated = _bound_execution_output(
-        stdout,
-        stderr,
-        executor_truncated=bool(run.get("truncated")),
-    )
-    run_code = run.get("code")
-    compile_code = compile_result.get("code")
-    exit_code = int(run_code if run_code is not None else (compile_code if compile_code is not None else 0))
-    execution_status = str(run.get("status") or compile_result.get("status") or "").upper()
-    timed_out = execution_status == "TO"
-    accepted = exit_code == 0 and not execution_status
-    wall_time_ms = int(run.get("wall_time") or compile_result.get("wall_time") or 0)
-    memory_bytes = int(run.get("memory") or compile_result.get("memory") or 0)
-    return {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": exit_code,
-        "status_id": 3 if accepted else (5 if timed_out else 6),
-        "status_description": "Accepted" if accepted else ("Time Limit Exceeded" if timed_out else "Runtime Error"),
-        "runtime_ms": wall_time_ms or int((time.time() - started) * 1000),
-        "memory_kb": max(0, memory_bytes // 1024),
-        "executor": "isolated_sandbox",
-        "truncated": truncated,
-    }
-
-
-def _judge0_verdict(result: Dict[str, Any]) -> str:
-    status_id = int(result.get("status_id") or 0)
-    if status_id == 3:
-        return "Accepted"
-    if status_id == 4:
-        return "Wrong Answer"
-    if status_id == 5:
+def _execution_verdict(result: Dict[str, Any]) -> str:
+    if bool(result.get("timed_out")):
         return "TLE"
-    return "Runtime Error"
+    if bool(result.get("compile_failed")):
+        return "Compile Error"
+    exit_code = result.get("exit_code")
+    return "Accepted" if exit_code is not None and int(exit_code) == 0 else "Runtime Error"
 
 
 def _outputs_match(stdout: str, expected: str) -> bool:
@@ -4520,34 +4831,140 @@ def _outputs_match(stdout: str, expected: str) -> bool:
 
 
 def _case_verdict(result: Dict[str, Any], case: Dict[str, Any]) -> str:
-    verdict = _judge0_verdict(result)
+    verdict = _execution_verdict(result)
     if verdict != "Accepted":
         return verdict
     return "Accepted" if _outputs_match(result.get("stdout", ""), str(case.get("expected", ""))) else "Wrong Answer"
 
 
-async def _record_code_snapshot(round_row, user_id: str, language: str, code: str, metadata: Dict[str, Any]):
-    await async_execute(
-        """
-        INSERT INTO TechnicalCodeSnapshots (
-            snapshot_id, round_id, interview_id, user_id, language,
-            source_chars, code_hash, source_excerpt, source_code,
-            source_code_encrypted, metadata
+def _persist_draft_snapshot_sync(
+    round_row: Any,
+    user_id: str,
+    request: DraftSaveRequest,
+) -> Dict[str, Any]:
+    """Persist one revisioned editor state under a per-round transaction lock."""
+    round_id = str(round_row[0])
+    interview_id = str(round_row[1])
+    starter_code = str(round_row[20] or "") if len(round_row) > 20 else ""
+    source_hash = hashlib.sha256(request.code.encode("utf-8")).hexdigest()
+    if request.editor_hash and request.editor_hash.lower() != source_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The editor content changed before this draft could be saved. Retry with the latest revision.",
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, '[encrypted]', '[encrypted]', %s, %s)
-        """,
-        (
-            str(uuid.uuid4()),
-            round_row[0],
-            round_row[1],
-            user_id,
-            language,
-            len(code),
-            hashlib.sha256(code.encode("utf-8")).hexdigest(),
-            encrypt_data(code).encode("utf-8"),
-            json.dumps(metadata),
-        ),
-    )
+
+    candidate_edited = _source_differs_from_starter(request.code, starter_code)
+    metadata = {
+        "event": "save_draft",
+        "candidate_edited": candidate_edited,
+        "editor_revision": request.editor_revision,
+        "editor_hash": source_hash,
+    }
+    connection = get_db_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            SELECT snapshot_id, code_hash, metadata, created_at
+            FROM TechnicalCodeSnapshots
+            WHERE round_id = ? AND user_id = ?
+              AND json_extract(metadata, '$.event') = 'save_draft'
+            ORDER BY created_at DESC, snapshot_id DESC
+            LIMIT 1
+            """,
+            (round_id, user_id),
+        )
+        latest = cursor.fetchone()
+        latest_metadata = _json_value(latest[2], {}) if latest else {}
+        latest_revision = _editor_revision_from_metadata(latest_metadata)
+        incoming_revision = request.editor_revision
+
+        if incoming_revision is not None and latest_revision is not None:
+            if incoming_revision < latest_revision:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A newer draft is already saved for this question. Reload before editing.",
+                )
+            if incoming_revision == latest_revision and str(latest[1] or "") != source_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="This editor revision conflicts with another saved draft. Reload before editing.",
+                )
+
+        if latest and str(latest[1] or "") == source_hash:
+            if incoming_revision is None or (
+                latest_revision is not None and incoming_revision <= latest_revision
+            ):
+                connection.commit()
+                return {
+                    "success": True,
+                    "saved": True,
+                    "idempotent_replay": True,
+                    "candidate_edited": candidate_edited,
+                    "editor_revision": latest_revision,
+                    "editor_hash": source_hash,
+                    "saved_at": latest[3].isoformat() if latest[3] and hasattr(latest[3], "isoformat") else latest[3],
+                }
+
+        # Do not create evidence merely because the initial starter template was
+        # mounted or the page was closed without an edit.
+        if not latest and not candidate_edited and incoming_revision in {None, 0}:
+            connection.commit()
+            return {
+                "success": True,
+                "saved": False,
+                "idempotent_replay": False,
+                "candidate_edited": False,
+                "editor_revision": incoming_revision,
+                "editor_hash": source_hash,
+                "saved_at": None,
+            }
+
+        snapshot_id = str(uuid.uuid4())
+        cursor.execute(
+            """
+            INSERT INTO TechnicalCodeSnapshots (
+                snapshot_id, round_id, interview_id, user_id, language,
+                source_chars, code_hash, source_excerpt, source_code,
+                source_code_encrypted, metadata
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, '[encrypted]', '[encrypted]', ?, ?)
+            RETURNING created_at
+            """,
+            (
+                snapshot_id,
+                round_id,
+                interview_id,
+                user_id,
+                request.language,
+                len(request.code),
+                source_hash,
+                encrypt_data(request.code).encode("utf-8"),
+                json.dumps(metadata),
+            ),
+        )
+        inserted = cursor.fetchone()
+        saved_at = inserted[0] if inserted else None
+        connection.commit()
+        return {
+            "success": True,
+            "saved": True,
+            "idempotent_replay": False,
+            "candidate_edited": candidate_edited,
+            "editor_revision": incoming_revision,
+            "editor_hash": source_hash,
+            "saved_at": saved_at.isoformat() if saved_at and hasattr(saved_at, "isoformat") else saved_at,
+        }
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+        return_db_connection(connection)
 
 
 def _safe_event_metadata(payload: Dict[str, Any], *, idempotency_key: Optional[str] = None) -> Dict[str, Any]:
@@ -4581,7 +4998,7 @@ async def _record_technical_event(
             interview_id, round_id, user_id, event_type, payload,
             payload_encrypted, idempotency_key
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (user_id, round_id, idempotency_key)
             WHERE idempotency_key IS NOT NULL
             DO NOTHING
@@ -4615,7 +5032,7 @@ async def _record_technical_event(
                 user_id, interview_id, round_id, evidence_type, content, payload,
                 content_encrypted, idempotency_key, evidence_hash
             )
-            VALUES (%s, %s, %s, %s, '[encrypted]', %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, '[encrypted]', ?, ?, ?, ?)
             ON CONFLICT (user_id, round_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL
                 DO NOTHING
@@ -4625,25 +5042,3 @@ async def _record_technical_event(
                 json.dumps(safe_payload), encrypted_payload, idempotency_key, evidence_hash,
             ),
         )
-
-
-async def _record_proctoring_flag(interview_id: str, user_id: str, flag_type: str, severity: str, evidence: Dict[str, Any]) -> None:
-    try:
-        await async_execute(
-            """
-            INSERT INTO ProctoringFlags (interview_id, user_id, flag_type, severity, evidence)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (
-                interview_id,
-                user_id,
-                flag_type[:60],
-                severity,
-                json.dumps({
-                    **_safe_event_metadata(evidence or {}),
-                    "encrypted_payload": encrypt_data(json.dumps(evidence or {}, separators=(",", ":"), ensure_ascii=False, default=str)),
-                }),
-            ),
-        )
-    except Exception:
-        logger.warning("Proctoring flag write skipped for %s", flag_type)

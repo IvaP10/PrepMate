@@ -25,7 +25,7 @@ ALLOWED_CLIENT_EVENT_TYPES = {
     "avatar_ice",
     "video_frame",
     "body_language_metrics",
-    "anti_cheat_event",
+    "self_review_signal",
     "response_complete",
     "text_answer",
     "end_interview",
@@ -135,60 +135,28 @@ def canonical_integrity_event(value: Any) -> str:
     return canonical
 
 
-def acquire_controller_lease(redis_client: Any, key: str, connection_id: str) -> bool:
-    existing = redis_client.get(key)
+def acquire_controller_lease(local_cache: Any, key: str, connection_id: str) -> bool:
+    existing = local_cache.get(key)
     if isinstance(existing, bytes):
         existing = existing.decode("utf-8", errors="ignore")
     if existing == connection_id:
-        return bool(redis_client.expire(key, CONTROLLER_LEASE_SECONDS))
-    return bool(redis_client.set(key, connection_id, nx=True, ex=CONTROLLER_LEASE_SECONDS))
+        return bool(local_cache.expire(key, CONTROLLER_LEASE_SECONDS))
+    return bool(local_cache.set(key, connection_id, nx=True, ex=CONTROLLER_LEASE_SECONDS))
 
 
-def renew_controller_lease(redis_client: Any, key: str, connection_id: str) -> bool:
-    result = redis_client.eval(
-        """
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
-          return redis.call('EXPIRE', KEYS[1], ARGV[2])
-        end
-        return 0
-        """,
-        1,
-        key,
-        connection_id,
-        CONTROLLER_LEASE_SECONDS,
-    )
-    return bool(result)
+def renew_controller_lease(local_cache: Any, key: str, connection_id: str) -> bool:
+    return bool(local_cache.compare_and_expire(key, connection_id, CONTROLLER_LEASE_SECONDS))
 
 
-def release_controller_lease(redis_client: Any, key: str, connection_id: str) -> bool:
-    return bool(redis_client.eval(
-        """
-        if redis.call('GET', KEYS[1]) == ARGV[1] then
-          return redis.call('DEL', KEYS[1])
-        end
-        return 0
-        """,
-        1,
-        key,
-        connection_id,
-    ))
+def release_controller_lease(local_cache: Any, key: str, connection_id: str) -> bool:
+    return bool(local_cache.compare_and_delete(key, connection_id))
 
 
-def claim_event_sequence(redis_client: Any, event: ClientEvent) -> str:
+def claim_event_sequence(local_cache: Any, event: ClientEvent) -> str:
     """Atomically deduplicate an event and advance one client session sequence."""
     event_key = f"attempt-event:{event.interview_id}:{event.event_id}"
     sequence_key = f"attempt-sequence:{event.interview_id}:{event.client_session_id}"
-    result = int(redis_client.eval(
-        """
-        if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-        local last = tonumber(redis.call('GET', KEYS[2]) or '0')
-        local incoming = tonumber(ARGV[1])
-        if incoming <= last then return -1 end
-        redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
-        redis.call('SET', KEYS[2], incoming, 'EX', ARGV[2])
-        return 1
-        """,
-        2,
+    result = int(local_cache.claim_sequence(
         event_key,
         sequence_key,
         event.sequence,

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Public support
+    url: https://example.invalid/prepmate/support
+    about: Use the official website support route for customer questions.
+  - name: Security vulnerability
+    url: https://example.invalid/prepmate/security
+    about: Report security issues through the private security route.

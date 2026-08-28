@@ -7,7 +7,7 @@ export type MediaReadinessResult =
 export function mediaCaptureErrorMessage(error: unknown, kind: "microphone" | "camera" | "media" = "media") {
   const name = error instanceof DOMException ? error.name : ""
   if (name === "NotAllowedError" || name === "SecurityError") {
-    return `${kind === "media" ? "Media" : kind[0].toUpperCase() + kind.slice(1)} access was denied. Allow it in browser and operating-system privacy settings, then retry.`
+    return `${kind === "media" ? "Media" : kind[0].toUpperCase() + kind.slice(1)} access was denied. Allow it in PrepMate and operating-system privacy settings, then retry.`
   }
   if (name === "NotReadableError" || name === "AbortError") {
     return `The ${kind} could not be opened. It may be in use by another application or blocked by the operating system.`
@@ -23,13 +23,13 @@ export function mediaCaptureErrorMessage(error: unknown, kind: "microphone" | "c
 
 export async function verifyAudioOutputReadiness(): Promise<{ ok: true } | { ok: false; message: string }> {
   const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
-  if (!AudioContextCtor) return { ok: false, message: "This browser cannot verify audio playback." }
+  if (!AudioContextCtor) return { ok: false, message: "PrepMate cannot verify audio playback on this system." }
   const context = new AudioContextCtor()
   try {
     await context.resume()
     return context.state === "running"
       ? { ok: true }
-      : { ok: false, message: "Audio playback is blocked. Allow sound for this site, then retry." }
+      : { ok: false, message: "Audio playback is blocked. Allow sound for PrepMate, then retry." }
   } finally {
     await context.close().catch(() => undefined)
   }
@@ -53,7 +53,7 @@ export async function verifyMediaReadiness(
   if (options.requireAudio) {
     const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
     if (!AudioContextCtor) {
-      return { ok: false, message: "This browser cannot measure microphone input or verify audio playback." }
+      return { ok: false, message: "PrepMate cannot measure microphone input or verify audio playback on this system." }
     }
     const context = new AudioContextCtor()
     try {
@@ -78,7 +78,7 @@ export async function verifyMediaReadiness(
       await context.close().catch(() => undefined)
     }
     if (!audioOutputReady) {
-      return { ok: false, message: "Audio playback is blocked. Allow sound for this site, then retry." }
+      return { ok: false, message: "Audio playback is blocked. Allow sound for PrepMate, then retry." }
     }
     // Silence at startup is normal: the candidate has not been asked a
     // question yet. A live, enabled, unmuted track is sufficient here; the
@@ -87,10 +87,10 @@ export async function verifyMediaReadiness(
 
   const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [])
   if (options.requireAudio && !devices.some((device) => device.kind === "audioinput")) {
-    return { ok: false, message: "No microphone is available to the browser." }
+    return { ok: false, message: "No microphone is available to PrepMate." }
   }
   if (options.requireVideo && !devices.some((device) => device.kind === "videoinput")) {
-    return { ok: false, message: "No camera is available to the browser." }
+    return { ok: false, message: "No camera is available to PrepMate." }
   }
   return { ok: true, peakRms, audioOutputReady }
 }

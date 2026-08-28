@@ -1,7 +1,7 @@
 # ============================================================================
 # MODULE: persona_generator.py
-# PURPOSE: Deterministically pick a synthetic interviewer persona (name,
-#          company type, voice style) from a user-id hash + strictness, plus
+# PURPOSE: Deterministically pick a synthetic interviewer persona (name and
+#          company type) from a user-id hash + strictness, plus
 #          generate the opening statement text.
 # STRUCTURE:
 #   - INTERVIEWER_NAMES / COMPANY_TYPES static lists (lines 14-44+)
@@ -98,8 +98,6 @@ ROLE_TITLES = {
 def generate_persona(strictness_level: str, job_title: str, company_name: Optional[str] = None) -> Dict:
     config = get_strictness_config(strictness_level)
     seed = (strictness_level, job_title, company_name or "")
-    from config import settings
-    voice = getattr(settings, "KOKORO_VOICE", "af_heart")
     names_source = INTERVIEWER_NAMES_INDIAN
     interviewer_name = _pick(names_source.get(strictness_level, names_source["medium"]), "name", *seed)
     role_title = _pick(ROLE_TITLES.get(strictness_level, ROLE_TITLES["medium"]), "role", *seed)

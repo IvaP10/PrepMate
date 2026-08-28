@@ -2,7 +2,7 @@
 
 import { safeStorageGet, safeStorageSet } from "@/lib/safe-storage"
 
-const RECOVERY_GRACE_KEY = "interai-session-recovery-grace-seconds"
+const RECOVERY_GRACE_KEY = "prepmate-session-recovery-grace-seconds"
 const DEFAULT_RECOVERY_GRACE_SECONDS = 60
 
 export function rememberRecoveryGraceSeconds(value: number | null | undefined) {

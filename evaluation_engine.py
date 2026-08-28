@@ -631,9 +631,6 @@ def _semantic_policy(
 
     if context.get("semantic_analysis_enabled") is False or context.get("allow_semantic_analysis") is False:
         return False, "disabled_by_context"
-    if context.get("semantic_budget_available") is False:
-        return False, "semantic_budget_unavailable"
-
     word_count = int(signals.get("word_count") or 0)
     if word_count < 12:
         return False, "insufficient_answer"

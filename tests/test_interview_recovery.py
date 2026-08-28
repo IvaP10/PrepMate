@@ -2,13 +2,11 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import interview
-import pytest
-from pydantic import ValidationError
 
 
-def test_interview_round_rejects_text_input_but_technical_remains_typed():
-    with pytest.raises(ValidationError, match="requires voice input"):
-        interview.StartInterviewRequest(interview_type="Mock Interview", input_mode="text")
+def test_interview_and_technical_rounds_accept_typed_input():
+    interview_round = interview.StartInterviewRequest(interview_type="Mock Interview", input_mode="text")
+    assert interview_round.input_mode == "text"
 
     technical = interview.StartInterviewRequest(interview_type="technical", input_mode="text")
     assert technical.input_mode == "text"
@@ -53,5 +51,10 @@ def test_expired_recovery_is_incomplete_not_scored():
     assert "status = 'cancelled'" in query
     assert "overall_score = NULL" in query
     assert "status = 'recovering'" in query
-    assert "UPDATE TechnicalInterviewRounds round" in query
-    assert "round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')" in query
+    round_query = next(
+        call.args[0]
+        for call in execute.await_args_list
+        if "UPDATE TechnicalInterviewRounds" in call.args[0]
+    )
+    assert "status = 'cancelled'" in round_query
+    assert "status NOT IN ('submitted', 'completed', 'expired', 'cancelled')" in round_query

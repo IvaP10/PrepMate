@@ -24,8 +24,7 @@ import {
 } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
-import { getAuthHeaders } from "@/lib/auth"
-import { abandonInterviewSession, cancelInterviewSession, endInterviewSession } from "@/lib/api"
+import { activateTechnicalRound, cancelInterviewSession, endInterviewSession } from "@/lib/api"
 import { API_CONFIG } from "@/lib/config"
 import { cn } from "@/lib/utils"
 import { readRecoveryGraceSeconds } from "@/lib/session-integrity"
@@ -34,16 +33,16 @@ import {
   getTechnicalCameraStream,
   getTechnicalPermissionState,
   releaseTechnicalPermissions,
+  requestTechnicalCamera,
   requestTechnicalPermissions,
+  requestTechnicalScreenShare,
+  stopTechnicalCamera,
+  stopTechnicalScreenShare,
   subscribeTechnicalPermissionState,
   type TechnicalPermissionState,
 } from "@/lib/technical-permissions"
-import {
-  integrityWarningMessage,
-  type AntiCheatRecordResult,
-} from "@/lib/technical-integrity"
+import { type SelfReviewSignalResult } from "@/lib/technical-integrity"
 import { useFaceCheck } from "@/hooks/use-face-check"
-import { useObjectDetection } from "@/hooks/use-object-detection"
 import { useAudioEnvironment } from "@/hooks/use-audio-environment"
 import { useSessionControlLock } from "@/hooks/use-session-control-lock"
 import { WaveformVisualizer } from "@/components/interview/waveform-visualizer"
@@ -72,6 +71,12 @@ type Round = {
   max_submissions?: number
   workflow_state?: Record<string, any>
   round_number?: number
+  draft_code?: string | null
+  draft_language?: Language | null
+  draft_saved_at?: string | null
+  draft_editor_revision?: number | null
+  draft_editor_hash?: string | null
+  latest_run?: RunResult | null
 }
 
 type TestCase = {
@@ -96,6 +101,7 @@ type CaseResult = {
 
 type RunResult = {
   run_id?: string
+  action?: "test" | "custom-run" | "submit" | string
   executor?: string
   status?: "queued" | "running" | "completed" | "failed" | string
   stdout?: string
@@ -123,6 +129,11 @@ type RunResult = {
   hidden_details?: null
 }
 
+type LanguageCapability = {
+  available?: boolean
+  reason?: string
+}
+
 type TechnicalResponseResult = {
   round_id: string
   response_id: string
@@ -143,6 +154,8 @@ type CodingWorkflowDraft = {
   complexity: string
   explanation: string
 }
+
+type DraftSaveState = "saved" | "unsaved" | "saving" | "error"
 
 type JobContext = {
   role?: string | null
@@ -294,19 +307,20 @@ export default function TechnicalInterviewPage() {
   const [codeByRound, setCodeByRound] = useState<Record<string, string>>({})
   const [languageByRound, setLanguageByRound] = useState<Record<string, Language>>({})
   const [customInputByRound, setCustomInputByRound] = useState<Record<string, string>>({})
-  const [output, setOutput] = useState<RunResult | null>(null)
+  const [outputByRound, setOutputByRound] = useState<Record<string, RunResult | null>>({})
   const [loading, setLoading] = useState(true)
   const [loadPhase, setLoadPhase] = useState("Preparing environment")
   const [roundLoadError, setRoundLoadError] = useState("")
   const [executorName, setExecutorName] = useState("Code runner")
-  const [running, setRunning] = useState(false)
-  const [recoverableRun, setRecoverableRun] = useState<RecoverableRun | null>(null)
-  const [pollingError, setPollingError] = useState("")
+  const [languageCapabilities, setLanguageCapabilities] = useState<Record<string, LanguageCapability>>({})
+  const [runningByRound, setRunningByRound] = useState<Record<string, boolean>>({})
+  const [recoverableRunByRound, setRecoverableRunByRound] = useState<Record<string, RecoverableRun | null>>({})
+  const [pollingErrorByRound, setPollingErrorByRound] = useState<Record<string, string>>({})
+  const [draftSaveStateByRound, setDraftSaveStateByRound] = useState<Record<string, DraftSaveState>>({})
   const [responseByRound, setResponseByRound] = useState<Record<string, string>>({})
   const [responseResultByRound, setResponseResultByRound] = useState<Record<string, TechnicalResponseResult>>({})
   const [submittingResponseByRound, setSubmittingResponseByRound] = useState<Record<string, boolean>>({})
   const [strictWarnings, setStrictWarnings] = useState(0)
-  const [sessionFlagged, setSessionFlagged] = useState(false)
   const [submitLockedByRound, setSubmitLockedByRound] = useState<Record<string, boolean>>({})
   const [submitCountByRound, setSubmitCountByRound] = useState<Record<string, number>>({})
   const [workflowDraftByRound, setWorkflowDraftByRound] = useState<Record<string, CodingWorkflowDraft>>({})
@@ -317,6 +331,8 @@ export default function TechnicalInterviewPage() {
   const [preflightDone, setPreflightDone] = useState(() => consumePreflightFlag())
   const [reviewMode, setReviewMode] = useState(false)
   const [statusChecked, setStatusChecked] = useState(false)
+  const [technicalActivated, setTechnicalActivated] = useState(false)
+  const [activatingTechnical, setActivatingTechnical] = useState(false)
 
   useEffect(() => {
     if (permissionState.ready && preflightDone) {
@@ -331,9 +347,11 @@ export default function TechnicalInterviewPage() {
   const [revealedConstraintsByRound, setRevealedConstraintsByRound] = useState<Record<string, boolean>>({})
   const [revealedHintByRound, setRevealedHintByRound] = useState<Record<string, boolean>>({})
   const [clarificationAskedByRound, setClarificationAskedByRound] = useState<Record<string, boolean>>({})
-  const [technicalTranscript, setTechnicalTranscript] = useState("")
+  const [technicalTranscriptByRound, setTechnicalTranscriptByRound] = useState<Record<string, string>>({})
   const [micListening, setMicListening] = useState(false)
-  const [micSupported, setMicSupported] = useState(true)
+  // Browser speech recognition may route audio through a browser vendor.
+  // Voice notes stay disabled until an explicit provider-backed path exists.
+  const [micSupported] = useState(false)
   const roundStartedAtRef = useRef(Date.now())
   const endSentRef = useRef(false)
   const roundsRef = useRef<Round[]>([])
@@ -342,8 +360,8 @@ export default function TechnicalInterviewPage() {
   const reviewModeRef = useRef(false)
   const finishSessionRef = useRef<(options?: { keepalive?: boolean }) => Promise<boolean> | boolean | void>(() => undefined)
   const noClarificationLoggedRef = useRef<Set<string>>(new Set())
-  const recognitionRef = useRef<any>(null)
-  const technicalTranscriptRef = useRef("")
+  const technicalTranscriptByRoundRef = useRef<Record<string, string>>({})
+  const micRoundIdRef = useRef("")
   const lastPermissionStateRef = useRef<TechnicalPermissionState>({
     fullscreenAttempted: false,
     fullscreenActive: false,
@@ -352,25 +370,25 @@ export default function TechnicalInterviewPage() {
     screenShareSurface: null,
     cameraReady: false,
     microphoneReady: false,
-    ready: false,
+    ready: true,
   })
-  const proctoringStartedRef = useRef(false)
   const cameraVideoRef = useRef<HTMLVideoElement>(null)
   const faceMissingSinceRef = useRef<number | null>(null)
   const pageLoadTimeRef = useRef(Date.now())
-  const lastMobileWarningRef = useRef<number | null>(null)
-  const lastMultiplePeopleWarningRef = useRef<number | null>(null)
   const lastCodeJumpWarningRef = useRef<number | null>(null)
   const responseIdempotencyRef = useRef<Record<string, { text: string; key: string }>>({})
   const workflowIdempotencyRef = useRef<Record<string, string>>({})
   const editorRevisionRef = useRef<Record<string, number>>({})
+  const dirtyRoundIdsRef = useRef<Set<string>>(new Set())
+  const lastSavedCodeRef = useRef<Record<string, string>>({})
+  const draftSaveInFlightRef = useRef<Record<string, Promise<boolean> | undefined>>({})
+  const pollingRunIdsRef = useRef<Set<string>>(new Set())
   const responseByRoundRef = useRef<Record<string, string>>({})
   const responseResultByRoundRef = useRef<Record<string, TechnicalResponseResult>>({})
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
   const [targetDurationSeconds, setTargetDurationSeconds] = useState(3600)
   const sessionStartedAtRef = useRef(Date.now())
   const { metrics: faceMetrics, isRunning: faceCheckRunning, start: startFaceCheck, stop: stopFaceCheck } = useFaceCheck(cameraVideoRef)
-  const { metrics: objMetrics, isRunning: objCheckRunning, start: startObjCheck, stop: stopObjCheck } = useObjectDetection(cameraVideoRef)
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null)
 
   const activeRound = useMemo(
@@ -382,12 +400,25 @@ export default function TechnicalInterviewPage() {
   const selectedCase = activeTests[selectedCaseIndex] || activeTests[0]
   const customInput = activeRound ? customInputByRound[activeRound.round_id] || "" : ""
   const currentLanguage: Language = activeRound ? languageByRound[activeRound.round_id] || activeRound.language || "python" : "python"
+  const currentLanguageCapability = languageCapabilities[currentLanguage] || {}
+  const executionAvailable = currentLanguageCapability.available === true
+  const executionUnavailableReason = currentLanguageCapability.reason || "A supported runtime and OS sandbox are required for code execution."
   const permissionsReady = permissionState.ready
   const submitsUsed = activeRound ? submitCountByRound[activeRound.round_id] || 0 : 0
   const maxSubmissions = Math.max(1, Number(activeRound?.max_submissions || 1))
   const submitsLeft = Math.max(0, maxSubmissions - submitsUsed)
   const activeRoundStatus = (activeRound?.status || "").toLowerCase()
   const activeRoundIsCoding = isCodingRound(activeRound)
+  const activeOutput = activeRound ? outputByRound[activeRound.round_id] || null : null
+  const activeRunning = activeRound ? !!runningByRound[activeRound.round_id] : false
+  const activeRecoverableRun = activeRound ? recoverableRunByRound[activeRound.round_id] || null : null
+  const activePollingError = activeRound ? pollingErrorByRound[activeRound.round_id] || "" : ""
+  const activeDraftSaveState: DraftSaveState = activeRound
+    ? draftSaveStateByRound[activeRound.round_id] || "saved"
+    : "saved"
+  const activeTechnicalTranscript = activeRound
+    ? technicalTranscriptByRound[activeRound.round_id] || ""
+    : ""
   const durationPerQuestionMinutes = Math.max(1, Math.round(targetDurationSeconds / Math.max(1, rounds.length) / 60))
   const headerJobTitle = jobContext?.profile_type === "custom"
     ? jobContext.job_title || jobContext.role || "Technical Round"
@@ -396,7 +427,8 @@ export default function TechnicalInterviewPage() {
       : jobContext?.role || `${jobContext?.profile_label || "Technical"} Technical Round`
   const activeRoundDeadlineMs = activeRound?.expires_at ? Date.parse(activeRound.expires_at) : Number.NaN
   const activeRoundExpired = Number.isFinite(activeRoundDeadlineMs) && Date.now() >= activeRoundDeadlineMs
-  const roundActionLocked = reviewMode || activeRoundExpired || ["pending", "expired", "submitted", "submitting", "awaiting_explanation", "cancelled"].includes(activeRoundStatus)
+  const roundActionLocked = reviewMode || !technicalActivated || activeRoundExpired || ["pending", "expired", "submitted", "submitting", "awaiting_explanation", "cancelled"].includes(activeRoundStatus)
+  const editorLocked = reviewMode || !technicalActivated || activeRoundExpired || ["pending", "expired", "submitted", "submitting", "awaiting_explanation", "cancelled"].includes(activeRoundStatus)
   const roundLockMessage = activeRoundStatus === "expired"
     ? "Time has expired for this technical round."
     : activeRoundStatus === "submitting"
@@ -404,7 +436,7 @@ export default function TechnicalInterviewPage() {
       : activeRoundStatus === "submitted"
         ? "This technical round has already been submitted."
         : activeRoundStatus === "pending"
-          ? "Complete the current round before starting this one."
+          ? "Read the briefing and activate the Technical round before editing, running, or submitting."
           : activeRoundStatus === "awaiting_explanation"
             ? "Final code is locked. Complete the complexity and explanation steps."
         : reviewMode
@@ -435,20 +467,16 @@ export default function TechnicalInterviewPage() {
     reviewModeRef.current = reviewMode
   }, [reviewMode])
 
-  const recordAntiCheat = useCallback(async (eventType: string, payload: Record<string, unknown> = {}) => {
+  const recordSelfReviewSignal = useCallback(async (eventType: string, payload: Record<string, unknown> = {}) => {
     try {
-      const response = await fetch(`${API_CONFIG.BASE_URL}/technical/anti-cheat`, {
+      const response = await fetch(`${API_CONFIG.BASE_URL}/technical/self-review-signal`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ interview_id: interviewId, event_type: eventType, payload }),
       })
-      const data = (await response.json().catch(() => ({}))) as AntiCheatRecordResult
+      const data = (await response.json().catch(() => ({}))) as SelfReviewSignalResult
       if (typeof data.warning_count === "number") {
         setStrictWarnings(data.warning_count)
-      }
-      if (data.flagged) {
-        setSessionFlagged(true)
       }
       return data
     } catch {
@@ -460,38 +488,31 @@ export default function TechnicalInterviewPage() {
     try {
       await fetch(`${API_CONFIG.BASE_URL}/technical/events`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ interview_id: interviewId, round_id: roundId || activeRoundId || null, event_type: eventType, payload }),
       })
     } catch {
     }
   }, [activeRoundId, interviewId])
 
-  const warnStrictMode = useCallback((eventType: string, message: string, payload: Record<string, unknown> = {}) => {
-    if (sessionFlagged) return
-    void recordAntiCheat(eventType, payload).then((result) => {
-      const count = result?.warning_count ?? strictWarnings + 1
-      setStrictWarnings(count)
-      toast.warning(integrityWarningMessage(message, count))
-      if (result?.flagged) {
-        setSessionFlagged(true)
-        toast.error("This technical round has been flagged after repeated integrity violations.")
-      }
+  const recordSelfReviewNotice = useCallback((eventType: string, message: string, payload: Record<string, unknown> = {}) => {
+    void recordSelfReviewSignal(eventType, payload).then((result) => {
+      setStrictWarnings(Number(result?.warning_count || 0))
+      toast.info(message)
     })
-  }, [recordAntiCheat, sessionFlagged, strictWarnings])
+  }, [recordSelfReviewSignal])
 
   useAudioEnvironment(cameraStream, {
     enabled: false,
     onBackgroundAudioDetected: useCallback((details: { type: string; confidence: number }) => {
-      warnStrictMode(
+      recordSelfReviewNotice(
         "background_audio_detected",
         details.type === "background_music"
           ? "Background music detected. Please mute other audio sources."
           : "Background audio detected. Please ensure a quiet environment.",
         details
       )
-    }, [warnStrictMode]),
+    }, [recordSelfReviewNotice]),
   })
 
   const revealConstraints = useCallback((roundId: string) => {
@@ -512,72 +533,20 @@ export default function TechnicalInterviewPage() {
   }, [clarificationAskedByRound, recordTechnicalEvent])
 
   useEffect(() => {
-    if (typeof window === "undefined") return
-    setMicSupported(Boolean((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition))
-    return () => {
-      recognitionRef.current?.stop?.()
-    }
-  }, [])
-
-  useEffect(() => {
-    technicalTranscriptRef.current = technicalTranscript
-  }, [technicalTranscript])
+    technicalTranscriptByRoundRef.current = technicalTranscriptByRound
+  }, [technicalTranscriptByRound])
 
   const stopTechnicalMic = useCallback(() => {
-    recognitionRef.current?.stop?.()
-    recognitionRef.current = null
     setMicListening(false)
-    void recordTechnicalEvent("technical_mic_stopped", { transcript_chars: technicalTranscriptRef.current.length }, activeRound?.round_id)
-  }, [activeRound?.round_id, recordTechnicalEvent])
+    const roundId = micRoundIdRef.current
+    const transcript = technicalTranscriptByRoundRef.current[roundId] || ""
+    void recordTechnicalEvent("technical_mic_stopped", { transcript_chars: transcript.length }, roundId || undefined)
+    micRoundIdRef.current = ""
+  }, [recordTechnicalEvent])
 
   const startTechnicalMic = useCallback(() => {
-    if (typeof window === "undefined") return
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
-    if (!SpeechRecognition) {
-      setMicSupported(false)
-      toast.error("Live transcript is not supported in this browser.")
-      return
-    }
-
-    recognitionRef.current?.stop?.()
-    const recognition = new SpeechRecognition()
-    recognition.continuous = true
-    recognition.interimResults = true
-    recognition.lang = "en-US"
-    recognition.onresult = (event: any) => {
-      let finalText = ""
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index]
-        if (result?.isFinal) {
-          finalText += `${result[0]?.transcript || ""} `
-        }
-      }
-      const clean = finalText.trim()
-      if (!clean) return
-      setTechnicalTranscript((prev) => `${prev}${prev ? "\n" : ""}${clean}`)
-      void recordTechnicalEvent(
-        "technical_transcript",
-        {
-          text: clean,
-          chars: clean.length,
-          words: clean.split(/\s+/).filter(Boolean).length,
-          capture: "browser_speech_recognition",
-        },
-        activeRound?.round_id
-      )
-    }
-    recognition.onerror = () => {
-      setMicListening(false)
-      void recordTechnicalEvent("technical_mic_error", {}, activeRound?.round_id)
-    }
-    recognition.onend = () => {
-      setMicListening(false)
-    }
-    recognitionRef.current = recognition
-    recognition.start()
-    setMicListening(true)
-    void recordTechnicalEvent("technical_mic_started", {}, activeRound?.round_id)
-  }, [activeRound?.round_id, recordTechnicalEvent])
+    toast.info("Voice notes are not enabled in this release. Type your reasoning instead.")
+  }, [])
 
   const requestPermissions = useCallback(async () => {
     setPermissionError("")
@@ -588,17 +557,17 @@ export default function TechnicalInterviewPage() {
     const state = result.ok ? result.state : getTechnicalPermissionState()
 
     if (!result.ok || !state.ready) {
-      const message = result.ok ? "Camera, microphone, and screen sharing are required to continue." : result.message
+      const message = result.ok ? "Fullscreen is required to continue. Camera, microphone, and screen sharing remain optional coaching tools." : result.message
       await releaseTechnicalPermissions()
       setPermissionError(message)
       toast.error(message)
-      void recordAntiCheat("technical_permission_failed", { reason: result.ok ? "incomplete" : result.reason })
+      void recordSelfReviewSignal("technical_permission_failed", { reason: result.ok ? "incomplete" : result.reason })
       return
     }
 
     setPermissionState(state)
     toast.success("Technical permissions are active.")
-  }, [recordAntiCheat, recordTechnicalEvent, warnStrictMode])
+  }, [recordSelfReviewSignal, recordTechnicalEvent, recordSelfReviewNotice])
 
   useEffect(() => {
     if (!statusChecked || reviewMode || permissionState.ready || endSentRef.current) return
@@ -615,32 +584,45 @@ export default function TechnicalInterviewPage() {
 
       if (!previous.screenShareReady && state.screenShareReady) {
         void recordTechnicalEvent("screen_share_started", { tracks: 1, surface: state.screenShareSurface || null })
-        if (state.screenShareSurface && state.screenShareSurface !== "monitor") {
-          warnStrictMode("screen_not_monitor", "Strict mode warning: share your entire screen, not a tab or window.", { surface: state.screenShareSurface })
-        }
       }
 
       if (previous.screenShareReady && !state.screenShareReady) {
-        setPermissionError("Screen sharing stopped. Resume sharing to continue the test.")
+        setPermissionError("Optional screen coaching stopped. The technical round will continue.")
         void recordTechnicalEvent("screen_share_stopped")
-        void recordAntiCheat("screen_share_stopped")
+        void recordSelfReviewSignal("screen_share_stopped")
       }
     })
 
     return unsubscribe
-  }, [recordAntiCheat, recordTechnicalEvent])
+  }, [recordSelfReviewSignal, recordTechnicalEvent])
+
+  const toggleCameraCoaching = useCallback(async () => {
+    if (permissionState.cameraReady) {
+      stopTechnicalCamera()
+      return
+    }
+    const result = await requestTechnicalCamera()
+    if (!result.ok) toast.error(result.message)
+  }, [permissionState.cameraReady])
+
+  const toggleScreenCoaching = useCallback(async () => {
+    if (permissionState.screenShareReady) {
+      stopTechnicalScreenShare()
+      return
+    }
+    const result = await requestTechnicalScreenShare()
+    if (!result.ok) toast.error(result.message)
+  }, [permissionState.screenShareReady])
 
   useEffect(() => {
     return () => {
       stopFaceCheck()
-      stopObjCheck()
       stopTechnicalMic()
     }
-  }, [stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [stopFaceCheck, stopTechnicalMic])
 
   useEffect(() => {
     if (permissionsReady) {
-      proctoringStartedRef.current = true
       pageLoadTimeRef.current = Date.now()
     }
   }, [permissionsReady])
@@ -657,69 +639,42 @@ export default function TechnicalInterviewPage() {
     if (permissionState.cameraReady && !faceCheckRunning) {
       startFaceCheck()
     }
-    if (permissionState.cameraReady && !objCheckRunning) {
-      startObjCheck()
-    }
-  }, [permissionState.cameraReady, faceCheckRunning, objCheckRunning, startFaceCheck, startObjCheck, permissionsReady])
+  }, [permissionState.cameraReady, faceCheckRunning, startFaceCheck, permissionsReady])
 
   useEffect(() => {
-    if (!permissionState.cameraReady || sessionFlagged) return
-    if (faceMetrics.source === "fallback") return
+    if (!permissionState.cameraReady) return
+    if (faceMetrics.source === "local") return
     if (Date.now() - pageLoadTimeRef.current < 15000) return
     const now = Date.now()
     if (!faceMetrics.facePresent) {
       if (!faceMissingSinceRef.current) faceMissingSinceRef.current = now
       if (now - faceMissingSinceRef.current > 2500) {
-        warnStrictMode("face_missing", "Camera check: your face is not visible.")
+        recordSelfReviewNotice("face_missing", "Self-review signal: your face was not visible to the optional camera tool.")
         faceMissingSinceRef.current = now + 8000
       }
     } else {
       faceMissingSinceRef.current = null
     }
 
-  }, [faceMetrics, permissionState.cameraReady, sessionFlagged, warnStrictMode])
+  }, [faceMetrics, permissionState.cameraReady, recordSelfReviewNotice])
 
   useEffect(() => {
-    if (!permissionState.cameraReady || sessionFlagged) return
-    if (Date.now() - pageLoadTimeRef.current < 15000) return
-
-    const now = Date.now()
-
-    if (objMetrics.mobileDetected) {
-      if (!lastMobileWarningRef.current || now - lastMobileWarningRef.current > 10000) {
-        warnStrictMode("mobile_phone_detected", "Anti-cheat: Cell phone detected in your environment.")
-        lastMobileWarningRef.current = now
-      }
-    }
-
-    if (objMetrics.multiplePeopleDetected) {
-      if (!lastMultiplePeopleWarningRef.current || now - lastMultiplePeopleWarningRef.current > 10000) {
-        warnStrictMode("multiple_people_detected", "Anti-cheat: Multiple people detected in the camera frame.")
-        lastMultiplePeopleWarningRef.current = now
-      }
-    }
-  }, [objMetrics, permissionState.cameraReady, sessionFlagged, warnStrictMode])
-
-  useEffect(() => {
-    if (reviewMode || !activeRound) return
+    if (reviewMode || !technicalActivated || !activeRound) return
     const interval = setInterval(() => {
       setElapsedSeconds(Math.floor((Date.now() - sessionStartedAtRef.current) / 1000))
     }, 1000)
     return () => clearInterval(interval)
-  }, [reviewMode, activeRound])
+  }, [reviewMode, technicalActivated, activeRound])
 
   useEffect(() => {
     if (!rounds.length) return
     void (async () => {
       try {
         const response = await fetch(`${API_CONFIG.BASE_URL}/technical/sessions/${interviewId}/integrity`, {
-          credentials: "include",
-          headers: getAuthHeaders(),
         })
         if (!response.ok) return
         const data = await response.json()
         if (typeof data.warning_count === "number") setStrictWarnings(data.warning_count)
-        if (data.flagged) setSessionFlagged(true)
       } catch {
       }
     })()
@@ -733,8 +688,6 @@ export default function TechnicalInterviewPage() {
       // Check interview status first — if ended, enable review mode (no permissions needed)
       try {
         const statusResp = await fetch(`${API_CONFIG.BASE_URL}/interview/status/${interviewId}`, {
-          credentials: "include",
-          headers: getAuthHeaders(),
         })
         if (statusResp.ok) {
           const statusData = await statusResp.json()
@@ -756,8 +709,6 @@ export default function TechnicalInterviewPage() {
       setStatusChecked(true)
       setLoadPhase("Loading typed technical rounds")
       const response = await fetch(`${API_CONFIG.BASE_URL}/technical/sessions/${interviewId}/rounds`, {
-        credentials: "include",
-        headers: getAuthHeaders(),
       })
       const data = await response.json().catch(() => ({}))
       if (!response.ok) throw new Error(data.detail || data.message || "Failed to load technical rounds")
@@ -776,7 +727,12 @@ export default function TechnicalInterviewPage() {
       const loadedRounds = (data.rounds || []) as Round[]
       if (!loadedRounds.length) throw new Error("No technical questions were generated. Please retry.")
       setExecutorName(data.executor_label || data.generation?.executor_label || data.executor || data.generation?.executor || "Code runner")
+      setLanguageCapabilities((data.language_capabilities || data.generation?.language_capabilities || {}) as Record<string, LanguageCapability>)
       const firstRound = loadedRounds[0]
+      const attemptState = data.attempt && typeof data.attempt === "object" ? data.attempt : {}
+      const loadedIsActivated = String(attemptState.lifecycle_state || "").toLowerCase() === "active"
+        || loadedRounds.some((round) => !["pending", ""].includes(String(round.status || "").toLowerCase()))
+      setTechnicalActivated(loadedIsActivated)
       const durationSeconds = Number(data.target_duration_seconds || firstRound?.target_duration_seconds || 3600)
       setTargetDurationSeconds(Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : 3600)
       if (firstRound?.started_at) {
@@ -785,8 +741,11 @@ export default function TechnicalInterviewPage() {
           sessionStartedAtRef.current = startedAt
           setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startedAt) / 1000)))
         }
-      } else if (typeof firstRound?.remaining_seconds === "number") {
+      } else if (loadedIsActivated && typeof firstRound?.remaining_seconds === "number") {
         setElapsedSeconds(Math.max(0, durationSeconds - firstRound.remaining_seconds))
+      } else {
+        sessionStartedAtRef.current = Date.now()
+        setElapsedSeconds(0)
       }
       setRounds(loadedRounds)
       const nextActiveRound = loadedRounds.find((round) => ["active", "awaiting_explanation"].includes(String(round.status || "").toLowerCase())) || loadedRounds[0]
@@ -797,20 +756,43 @@ export default function TechnicalInterviewPage() {
       const writtenResponses: Record<string, string> = {}
       const workflowDrafts: Record<string, CodingWorkflowDraft> = {}
       const submitCounts: Record<string, number> = {}
+      const restoredOutputs: Record<string, RunResult | null> = {}
+      const recoverableRuns: Record<string, RecoverableRun | null> = {}
+      const draftStates: Record<string, DraftSaveState> = {}
       loadedRounds.forEach((round) => {
-        code[round.round_id] = isCodingRound(round) ? round.starter_code || starterForLanguage(round, round.language || "python") : ""
-        languages[round.round_id] = round.language || "python"
+        const frozenLanguage = round.language || "python"
+        const restoredCode = typeof round.draft_code === "string"
+          ? round.draft_code
+          : round.starter_code || starterForLanguage(round, frozenLanguage)
+        code[round.round_id] = isCodingRound(round) ? restoredCode : ""
+        languages[round.round_id] = round.draft_language || frozenLanguage
         inputs[round.round_id] = visibleTests(round)[0]?.stdin || ""
         if (!isCodingRound(round)) writtenResponses[round.round_id] = ""
         workflowDrafts[round.round_id] = { complexity: "", explanation: "" }
         submitCounts[round.round_id] = Number(round.workflow_state?.final_submission?.submit_number || 0)
+        lastSavedCodeRef.current[round.round_id] = code[round.round_id]
+        editorRevisionRef.current[round.round_id] = Math.max(0, Number(round.draft_editor_revision || 0))
+        draftStates[round.round_id] = "saved"
+        if (round.latest_run) {
+          restoredOutputs[round.round_id] = round.latest_run
+          if (!["completed", "failed"].includes(String(round.latest_run.status || "").toLowerCase()) && round.latest_run.run_id) {
+            const action = ["test", "custom-run", "submit"].includes(String((round.latest_run as any).action))
+              ? (round.latest_run as any).action as RecoverableRun["action"]
+              : "test"
+            recoverableRuns[round.round_id] = { runId: round.latest_run.run_id, roundId: round.round_id, action }
+          }
+        }
       })
+      dirtyRoundIdsRef.current.clear()
       setCodeByRound(code)
       setLanguageByRound(languages)
       setCustomInputByRound(inputs)
       setResponseByRound(writtenResponses)
       setWorkflowDraftByRound(workflowDrafts)
       setSubmitCountByRound(submitCounts)
+      setOutputByRound(restoredOutputs)
+      setRecoverableRunByRound(recoverableRuns)
+      setDraftSaveStateByRound(draftStates)
     } catch (error) {
       const message = error instanceof Error ? error.message : "Failed to load technical mode."
       setRoundLoadError(message)
@@ -825,9 +807,34 @@ export default function TechnicalInterviewPage() {
     void loadRounds()
   }, [loadRounds, sessionControlLock])
 
+  const activateSession = useCallback(async () => {
+    if (activatingTechnical || technicalActivated) return
+    setActivatingTechnical(true)
+    setRoundLoadError("")
+    try {
+      const data = await activateTechnicalRound(interviewId)
+      const startedAt = data?.activation?.started_at || data?.attempt?.started_at
+      if (startedAt) {
+        const parsed = Date.parse(startedAt)
+        if (Number.isFinite(parsed)) {
+          sessionStartedAtRef.current = parsed
+          setElapsedSeconds(Math.max(0, Math.floor((Date.now() - parsed) / 1000)))
+        }
+      }
+      setTechnicalActivated(true)
+      await loadRounds()
+      toast.success("Technical round activated. Your server-owned timer has started.")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not activate the Technical round."
+      setRoundLoadError(message)
+      toast.error(message)
+    } finally {
+      setActivatingTechnical(false)
+    }
+  }, [activateTechnicalRound, activatingTechnical, interviewId, loadRounds, technicalActivated])
+
   useEffect(() => {
     setSelectedCaseIndex(0)
-    setOutput(null)
     setActiveInfoTab("description")
   }, [activeRoundId])
 
@@ -835,7 +842,7 @@ export default function TechnicalInterviewPage() {
     // Strict mode constraints disabled
   }, [])
 
-  const pollRunStatus = async (runId: string, initialPollAfterMs = 250) => {
+  const pollRunStatus = async (runId: string, roundId: string, initialPollAfterMs = 250) => {
     let latest: RunResult | null = null
     const deadline = Date.now() + 45_000
     let attempt = 0
@@ -847,8 +854,6 @@ export default function TechnicalInterviewPage() {
       const timeout = window.setTimeout(() => controller.abort(), 10_000)
       try {
         const response = await fetch(`${API_CONFIG.BASE_URL}/technical/runs/${runId}`, {
-          credentials: "include",
-          headers: getAuthHeaders(),
           signal: controller.signal,
         })
         const data = await response.json().catch(() => ({}))
@@ -857,7 +862,7 @@ export default function TechnicalInterviewPage() {
           throw new Error(data.detail || "Failed to poll run status")
         }
         latest = data
-        setOutput(data)
+        setOutputByRound((current) => ({ ...current, [roundId]: data }))
         pollAfterMs = Math.max(100, Math.min(Number(data.poll_after_ms) || 250, 2_000))
         if (isTerminalRun(data.status)) return data as RunResult
       } catch (error) {
@@ -867,13 +872,13 @@ export default function TechnicalInterviewPage() {
         window.clearTimeout(timeout)
       }
     }
-    if (latest) setOutput(latest)
+    if (latest) setOutputByRound((current) => ({ ...current, [roundId]: latest }))
     throw new RunPollingTimeout()
   }
 
   const applyFinalRunResult = (context: RecoverableRun, finalResult: RunResult) => {
-    setRecoverableRun(null)
-    setPollingError("")
+    setRecoverableRunByRound((current) => ({ ...current, [context.roundId]: null }))
+    setPollingErrorByRound((current) => ({ ...current, [context.roundId]: "" }))
     if (context.action !== "submit") return
     if (finalResult.status !== "completed") {
       setRounds((current) => current.map((round) => round.round_id === context.roundId ? { ...round, status: "active", locked_reason: null } : round))
@@ -911,21 +916,35 @@ export default function TechnicalInterviewPage() {
     )))
   }
 
-  const resumeRunPolling = async () => {
-    if (!recoverableRun || running) return
-    setRunning(true)
-    setPollingError("")
+  const resumeRunPolling = async (context: RecoverableRun | null = activeRecoverableRun) => {
+    if (!context || runningByRound[context.roundId] || pollingRunIdsRef.current.has(context.runId)) return
+    pollingRunIdsRef.current.add(context.runId)
+    setRunningByRound((current) => ({ ...current, [context.roundId]: true }))
+    setPollingErrorByRound((current) => ({ ...current, [context.roundId]: "" }))
     try {
-      const result = await pollRunStatus(recoverableRun.runId)
-      applyFinalRunResult(recoverableRun, result)
+      const result = await pollRunStatus(context.runId, context.roundId)
+      applyFinalRunResult(context, result)
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not recover code-run status."
-      setPollingError(message)
-      if (!(error instanceof RunPollingTimeout)) setRecoverableRun(null)
+      setPollingErrorByRound((current) => ({ ...current, [context.roundId]: message }))
+      if (!(error instanceof RunPollingTimeout)) {
+        setRecoverableRunByRound((current) => ({ ...current, [context.roundId]: null }))
+      }
     } finally {
-      setRunning(false)
+      pollingRunIdsRef.current.delete(context.runId)
+      setRunningByRound((current) => ({ ...current, [context.roundId]: false }))
     }
   }
+
+  useEffect(() => {
+    if (reviewMode) return
+    Object.values(recoverableRunByRound).forEach((context) => {
+      if (context) void resumeRunPolling(context)
+    })
+    // A newly hydrated queued/running job should continue without requiring a
+    // second submission. The per-run ref prevents duplicate poll loops.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recoverableRunByRound, reviewMode])
 
   const codeLooksHardcoded = (code: string) => {
     const expectedValues = activeTests
@@ -950,8 +969,7 @@ export default function TechnicalInterviewPage() {
     try {
       const response = await fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${round.round_id}/workflow`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey, ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         body: JSON.stringify({ stage, content: content.trim(), idempotency_key: idempotencyKey }),
       })
       const data = await response.json().catch(() => ({}))
@@ -971,6 +989,10 @@ export default function TechnicalInterviewPage() {
 
   const executeRound = async (action: "test" | "custom-run" | "submit") => {
     if (!activeRound) return
+    if (!executionAvailable) {
+      toast.error(executionUnavailableReason)
+      return
+    }
     if (!isCodingRound(activeRound)) {
       toast.error("Use the written-response form for this round type.")
       return
@@ -984,10 +1006,6 @@ export default function TechnicalInterviewPage() {
       toast.error(roundLockMessage)
       return
     }
-    if (sessionFlagged) {
-      toast.error("This technical round is locked after repeated integrity warnings.")
-      return
-    }
     if (action === "submit" && (submitLockedByRound[activeRound.round_id] || submitsLeft <= 0)) {
       toast.error("No final submits remain for this round.")
       return
@@ -997,13 +1015,14 @@ export default function TechnicalInterviewPage() {
       noteNoClarificationBeforeCoding(activeRound.round_id)
     }
     if ((action === "test" || action === "submit") && codeLooksHardcoded(source)) {
-      void recordTechnicalEvent("visible_output_hardcode", { round_id: activeRound.round_id }, activeRound.round_id)
-      void recordAntiCheat("visible_output_hardcode", { round_id: activeRound.round_id })
+      void recordTechnicalEvent("visible_output_pattern", { round_id: activeRound.round_id }, activeRound.round_id)
+      void recordSelfReviewSignal("visible_output_pattern", { round_id: activeRound.round_id })
     }
-    setRunning(true)
-    setOutput(null)
-    setPollingError("")
-    setRecoverableRun(null)
+    const executingRoundId = activeRound.round_id
+    setRunningByRound((current) => ({ ...current, [executingRoundId]: true }))
+    setOutputByRound((current) => ({ ...current, [executingRoundId]: null }))
+    setPollingErrorByRound((current) => ({ ...current, [executingRoundId]: "" }))
+    setRecoverableRunByRound((current) => ({ ...current, [executingRoundId]: null }))
     let activeRun: RecoverableRun | null = null
     try {
       const idempotencyKey = typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -1013,8 +1032,7 @@ export default function TechnicalInterviewPage() {
       const editorHash = await sourceSha256(source)
       const response = await fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${activeRound.round_id}/${action}`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey, ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         body: JSON.stringify({
           language: currentLanguage,
           code: source,
@@ -1027,32 +1045,32 @@ export default function TechnicalInterviewPage() {
       })
       const data = await response.json()
       if (!response.ok) throw new Error(data.detail || "Code execution failed")
-      setOutput(data)
+      setOutputByRound((current) => ({ ...current, [executingRoundId]: data }))
       if (data.run_id) {
         activeRun = { runId: data.run_id, roundId: activeRound.round_id, action }
       }
-      const finalResult = data.run_id ? await pollRunStatus(data.run_id, data.poll_after_ms) : data
+      const finalResult = data.run_id ? await pollRunStatus(data.run_id, executingRoundId, data.poll_after_ms) : data
       if (
         action === "submit" &&
         finalResult?.status === "completed" &&
         finalResult.pass_count === finalResult.total_count &&
         Date.now() - roundStartedAtRef.current < 120000
       ) {
-        void recordTechnicalEvent("suspicious_fast_submit", { elapsed_ms: Date.now() - roundStartedAtRef.current }, activeRound.round_id)
-        void recordAntiCheat("suspicious_fast_submit", { elapsed_ms: Date.now() - roundStartedAtRef.current })
+        void recordTechnicalEvent("fast_submit", { elapsed_ms: Date.now() - roundStartedAtRef.current }, activeRound.round_id)
+      void recordSelfReviewSignal("fast_submit", { elapsed_ms: Date.now() - roundStartedAtRef.current })
       }
       if (activeRun) applyFinalRunResult(activeRun, finalResult)
     } catch (error) {
       const message = error instanceof Error ? error.message : "Code execution failed"
       if (error instanceof RunPollingTimeout && activeRun) {
-        setRecoverableRun(activeRun)
-        setPollingError(message)
+        setRecoverableRunByRound((current) => ({ ...current, [executingRoundId]: activeRun }))
+        setPollingErrorByRound((current) => ({ ...current, [executingRoundId]: message }))
         toast.info("The submission was not sent again. Resume status checks when ready.")
       } else {
         toast.error(message)
       }
     } finally {
-      setRunning(false)
+      setRunningByRound((current) => ({ ...current, [executingRoundId]: false }))
     }
   }
 
@@ -1082,10 +1100,12 @@ export default function TechnicalInterviewPage() {
       const now = Date.now()
       if (!lastCodeJumpWarningRef.current || now - lastCodeJumpWarningRef.current > 15000) {
         lastCodeJumpWarningRef.current = now
-        void recordAntiCheat("large_code_jump", { from_chars: previous.length, to_chars: value.length })
+      void recordSelfReviewSignal("large_code_jump", { from_chars: previous.length, to_chars: value.length })
       }
     }
     editorRevisionRef.current[activeRound.round_id] = (editorRevisionRef.current[activeRound.round_id] || 0) + 1
+    dirtyRoundIdsRef.current.add(activeRound.round_id)
+    setDraftSaveStateByRound((current) => ({ ...current, [activeRound.round_id]: "unsaved" }))
     setCodeByRound((prev) => ({ ...prev, [activeRound.round_id]: value }))
   }
 
@@ -1103,14 +1123,16 @@ export default function TechnicalInterviewPage() {
   const commitActiveFinalEvidence = async () => {
     if (!activeRound) return
     const draft = workflowDraftByRound[activeRound.round_id] || { complexity: "", explanation: "" }
-    if (!draft.complexity.trim() || !draft.explanation.trim()) {
-      toast.error("Add both the complexity analysis and final explanation.")
+    const needsComplexity = !activeRound.workflow_state?.complexity
+    const needsExplanation = !activeRound.workflow_state?.explanation
+    if ((needsComplexity && !draft.complexity.trim()) || (needsExplanation && !draft.explanation.trim())) {
+      toast.error("Complete the remaining complexity and final explanation fields.")
       return
     }
-    if (!activeRound.workflow_state?.complexity) {
+    if (needsComplexity) {
       if (!await submitWorkflowEvidence("complexity", draft.complexity, activeRound)) return
     }
-    await submitWorkflowEvidence("explanation", draft.explanation, activeRound)
+    if (needsExplanation) await submitWorkflowEvidence("explanation", draft.explanation, activeRound)
   }
 
   const updateWrittenResponse = (roundId: string, value: string) => {
@@ -1118,7 +1140,7 @@ export default function TechnicalInterviewPage() {
   }
 
   const submitWrittenResponse = async () => {
-    if (!activeRound || activeRoundIsCoding || reviewMode || sessionFlagged) return
+    if (!activeRound || activeRoundIsCoding || reviewMode) return
     const roundId = activeRound.round_id
     const previousResult = responseResultByRound[roundId]
     const previousDecision = previousResult?.decision && typeof previousResult.decision === "object"
@@ -1146,8 +1168,7 @@ export default function TechnicalInterviewPage() {
     try {
       const response = await fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${roundId}/response`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey, ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         body: JSON.stringify({
           response_text: responseText,
           response_payload: {
@@ -1183,11 +1204,6 @@ export default function TechnicalInterviewPage() {
     }
   }
 
-  const selectRound = (roundId: string) => {
-    setActiveRoundId(roundId)
-    roundStartedAtRef.current = Date.now()
-  }
-
   const selectCase = (index: number) => {
     setSelectedCaseIndex(index)
     if (activeRound) {
@@ -1208,47 +1224,99 @@ export default function TechnicalInterviewPage() {
     setShowLeaveConfirm(true)
   }, [])
 
-  const saveCurrentDrafts = useCallback(async (options: { keepalive?: boolean } = {}) => {
-    await Promise.all(
-      roundsRef.current.map(async (round) => {
-        const code = codeByRoundRef.current[round.round_id] || ""
-        const language = languageByRoundRef.current[round.round_id] || round.language || "python"
-        if (!code.trim()) return null
-        return fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${round.round_id}/save-draft`, {
+  const saveRoundDraft = useCallback(async (
+    roundId: string,
+    options: { keepalive?: boolean } = {},
+  ): Promise<boolean> => {
+    const existing = draftSaveInFlightRef.current[roundId]
+    if (existing) return existing
+
+    const round = roundsRef.current.find((item) => item.round_id === roundId)
+    if (!round || !isCodingRound(round)) return true
+    const status = String(round.status || "").toLowerCase()
+    if (["submitted", "submitting", "awaiting_explanation", "completed", "expired", "cancelled"].includes(status)) {
+      dirtyRoundIdsRef.current.delete(roundId)
+      return true
+    }
+
+    const code = codeByRoundRef.current[roundId] ?? ""
+    if (!dirtyRoundIdsRef.current.has(roundId) || code === lastSavedCodeRef.current[roundId]) {
+      dirtyRoundIdsRef.current.delete(roundId)
+      setDraftSaveStateByRound((current) => ({ ...current, [roundId]: "saved" }))
+      return true
+    }
+    const language = languageByRoundRef.current[roundId] || round.language || "python"
+    const revision = editorRevisionRef.current[roundId] || 0
+    const savePromise = (async () => {
+      setDraftSaveStateByRound((current) => ({ ...current, [roundId]: "saving" }))
+      try {
+        const response = await fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${roundId}/save-draft`, {
           method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          headers: { "Content-Type": "application/json" },
           keepalive: options.keepalive,
-          body: JSON.stringify({ code, language }),
-        }).catch(() => null)
-      })
+          body: JSON.stringify({ code, language, editor_revision: revision, candidate_edited: true }),
+        })
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}))
+          throw new Error(body.detail || "Draft save failed")
+        }
+        lastSavedCodeRef.current[roundId] = code
+        if (codeByRoundRef.current[roundId] === code) {
+          dirtyRoundIdsRef.current.delete(roundId)
+          setDraftSaveStateByRound((current) => ({ ...current, [roundId]: "saved" }))
+        } else {
+          setDraftSaveStateByRound((current) => ({ ...current, [roundId]: "unsaved" }))
+        }
+        return true
+      } catch {
+        setDraftSaveStateByRound((current) => ({ ...current, [roundId]: "error" }))
+        return false
+      } finally {
+        delete draftSaveInFlightRef.current[roundId]
+      }
+    })()
+    draftSaveInFlightRef.current[roundId] = savePromise
+    return savePromise
+  }, [])
+
+  const saveCurrentDrafts = useCallback(async (options: { keepalive?: boolean } = {}) => {
+    const results = await Promise.all(
+      roundsRef.current.map((round) => saveRoundDraft(round.round_id, options))
     )
-  }, [interviewId])
+    if (!options.keepalive && results.some((saved) => !saved)) {
+      throw new Error("One or more code drafts could not be saved. Check your connection and try again.")
+    }
+  }, [saveRoundDraft])
 
   useEffect(() => {
-    if (
-      reviewMode
-      || endSentRef.current
-      || !proctoringStartedRef.current
-      || permissionState.screenShareReady
-    ) return
-    toast.warning(`Screen sharing stopped. Restore it within ${recoveryGraceSeconds} seconds or this attempt will end incomplete.`)
+    if (!activeRoundId || !dirtyRoundIdsRef.current.has(activeRoundId)) return
     const timeout = window.setTimeout(() => {
-      if (getTechnicalPermissionState().screenShareReady || endSentRef.current) return
-      endSentRef.current = true
-      void saveCurrentDrafts({ keepalive: true }).finally(() => {
-        void cancelInterviewSession(interviewId).finally(() => {
-          stopFaceCheck()
-          stopObjCheck()
-          stopTechnicalMic()
-          void releaseTechnicalPermissions()
-          toast.error("The restoration window expired. This attempt was marked incomplete.")
-          router.replace("/?tab=technical")
-        })
-      })
-    }, recoveryGraceSeconds * 1000)
+      void saveRoundDraft(activeRoundId)
+    }, 900)
     return () => window.clearTimeout(timeout)
-  }, [interviewId, permissionState.screenShareReady, recoveryGraceSeconds, reviewMode, router, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [activeRoundId, codeByRound, saveRoundDraft])
+
+  useEffect(() => {
+    if (!rounds.length || reviewMode || !technicalActivated) return
+    const interval = window.setInterval(() => {
+      dirtyRoundIdsRef.current.forEach((roundId) => {
+        void saveRoundDraft(roundId)
+      })
+    }, 3_000)
+    return () => window.clearInterval(interval)
+  }, [reviewMode, rounds.length, saveRoundDraft])
+
+  const selectRound = (roundId: string) => {
+    if (activeRound?.round_id && activeRound.round_id !== roundId) {
+      void saveRoundDraft(activeRound.round_id)
+      if (micListening) stopTechnicalMic()
+    }
+    setActiveRoundId(roundId)
+    roundStartedAtRef.current = Date.now()
+  }
+
+  // Media capture is optional coaching. Losing an optional camera or screen
+  // stream must never cancel or lock a Technical attempt.
 
   const commitCurrentWrittenResponses = useCallback(async (options: { keepalive?: boolean } = {}) => {
     await Promise.all(roundsRef.current.map(async (round) => {
@@ -1275,8 +1343,7 @@ export default function TechnicalInterviewPage() {
       responseIdempotencyRef.current[responseKeySlot] = { text: responseText, key: idempotencyKey }
       const response = await fetch(`${API_CONFIG.BASE_URL}/technical/rounds/${round.round_id}/response`, {
         method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey, ...getAuthHeaders() },
+        headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
         keepalive: options.keepalive,
         body: JSON.stringify({
           response_text: responseText,
@@ -1298,17 +1365,19 @@ export default function TechnicalInterviewPage() {
     for (const round of roundsRef.current) {
       if (!isCodingRound(round) || String(round.status || "").toLowerCase() !== "awaiting_explanation") continue
       const draft = workflowDraftByRound[round.round_id] || { complexity: "", explanation: "" }
-      if (!draft.complexity.trim() || !draft.explanation.trim()) {
+      const needsComplexity = !round.workflow_state?.complexity
+      const needsExplanation = !round.workflow_state?.explanation
+      if ((needsComplexity && !draft.complexity.trim()) || (needsExplanation && !draft.explanation.trim())) {
         if (!options.keepalive) {
-          throw new Error("Complete the complexity and final explanation for every submitted coding round before finishing.")
+          throw new Error("Complete the remaining complexity and final explanation for every submitted coding round before finishing.")
         }
         continue
       }
-      if (!round.workflow_state?.complexity) {
+      if (needsComplexity) {
         if (!await submitWorkflowEvidence("complexity", draft.complexity, round)) throw new Error("Could not save complexity evidence.")
       }
       const latestRound = roundsRef.current.find((item) => item.round_id === round.round_id) || round
-      if (!latestRound.workflow_state?.explanation) {
+      if (!latestRound.workflow_state?.explanation && needsExplanation) {
         if (!await submitWorkflowEvidence("explanation", draft.explanation, latestRound)) throw new Error("Could not save final explanation.")
       }
     }
@@ -1317,8 +1386,8 @@ export default function TechnicalInterviewPage() {
   const finishTechnicalSession = useCallback(async (options: { keepalive?: boolean } = {}) => {
     if (reviewModeRef.current || endSentRef.current) return true
     endSentRef.current = true
-    await saveCurrentDrafts(options)
     try {
+      await saveCurrentDrafts(options)
       await commitPendingCodingEvidence(options)
       await commitCurrentWrittenResponses(options)
       let ended = await endInterviewSession(interviewId, { keepalive: options.keepalive })
@@ -1338,11 +1407,10 @@ export default function TechnicalInterviewPage() {
       }
     }
     stopFaceCheck()
-    stopObjCheck()
     stopTechnicalMic()
     await releaseTechnicalPermissions()
     return true
-  }, [commitCurrentWrittenResponses, interviewId, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [commitCurrentWrittenResponses, interviewId, saveCurrentDrafts, stopFaceCheck, stopTechnicalMic])
 
   useEffect(() => {
     finishSessionRef.current = finishTechnicalSession
@@ -1362,7 +1430,6 @@ export default function TechnicalInterviewPage() {
       await commitCurrentWrittenResponses()
       await cancelInterviewSession(interviewId)
       stopFaceCheck()
-      stopObjCheck()
       stopTechnicalMic()
       await releaseTechnicalPermissions()
       router.replace("/?tab=technical")
@@ -1370,18 +1437,13 @@ export default function TechnicalInterviewPage() {
       endSentRef.current = false
       toast.error(error instanceof Error ? error.message : "Could not end this attempt. Check your connection and try again.")
     }
-  }, [commitCurrentWrittenResponses, finishTechnicalSession, interviewId, leaveIntent, router, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [commitCurrentWrittenResponses, finishTechnicalSession, interviewId, leaveIntent, router, saveCurrentDrafts, stopFaceCheck, stopTechnicalMic])
 
   useEffect(() => {
     if (!rounds.length || reviewMode) return
     const preserveOnLeave = () => {
       void saveCurrentDrafts({ keepalive: true })
-      if (!endSentRef.current) {
-        endSentRef.current = true
-        void abandonInterviewSession(interviewId, { keepalive: true }).catch(() => undefined)
-      }
       stopFaceCheck()
-      stopObjCheck()
       stopTechnicalMic()
       void releaseTechnicalPermissions()
     }
@@ -1396,7 +1458,7 @@ export default function TechnicalInterviewPage() {
       window.removeEventListener("beforeunload", onBeforeUnload)
       window.removeEventListener("pagehide", onPageHide)
     }
-  }, [interviewId, reviewMode, rounds.length, saveCurrentDrafts, stopFaceCheck, stopObjCheck, stopTechnicalMic])
+  }, [reviewMode, rounds.length, saveCurrentDrafts, stopFaceCheck, stopTechnicalMic, technicalActivated])
 
   useEffect(() => {
     if (reviewMode) return
@@ -1497,11 +1559,69 @@ export default function TechnicalInterviewPage() {
     )
   }
 
+  if (!reviewMode && !technicalActivated) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background px-5 py-10 text-foreground">
+        <section className="w-full max-w-2xl rounded-2xl border border-border bg-card p-7 shadow-sm md:p-10">
+          <div className="flex items-center gap-3 text-primary">
+            <SquareTerminal className="h-6 w-6" />
+            <p className="text-sm font-semibold uppercase tracking-[0.16em]">Technical briefing</p>
+          </div>
+          <h1 className="mt-4 text-3xl font-bold tracking-tight">Hi, I&apos;m your technical interviewer.</h1>
+          <p className="mt-4 text-sm leading-7 text-muted-foreground">
+            I&apos;ll first show you the validated problems and explain the round. After you activate it, your
+            server-owned timer starts and you can clarify the prompt, explain your approach, write code, test it,
+            submit it, and receive an evidence-based report.
+          </p>
+          <div className="mt-6 grid gap-3 sm:grid-cols-5">
+            {[
+              ["1", "Clarify"],
+              ["2", "Explain"],
+              ["3", "Code"],
+              ["4", "Test"],
+              ["5", "Submit"],
+            ].map(([step, label]) => (
+              <div key={step} className="rounded-lg border border-border bg-background px-3 py-3 text-center">
+                <p className="text-xs font-bold text-primary">{step}</p>
+                <p className="mt-1 text-xs font-medium">{label}</p>
+              </div>
+            ))}
+          </div>
+          <p className="mt-5 text-xs leading-5 text-muted-foreground">
+            {rounds.length} validated problem{rounds.length === 1 ? "" : "s"} are ready. Nothing is timed or
+            actionable until you choose Start Technical Round.
+          </p>
+          <div className="mt-7 flex flex-wrap gap-3">
+            <Button onClick={() => void activateSession()} disabled={activatingTechnical}>
+              {activatingTechnical ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Play className="mr-2 h-4 w-4" />}
+              {activatingTechnical ? "Starting round…" : "Start Technical Round"}
+            </Button>
+            <Button variant="outline" onClick={requestLeave} disabled={activatingTechnical}>
+              <ArrowLeft className="mr-2 h-4 w-4" />Leave round
+            </Button>
+          </div>
+        </section>
+        <TechnicalLeaveConfirmDialog
+          open={showLeaveConfirm}
+          intent={leaveIntent}
+          onCancel={() => setShowLeaveConfirm(false)}
+          onConfirm={confirmLeave}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-dvh min-h-0 flex-col overflow-hidden bg-background text-foreground">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-border bg-secondary px-3">
         <div className="flex min-w-0 items-center gap-2">
-          <Button variant="ghost" size="icon-sm" className="text-foreground hover:bg-secondary hover:text-foreground" onClick={requestLeave}>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-foreground hover:bg-secondary hover:text-foreground"
+            aria-label="Leave technical round"
+            onClick={requestLeave}
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div className="hidden min-w-0 sm:block">
@@ -1514,7 +1634,7 @@ export default function TechnicalInterviewPage() {
             onChange={(event) => selectRound(event.target.value)}
           >
             {rounds.map((round, index) => (
-              <option key={round.round_id} value={round.round_id} disabled={String(round.status || "").toLowerCase() === "pending"}>
+              <option key={round.round_id} value={round.round_id}>
                 {problemTitle(round, index)}
               </option>
             ))}
@@ -1569,14 +1689,24 @@ export default function TechnicalInterviewPage() {
           {!reviewMode && strictWarnings > 0 && (
             <span className="hidden items-center gap-1 rounded-md bg-amber-500/15 px-2 py-1 text-xs text-amber-700 dark:text-amber-300 sm:flex">
               <ShieldAlert className="h-3 w-3" />
-              Session protected
+              Self-review signal
             </span>
           )}
           {!reviewMode && permissionsReady && (
           <span className="hidden items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-1 text-xs text-emerald-700 dark:text-emerald-300 sm:flex">
             <ShieldCheck className="h-3 w-3" />
-            Sharing active
+            Typed round ready
           </span>
+          )}
+          {!reviewMode && (
+            <>
+              <Button size="sm" variant="outline" className="hidden sm:inline-flex" onClick={() => void toggleCameraCoaching()}>
+                {permissionState.cameraReady ? "Stop camera" : "Camera coaching"}
+              </Button>
+              <Button size="sm" variant="outline" className="hidden sm:inline-flex" onClick={() => void toggleScreenCoaching()}>
+                {permissionState.screenShareReady ? "Stop sharing" : "Screen coaching"}
+              </Button>
+            </>
           )}
           {!reviewMode && (
             <Button
@@ -1590,21 +1720,23 @@ export default function TechnicalInterviewPage() {
         </div>
       </header>
 
-      {sessionFlagged && (
-        <div className="flex items-center gap-2 border-b border-rose-500/40 bg-rose-500/15 px-4 py-2 text-xs font-semibold text-rose-800 dark:text-rose-200">
-          <ShieldAlert className="h-4 w-4" />
-          This attempt is locked after repeated session-integrity warnings.
-        </div>
-      )}
-
-      {strictWarnings > 0 && !sessionFlagged && (
+      {strictWarnings > 0 && (
         <div className="flex items-center gap-2 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs font-medium text-amber-700 dark:text-amber-300 sm:hidden">
           <ShieldAlert className="h-4 w-4" />
-          Integrity warnings: {strictWarnings}
+          Self-review signals recorded: {strictWarnings}
         </div>
       )}
 
-      <video ref={cameraVideoRef} autoPlay playsInline muted className="hidden" />
+      <video
+        ref={cameraVideoRef}
+        autoPlay
+        playsInline
+        muted
+        aria-label="Optional camera coaching preview"
+        className={permissionState.cameraReady
+          ? "fixed bottom-4 right-4 z-40 aspect-video w-48 rounded-lg border border-border bg-black object-cover shadow-xl"
+          : "hidden"}
+      />
 
       {activeRoundIsCoding ? (
       <main className="grid min-h-0 flex-1 gap-2 overflow-hidden bg-background p-2 lg:grid-cols-[minmax(360px,0.95fr)_minmax(520px,1fr)]">
@@ -1617,7 +1749,7 @@ export default function TechnicalInterviewPage() {
             tests={activeTests}
             constraintsRevealed={activeRound ? !!revealedConstraintsByRound[activeRound.round_id] : false}
             hintRevealed={activeRound ? !!revealedHintByRound[activeRound.round_id] : false}
-            technicalTranscript={technicalTranscript}
+            technicalTranscript={activeTechnicalTranscript}
             micListening={micListening}
             micSupported={micSupported}
             onRevealConstraints={() => activeRound && revealConstraints(activeRound.round_id)}
@@ -1626,7 +1758,7 @@ export default function TechnicalInterviewPage() {
             workflowDraft={activeRound ? workflowDraftByRound[activeRound.round_id] || { complexity: "", explanation: "" } : { complexity: "", explanation: "" }}
             workflowState={activeRound?.workflow_state || {}}
             workflowSaving={workflowSaving}
-            actionLocked={roundActionLocked || sessionFlagged}
+            actionLocked={roundActionLocked}
             onWorkflowChange={updateWorkflowDraft}
             onCommitFinalEvidence={() => void commitActiveFinalEvidence()}
           />
@@ -1645,31 +1777,27 @@ export default function TechnicalInterviewPage() {
             language={currentLanguage}
             code={activeRound ? codeByRound[activeRound.round_id] || "" : ""}
             executorName={executorName}
-            onLanguageChange={(language) => {
-              if (!activeRound) return
-              setLanguageByRound((prev) => ({ ...prev, [activeRound.round_id]: language }))
-              setCodeByRound((prev) => ({
-                ...prev,
-                [activeRound.round_id]: prev[activeRound.round_id]?.trim() ? prev[activeRound.round_id] : starterForLanguage(activeRound, language),
-              }))
-            }}
-            onCodeChange={reviewMode ? () => undefined : updateCode}
+            readOnly={editorLocked}
+            saveState={activeDraftSaveState}
+            onCodeChange={editorLocked ? () => undefined : updateCode}
             onRecordTechnicalEvent={recordTechnicalEvent}
           />
           <ResultPanel
-            output={output}
-            running={running}
+            output={activeOutput}
+            running={activeRunning}
             executorName={executorName}
-            actionLocked={roundActionLocked || sessionFlagged}
-            lockMessage={sessionFlagged ? "This technical round is locked after repeated integrity warnings." : roundLockMessage}
-            submitLocked={roundActionLocked || sessionFlagged || (activeRound ? !!submitLockedByRound[activeRound.round_id] : false) || submitsLeft <= 0}
+            executionAvailable={executionAvailable}
+            executionUnavailableReason={executionUnavailableReason}
+            actionLocked={roundActionLocked}
+            lockMessage={roundLockMessage}
+            submitLocked={roundActionLocked || (activeRound ? !!submitLockedByRound[activeRound.round_id] : false) || submitsLeft <= 0}
             submitsLeft={submitsLeft}
             maxSubmissions={maxSubmissions}
-            pollingError={activeRound && recoverableRun?.roundId === activeRound.round_id ? pollingError : ""}
-            canResumePolling={Boolean(activeRound && recoverableRun?.roundId === activeRound.round_id)}
+            pollingError={activePollingError}
+            canResumePolling={Boolean(activeRecoverableRun)}
             onRun={handleRun}
             onSubmit={() => executeRound("submit")}
-            onResumePolling={() => void resumeRunPolling()}
+            onResumePolling={() => void resumeRunPolling(activeRecoverableRun)}
           />
         </section>
       </main>
@@ -1680,8 +1808,8 @@ export default function TechnicalInterviewPage() {
           value={activeRound ? responseByRound[activeRound.round_id] || "" : ""}
           result={activeRound ? responseResultByRound[activeRound.round_id] : undefined}
           submitting={Boolean(activeRound && submittingResponseByRound[activeRound.round_id])}
-          locked={roundActionLocked || sessionFlagged}
-          lockMessage={sessionFlagged ? "This technical round is locked after repeated integrity warnings." : roundLockMessage}
+          locked={roundActionLocked}
+          lockMessage={roundLockMessage}
           onChange={(value) => activeRound && updateWrittenResponse(activeRound.round_id, value)}
           onSubmit={() => void submitWrittenResponse()}
         />
@@ -1722,17 +1850,17 @@ function PermissionGate({
               <Lock className="h-5 w-5" />
             </div>
             <div>
-              <h1 className="text-lg font-semibold">Restore permissions</h1>
-              <p className="mt-1 text-sm text-muted-foreground">Restore any permission that was interrupted.</p>
+              <h1 className="text-lg font-semibold">Technical round setup</h1>
+              <p className="mt-1 text-sm text-muted-foreground">Fullscreen lets you focus. Camera, microphone, and screen sharing are optional coaching tools.</p>
             </div>
           </div>
         </div>
 
         <div className="space-y-4 px-6 py-5">
           <div className="grid gap-2">
-            <PermissionRow label="Screen share" active={permissionState.screenShareReady} />
-            <PermissionRow label="Camera" active={permissionState.cameraReady} />
-            <PermissionRow label="Microphone input" active={permissionState.microphoneReady} />
+            <PermissionRow label="Screen coaching (optional)" active={permissionState.screenShareReady} />
+            <PermissionRow label="Camera coaching (optional)" active={permissionState.cameraReady} />
+            <PermissionRow label="Microphone input (optional)" active={permissionState.microphoneReady} />
           </div>
           {permissionState.cameraReady && (
             <div className="overflow-hidden rounded-lg border border-border bg-black">
@@ -1746,7 +1874,7 @@ function PermissionGate({
           )}
           {strictWarnings > 0 && (
             <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-750 dark:text-amber-200">
-              Strict mode has logged {strictWarnings} warning{strictWarnings === 1 ? "" : "s"} for this session.
+              Optional coaching has logged {strictWarnings} self-review signal{strictWarnings === 1 ? "" : "s"} for this session.
             </div>
           )}
         </div>
@@ -1757,7 +1885,7 @@ function PermissionGate({
           </Button>
           <Button className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90" onClick={onRequestPermissions} disabled={requestingPermission}>
             {requestingPermission ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
-            {requestingPermission ? "Requesting…" : "Restore"}
+            {requestingPermission ? "Preparing…" : "Continue"}
           </Button>
         </div>
       </div>
@@ -2140,18 +2268,27 @@ function ProblemPanel({
                   value={workflowDraft.complexity}
                   onChange={(event) => onWorkflowChange("complexity", event.target.value)}
                   disabled={Boolean(workflowState.complexity) || workflowSaving}
-                  placeholder="Time complexity…, space complexity…, and why…"
+                  placeholder={workflowState.complexity ? "Complexity analysis saved" : "Time complexity…, space complexity…, and why…"}
                   className="h-24 w-full resize-none rounded-md border border-border bg-background p-3 text-sm leading-6 text-foreground outline-none focus:border-primary disabled:opacity-60"
                 />
                 <textarea
                   value={workflowDraft.explanation}
                   onChange={(event) => onWorkflowChange("explanation", event.target.value)}
                   disabled={Boolean(workflowState.explanation) || workflowSaving}
-                  placeholder="Explain the final implementation, edge cases, debugging changes, and remaining trade-offs…"
+                  placeholder={workflowState.explanation ? "Final explanation saved" : "Explain the final implementation, edge cases, debugging changes, and remaining trade-offs…"}
                   className="h-28 w-full resize-none rounded-md border border-border bg-background p-3 text-sm leading-6 text-foreground outline-none focus:border-primary disabled:opacity-60"
                 />
                 <div className="flex justify-end">
-                  <Button size="sm" onClick={onCommitFinalEvidence} disabled={workflowSaving || Boolean(workflowState.explanation) || !workflowDraft.complexity.trim() || !workflowDraft.explanation.trim()}>
+                  <Button
+                    size="sm"
+                    onClick={onCommitFinalEvidence}
+                    disabled={
+                      workflowSaving
+                      || Boolean(workflowState.complexity && workflowState.explanation)
+                      || (!workflowState.complexity && !workflowDraft.complexity.trim())
+                      || (!workflowState.explanation && !workflowDraft.explanation.trim())
+                    }
+                  >
                     {workflowSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />} Commit final reasoning
                   </Button>
                 </div>
@@ -2281,7 +2418,8 @@ function CodePanel({
   language,
   code,
   executorName,
-  onLanguageChange,
+  readOnly,
+  saveState,
   onCodeChange,
   onRecordTechnicalEvent,
 }: {
@@ -2289,7 +2427,8 @@ function CodePanel({
   language: Language
   code: string
   executorName: string
-  onLanguageChange: (language: Language) => void
+  readOnly: boolean
+  saveState: DraftSaveState
   onCodeChange: (code: string) => void
   onRecordTechnicalEvent: (eventType: string, payload?: Record<string, unknown>, roundId?: string) => void
 }) {
@@ -2328,35 +2467,20 @@ function CodePanel({
   }, [onRecordTechnicalEvent, round?.round_id])
 
   return (
-    <div
-      className="min-h-0 overflow-hidden rounded-lg border border-border bg-card"
-      onPasteCapture={(event) => {
-        event.preventDefault()
-        toast.warning("Paste is blocked in strict mode.")
-        void onRecordTechnicalEvent("paste_blocked", { chars: event.clipboardData.getData("text").length }, round?.round_id)
-      }}
-      onDropCapture={(event) => {
-        event.preventDefault()
-        toast.warning("Dropping code is blocked in strict mode.")
-        void onRecordTechnicalEvent("drop_blocked", {}, round?.round_id)
-      }}
-    >
+    <div className="min-h-0 overflow-hidden rounded-lg border border-border bg-card">
       <div className="flex h-10 items-center justify-between border-b border-border bg-secondary px-3">
         <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
           <Code2 className="h-4 w-4 text-emerald-400" />
           Code
         </div>
         <div className="flex items-center gap-3">
-          <select
-            className="h-8 rounded-md border border-transparent bg-secondary px-1 text-sm text-muted-foreground outline-none hover:border-border"
-            value={language}
-            onChange={(event) => onLanguageChange(event.target.value as Language)}
+          <span
+            className="h-8 rounded-md border border-transparent bg-secondary px-2 py-1.5 text-sm text-muted-foreground"
+            aria-label="Programming language"
+            title="The language is fixed for this question"
           >
-            <option value="python">Python3</option>
-            <option value="javascript">JavaScript</option>
-            <option value="java">Java</option>
-            <option value="cpp">C++</option>
-          </select>
+            {languageLabels[language] || language}
+          </span>
           <span className="text-sm text-muted-foreground">{executorName || "Code runner"}</span>
         </div>
       </div>
@@ -2369,10 +2493,6 @@ function CodePanel({
           value={code}
           onChange={(value) => onCodeChange(value || "")}
           onMount={(editor) => {
-            editor.onDidPaste(() => {
-              const currentCode = editor.getValue()
-              void onRecordTechnicalEvent("paste_blocked", { chars: currentCode.length }, round?.round_id)
-            })
             editor.onKeyDown(recordKeyActivity)
           }}
           options={{
@@ -2382,13 +2502,22 @@ function CodePanel({
             minimap: { enabled: false },
             padding: { top: 10 },
             quickSuggestions: false,
+            readOnly,
             scrollBeyondLastLine: false,
             suggestOnTriggerCharacters: false,
           }}
         />
       </div>
       <div className="flex h-9 items-center justify-between border-t border-border bg-card px-4 text-xs text-muted-foreground">
-        <span>Saved</span>
+        <span aria-live="polite">
+          {saveState === "saving"
+            ? "Saving..."
+            : saveState === "unsaved"
+              ? "Unsaved changes"
+              : saveState === "error"
+                ? "Save failed - retrying"
+                : "Saved"}
+        </span>
         <span>{languageLabels[language] || language}</span>
       </div>
     </div>
@@ -2399,6 +2528,8 @@ function ResultPanel({
   output,
   running,
   executorName,
+  executionAvailable,
+  executionUnavailableReason,
   actionLocked,
   lockMessage,
   submitLocked,
@@ -2413,6 +2544,8 @@ function ResultPanel({
   output: RunResult | null
   running: boolean
   executorName: string
+  executionAvailable: boolean
+  executionUnavailableReason: string
   actionLocked: boolean
   lockMessage: string
   submitLocked: boolean
@@ -2432,11 +2565,11 @@ function ResultPanel({
           Test Result
         </div>
         <div className="flex gap-2">
-          <Button size="sm" className="h-7 gap-1.5 bg-indigo-600 px-3 text-white hover:bg-indigo-700" onClick={onRun} disabled={running || actionLocked}>
+          <Button size="sm" className="h-7 gap-1.5 bg-indigo-600 px-3 text-white hover:bg-indigo-700" onClick={onRun} disabled={!executionAvailable || running || actionLocked}>
             <Play className="h-3 w-3" />
             Run
           </Button>
-          <Button size="sm" className="h-7 gap-1.5 bg-emerald-600 px-3 text-white hover:bg-emerald-700" onClick={onSubmit} disabled={running || submitLocked || submitsLeft <= 0}>
+          <Button size="sm" className="h-7 gap-1.5 bg-emerald-600 px-3 text-white hover:bg-emerald-700" onClick={onSubmit} disabled={!executionAvailable || running || submitLocked || submitsLeft <= 0}>
             <Upload className="h-3 w-3" />
             Submit{maxSubmissions > 1 ? ` (${submitsLeft})` : ""}
           </Button>
@@ -2444,6 +2577,12 @@ function ResultPanel({
       </div>
 
       <div className="iv-thin-scrollbar h-[calc(100%-2.5rem)] min-h-0 overflow-y-auto p-4">
+
+          {!executionAvailable && (
+            <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
+              Code execution is unavailable: {executionUnavailableReason} Your draft remains editable.
+            </div>
+          )}
 
           {pollingError && (
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">

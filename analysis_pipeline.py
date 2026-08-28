@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from config import settings
 from database import async_execute
+from local_runtime import get_local_preferences
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
 from learning_engine import (
     ensure_mission_from_weakness,
@@ -21,7 +22,7 @@ from learning_engine import (
     validate_mission_with_analysis,
 )
 from report_generator import build_async_behavioral_report, build_async_technical_report
-from security_utils import decrypt_data, decrypt_json, encrypt_data, stable_hash
+from security_utils import decrypt_data, decrypt_json, decrypt_json_field, encrypt_data, stable_hash
 from weakness_engine import (
     RUBRIC_VERSION,
     TAXONOMY_VERSION,
@@ -35,7 +36,7 @@ ANALYSIS_STAGES = (
     "evidence_load",
     "transcript_analysis",
     "technical_analysis",
-    "integrity_summary",
+    "self_review_summary",
     "deterministic_report",
     "semantic_enhancement",
     "report_validation",
@@ -47,9 +48,11 @@ ANALYSIS_STAGES = (
 ANALYSIS_PREFLIGHT_STAGES = ("assessment_completion",)
 ANALYSIS_EXECUTION_STAGES = ANALYSIS_PREFLIGHT_STAGES + ANALYSIS_STAGES
 
-ANALYSIS_STAGE_VERSION = "evidence-v6"
+ANALYSIS_STAGE_VERSION = "evidence-v10"
 ANALYSIS_LEASE_SECONDS = 90
 ANALYSIS_MAX_RETRIES = 3
+REPORT_SIDE_EFFECT_LEASE_SECONDS = 120
+REPORT_SIDE_EFFECT_MAX_ATTEMPTS = 8
 TERMINAL_INTERVIEW_STATUSES = {"completed", "report_ready", "partial", "failed", "cancelled"}
 REPORT_READY_INTERVIEW_STATUSES = {"completed", "report_ready", "partial", "failed"}
 EVIDENCE_MANIFEST_VERSION = "evidence-manifest-v2"
@@ -118,7 +121,7 @@ def _manifest_hashable(value: Any) -> Any:
 
 
 def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tuple[str, str]:
-    cursor.execute("SELECT NOW()")
+    cursor.execute("SELECT CURRENT_TIMESTAMP")
     sealed_at = cursor.fetchone()[0]
     item_queries = (
         (
@@ -128,7 +131,7 @@ def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tup
                       question.rubric_version, question.provenance
                FROM InterviewQuestions question
                JOIN Interviews interview ON interview.interview_id = question.interview_id
-               WHERE question.interview_id = %s AND interview.user_id = %s AND question.created_at <= %s""",
+               WHERE question.interview_id = ? AND interview.user_id = ? AND question.created_at <= ?""",
         ),
         (
             "interview_response", "response-v1",
@@ -136,57 +139,66 @@ def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tup
                       evaluation_json, answer_quality_flags, evidence_quotes, stt_confidence,
                       answer_text_encrypted, raw_answer_hash, evidence_hash, input_mode, timing_json
                FROM InterviewResponses response
-               WHERE response.interview_id = %s
-                 AND EXISTS (SELECT 1 FROM Interviews interview WHERE interview.interview_id = response.interview_id AND interview.user_id = %s)
-                 AND response.created_at <= %s""",
+               WHERE response.interview_id = ?
+                 AND EXISTS (SELECT 1 FROM Interviews interview WHERE interview.interview_id = response.interview_id AND interview.user_id = ?)
+                 AND response.created_at <= ?""",
         ),
         (
             "response_assessment", "assessment-v1",
-            """SELECT assessment_id, created_at, response_id, evaluator_version, evidence_hash, overall_score, assessment_json
+            """SELECT assessment_id, created_at, response_id, evaluator_version, evidence_hash, overall_score,
+                      assessment_json_encrypted, assessment_json
                FROM ResponseAssessments assessment
-               WHERE assessment.interview_id = %s
-                 AND EXISTS (SELECT 1 FROM Interviews interview WHERE interview.interview_id = assessment.interview_id AND interview.user_id = %s)
-                 AND assessment.created_at <= %s""",
+               WHERE assessment.interview_id = ?
+                 AND EXISTS (SELECT 1 FROM Interviews interview WHERE interview.interview_id = assessment.interview_id AND interview.user_id = ?)
+                 AND assessment.created_at <= ?""",
+        ),
+        (
+            "technical_round", "technical-round-v1",
+            """SELECT round_id, created_at, round_type, language, prompt,
+                      problem_id, round_spec_id, problem_version, round_number,
+                      round_spec, metadata
+               FROM TechnicalInterviewRounds
+               WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
         (
             "technical_submission", "technical-submission-v1",
             """SELECT submission_id, created_at, round_id, code_hash, submit_number, visible_passed,
                       visible_total, hidden_passed, hidden_total, status, execution_job_id
-               FROM TechnicalSubmissions WHERE interview_id = %s AND user_id = %s AND created_at <= %s""",
+               FROM TechnicalSubmissions WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
         (
             "technical_run", "technical-run-v1",
             """SELECT run.run_id, run.created_at, run.round_id, run.code_hash, run.exit_code,
                       run.error_signature, run.runtime_ms, run.metadata, run.hidden_validation_result
                FROM TechnicalRunEvents run JOIN TechnicalInterviewRounds round ON round.round_id = run.round_id
-               WHERE round.interview_id = %s AND run.user_id = %s AND run.created_at <= %s""",
+               WHERE round.interview_id = ? AND run.user_id = ? AND run.created_at <= ?""",
         ),
         (
             "technical_code_snapshot", "code-snapshot-v1",
             """SELECT snapshot_id, created_at, round_id, code_hash, source_chars, metadata
-               FROM TechnicalCodeSnapshots WHERE interview_id = %s AND user_id = %s AND created_at <= %s""",
+               FROM TechnicalCodeSnapshots WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
         (
             "technical_reasoning", "technical-reasoning-v1",
-            """SELECT evidence_id::text, created_at, round_id, evidence_type, content, payload,
+            """SELECT evidence_id, created_at, round_id, evidence_type, content, payload,
                       content_encrypted, evidence_hash, idempotency_key
-               FROM TechnicalReasoningEvidence WHERE interview_id = %s AND user_id = %s AND created_at <= %s""",
+               FROM TechnicalReasoningEvidence WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
         (
             "integrity_event", "attempt-integrity-v1",
             """SELECT event_id, received_at, client_session_id, sequence, event_type, severity, source,
                       observed_at, payload_hash
-               FROM AttemptIntegrityEvents WHERE interview_id = %s AND user_id = %s AND received_at <= %s""",
+               FROM AttemptIntegrityEvents WHERE interview_id = ? AND user_id = ? AND received_at <= ?""",
         ),
         (
             "anti_cheat_event", "anti-cheat-v1",
-            """SELECT event_id::text, created_at, event_type, payload
-               FROM AntiCheatEvents WHERE interview_id = %s AND user_id = %s AND created_at <= %s""",
+            """SELECT event_id, created_at, event_type, payload
+               FROM SelfReviewEvents WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
         (
             "media_asset", "media-manifest-v1",
             """SELECT asset_id, created_at, media_kind, checksum, byte_size, chunk_index, chunk_count, status
-               FROM InterviewMediaAssets WHERE interview_id = %s AND user_id = %s AND created_at <= %s""",
+               FROM InterviewMediaAssets WHERE interview_id = ? AND user_id = ? AND created_at <= ?""",
         ),
     )
     items: List[Dict[str, Any]] = []
@@ -233,8 +245,7 @@ def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tup
         """
         SELECT manifest_id, evidence_hash, schema_version, revision_no, producer_version
         FROM EvidenceManifests
-        WHERE interview_id = %s AND user_id = %s AND is_current = TRUE
-        FOR UPDATE
+        WHERE interview_id = ? AND user_id = ? AND is_current = TRUE
         """,
         (interview_id, user_id),
     )
@@ -254,7 +265,7 @@ def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tup
             """
             UPDATE EvidenceManifests
             SET is_current = FALSE
-            WHERE manifest_id = %s
+            WHERE manifest_id = ?
             """,
             (existing[0],),
         )
@@ -265,7 +276,7 @@ def _seal_evidence_manifest(cursor: Any, interview_id: str, user_id: str) -> tup
             item_count, manifest_json, manifest_encrypted,
             revision_no, is_current, supersedes_manifest_id, producer_version,
             sealed_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?)
         """,
         (
             manifest_id, interview_id, user_id, EVIDENCE_MANIFEST_VERSION,
@@ -296,45 +307,68 @@ def _candidate_word_count(transcript: List[Dict[str, Any]]) -> int:
     return sum(_word_count(item.get("text", "")) for item in transcript if item.get("role") == "candidate")
 
 
-def aggregate_cheating_risk(event_counts: Counter, media_summary: Dict[str, Any], code_summary: Dict[str, Any]) -> Dict[str, Any]:
-    weights = {
-        "fullscreen_exit": 20,
-        "tab_switch": 18,
-        "window_blur": 8,
-        "paste": 22,
-        "paste_blocked": 18,
-        "large_paste": 28,
-        "clipboard_code": 15,
-        "second_speaker": 35,
-        "face_missing": 25,
-        "multiple_faces": 30,
-        "multiple_people_detected": 35,
-        "mobile_phone_detected": 35,
-        "large_code_jump": 24,
-        "screen_not_monitor": 28,
-        "no_clarification_before_coding": 8,
-        "suspicious_clipboard_pattern": 24,
-        "identity_mismatch": 40,
-        "gaze_offscreen": 10,
-        "visible_output_hardcode": 28,
+def _candidate_transcript_role(value: Any) -> Optional[str]:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"candidate", "user", "candidate_user"}:
+        return "candidate"
+    if normalized in {"interviewer", "assistant", "ai", "coach"}:
+        return "interviewer"
+    return None
+
+
+def _technical_reasoning_transcript_entry(
+    evidence_type: Any,
+    encrypted_payload: Any,
+) -> Optional[Dict[str, str]]:
+    """Turn encrypted Technical reasoning evidence into a candidate transcript row."""
+    if not encrypted_payload:
+        return None
+    try:
+        payload = _json_value(_decrypt_storage_text(encrypted_payload), {})
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    text = str(
+        payload.get("content")
+        or payload.get("text")
+        or payload.get("transcript")
+        or payload.get("question")
+        or payload.get("approach")
+        or ""
+    ).strip()
+    if not text:
+        return None
+    normalized_type = str(evidence_type or "").strip().lower()
+    labels = {
+        "technical_transcript": "Spoken reasoning",
+        "spoken_explanation": "Spoken explanation",
+        "written_approach": "Written approach",
+        "workflow_clarification": "Clarification",
+        "workflow_approach": "Approach",
+        "workflow_complexity": "Complexity analysis",
+        "workflow_explanation": "Final explanation",
+        "workflow_followup": "Follow-up explanation",
     }
-    score = 0
-    flags: List[Dict[str, Any]] = []
+    label = labels.get(normalized_type)
+    if not label:
+        return None
+    return {"role": "candidate", "text": text, "label": label}
+
+
+def summarize_self_review_signals(event_counts: Counter, media_summary: Dict[str, Any], code_summary: Dict[str, Any]) -> Dict[str, Any]:
+    events: List[Dict[str, Any]] = []
     for event_type, count in event_counts.items():
-        weight = weights.get(event_type, 4)
-        contribution = min(weight * count, weight * 3)
-        score += contribution
-        flags.append({"event_type": event_type, "count": count, "severity": "high" if weight >= 20 else "medium"})
+        if int(count or 0) > 0:
+            events.append({"event_type": event_type, "count": int(count)})
 
     media_flags = media_summary.get("flags") or []
     code_flags = code_summary.get("authenticity_flags") or []
-    score += min(len(media_flags) * 12, 36)
-    score += min(len(code_flags) * 15, 45)
-    normalized = max(0, min(100, score))
     return {
-        "risk_score": normalized,
-        "risk_level": _score_band(100 - normalized),
-        "events": flags,
+        "mode": "self_review",
+        "scored": False,
+        "signal_count": sum(item["count"] for item in events) + len(media_flags) + len(code_flags),
+        "events": events,
         "media_flags": media_flags,
         "code_flags": code_flags,
     }
@@ -353,14 +387,13 @@ async def enqueue_analysis_result(
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"analysis:{interview_id}",))
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 """
                 SELECT status, report_json, analysis_job_id, evidence_sealed_at, evidence_hash,
                        attempt_status
                 FROM Interviews
-                WHERE interview_id = %s AND user_id = %s
-                FOR UPDATE
+                WHERE interview_id = ? AND user_id = ?
                 """,
                 (interview_id, user_id),
             )
@@ -391,8 +424,8 @@ async def enqueue_analysis_result(
                             WHEN status = 'analysis_running' THEN 'running'
                             ELSE 'queued'
                         END,
-                        completed_at = COALESCE(completed_at, NOW())
-                    WHERE interview_id = %s AND user_id = %s
+                        completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+                    WHERE interview_id = ? AND user_id = ?
                     """,
                     (interview_id, user_id),
                 )
@@ -400,14 +433,33 @@ async def enqueue_analysis_result(
             if _is_report_ready_status(interview_row[0], interview_row[1]):
                 cursor.execute(
                     """
-                    SELECT 1 FROM SessionPerformanceAnalyses
-                    WHERE interview_id = %s AND user_id = %s
-                      AND schema_version = %s
-                      AND producer_version = %s
-                      AND status = 'ready'
-                      AND is_current = TRUE
-                      AND analysis_json_encrypted IS NOT NULL
-                      AND evidence_index_encrypted IS NOT NULL
+                    SELECT 1
+                    FROM SessionPerformanceAnalyses analysis
+                    WHERE analysis.interview_id = ? AND analysis.user_id = ?
+                      AND analysis.schema_version = ?
+                      AND analysis.producer_version = ?
+                      AND analysis.status = 'ready'
+                      AND analysis.is_current = TRUE
+                      AND analysis.analysis_json_encrypted IS NOT NULL
+                      AND analysis.evidence_index_encrypted IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM ReportArtifacts artifact
+                          WHERE artifact.analysis_id = analysis.analysis_id
+                            AND artifact.interview_id = analysis.interview_id
+                            AND artifact.user_id = analysis.user_id
+                            AND artifact.audience = 'candidate'
+                            AND artifact.status IN ('completed', 'partial')
+                            AND artifact.payload_encrypted IS NOT NULL
+                      )
+                      AND EXISTS (
+                          SELECT 1
+                          FROM ReportSideEffectOutbox side_effect
+                          WHERE side_effect.analysis_id = analysis.analysis_id
+                            AND side_effect.interview_id = analysis.interview_id
+                            AND side_effect.user_id = analysis.user_id
+                            AND side_effect.event_type = 'improve_sync'
+                      )
                     LIMIT 1
                     """,
                     (interview_id, user_id, SESSION_PERFORMANCE_VERSION, ANALYSIS_STAGE_VERSION),
@@ -419,7 +471,7 @@ async def enqueue_analysis_result(
                             """
                             UPDATE Interviews
                             SET analysis_status = 'completed'
-                            WHERE interview_id = %s AND user_id = %s
+                            WHERE interview_id = ? AND user_id = ?
                             """,
                             (interview_id, user_id),
                         )
@@ -430,11 +482,11 @@ async def enqueue_analysis_result(
                                 SET status = 'completed', progress = 100,
                                     current_stage = 'complete',
                                     error_message = NULL,
-                                    completed_at = COALESCE(completed_at, NOW()),
-                                    updated_at = NOW(),
+                                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                                    updated_at = CURRENT_TIMESTAMP,
                                     lease_owner = NULL,
                                     lease_expires_at = NULL
-                                WHERE job_id = %s AND status = 'failed'
+                                WHERE job_id = ? AND status = 'failed'
                                 """,
                                 (interview_row[2],),
                             )
@@ -449,9 +501,9 @@ async def enqueue_analysis_result(
             cursor.execute(
                 """
                 UPDATE Interviews
-                SET evidence_hash = %s,
-                    evidence_sealed_at = NOW()
-                WHERE interview_id = %s AND user_id = %s
+                SET evidence_hash = ?,
+                    evidence_sealed_at = CURRENT_TIMESTAMP
+                WHERE interview_id = ? AND user_id = ?
                 """,
                 (evidence_hash, interview_id, user_id),
             )
@@ -463,9 +515,8 @@ async def enqueue_analysis_result(
                 """
                 SELECT job_id, status, retry_count, manual_retry_count
                 FROM AnalysisJobs
-                WHERE user_id = %s AND idempotency_key = %s
+                WHERE user_id = ? AND idempotency_key = ?
                 LIMIT 1
-                FOR UPDATE
                 """,
                 (user_id, idempotency_key),
             )
@@ -493,14 +544,14 @@ async def enqueue_analysis_result(
                     UPDATE AnalysisJobs
                     SET status = 'queued', retry_count = 0,
                         manual_retry_count = manual_retry_count + 1,
-                        next_attempt_at = NOW(), error_message = NULL,
-                        completed_at = NULL, updated_at = NOW(),
+                        next_attempt_at = CURRENT_TIMESTAMP, error_message = NULL,
+                        completed_at = NULL, updated_at = CURRENT_TIMESTAMP,
                         lease_owner = NULL, lease_expires_at = NULL,
-                        heartbeat_at = NULL, trigger_reason = %s,
-                        producer_version = %s, manifest_id = %s,
-                        evidence_hash = %s, current_stage = 'evidence_load',
+                        heartbeat_at = NULL, trigger_reason = ?,
+                        producer_version = ?, manifest_id = ?,
+                        evidence_hash = ?, current_stage = 'evidence_load',
                         progress = 0
-                    WHERE job_id = %s
+                    WHERE job_id = ?
                     """,
                     (
                         reason, ANALYSIS_STAGE_VERSION, manifest_id,
@@ -508,7 +559,7 @@ async def enqueue_analysis_result(
                     ),
                 )
                 cursor.execute(
-                    "UPDATE Interviews SET analysis_job_id = %s WHERE interview_id = %s",
+                    "UPDATE Interviews SET analysis_job_id = ? WHERE interview_id = ?",
                     (existing[0], interview_id),
                 )
                 conn.commit()
@@ -522,13 +573,13 @@ async def enqueue_analysis_result(
                 cursor.execute(
                     """
                     UPDATE AnalysisJobs
-                    SET status = 'queued', next_attempt_at = NOW(), error_message = NULL,
-                        completed_at = NULL, updated_at = NOW(), lease_owner = NULL,
+                    SET status = 'queued', next_attempt_at = CURRENT_TIMESTAMP, error_message = NULL,
+                        completed_at = NULL, updated_at = CURRENT_TIMESTAMP, lease_owner = NULL,
                         lease_expires_at = NULL, heartbeat_at = NULL,
-                        trigger_reason = %s, producer_version = %s,
-                        manifest_id = %s, evidence_hash = %s,
+                        trigger_reason = ?, producer_version = ?,
+                        manifest_id = ?, evidence_hash = ?,
                         current_stage = 'evidence_load', progress = 0
-                    WHERE job_id = %s
+                    WHERE job_id = ?
                     """,
                     (
                         reason, ANALYSIS_STAGE_VERSION, manifest_id, evidence_hash,
@@ -536,7 +587,7 @@ async def enqueue_analysis_result(
                     ),
                 )
                 cursor.execute(
-                    "UPDATE Interviews SET analysis_job_id = %s WHERE interview_id = %s",
+                    "UPDATE Interviews SET analysis_job_id = ? WHERE interview_id = ?",
                     (existing[0], interview_id),
                 )
                 conn.commit()
@@ -550,7 +601,7 @@ async def enqueue_analysis_result(
                     progress, retry_count, idempotency_key, evidence_hash, manifest_id,
                     producer_version, next_attempt_at, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, 'queued', %s, 0, 0, %s, %s, %s, %s, NOW(), NOW(), NOW())
+                VALUES (?, ?, ?, 'queued', ?, 0, 0, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
                 (
                     job_id, interview_id, user_id, reason, idempotency_key,
@@ -558,7 +609,7 @@ async def enqueue_analysis_result(
                 ),
             )
             cursor.execute(
-                "UPDATE Interviews SET analysis_job_id = %s WHERE interview_id = %s",
+                "UPDATE Interviews SET analysis_job_id = ? WHERE interview_id = ?",
                 (job_id, interview_id),
             )
             conn.commit()
@@ -607,22 +658,27 @@ async def operator_retry_analysis(interview_id: str, actor_user_id: str) -> Dict
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"analysis:{interview_id}",))
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 """
+                WITH latest_job AS (
+                    SELECT job_id, interview_id, status, manual_retry_count, evidence_hash, manifest_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY interview_id
+                               ORDER BY created_at DESC, job_id DESC
+                           ) AS job_rank
+                    FROM AnalysisJobs
+                    WHERE interview_id = ?
+                )
                 SELECT (i.attempt_status = 'completed' OR i.status IN ('completed', 'report_ready', 'partial', 'failed')) AS completed_attempt,
                        i.report_json, i.report_json_encrypted,
                        job.job_id, job.status, job.manual_retry_count, job.evidence_hash, job.manifest_id
                 FROM Interviews i
-                LEFT JOIN LATERAL (
-                    SELECT job_id, status, manual_retry_count, evidence_hash, manifest_id
-                    FROM AnalysisJobs WHERE interview_id = i.interview_id
-                    ORDER BY created_at DESC LIMIT 1 FOR UPDATE
-                ) job ON TRUE
-                WHERE i.interview_id = %s
-                FOR UPDATE OF i
+                LEFT JOIN latest_job job
+                  ON job.interview_id = i.interview_id AND job.job_rank = 1
+                WHERE i.interview_id = ?
                 """,
-                (interview_id,),
+                (interview_id, interview_id),
             )
             row = cursor.fetchone()
             if not row:
@@ -643,11 +699,11 @@ async def operator_retry_analysis(interview_id: str, actor_user_id: str) -> Dict
                 UPDATE AnalysisJobs
                 SET status = 'queued', retry_count = 0,
                     manual_retry_count = manual_retry_count + 1,
-                    next_attempt_at = NOW(), error_message = NULL,
+                    next_attempt_at = CURRENT_TIMESTAMP, error_message = NULL,
                     current_stage = 'evidence_load', progress = 0,
-                    completed_at = NULL, updated_at = NOW(),
+                    completed_at = NULL, updated_at = CURRENT_TIMESTAMP,
                     lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL
-                WHERE job_id = %s
+                WHERE job_id = ?
                 RETURNING job_id, manual_retry_count
                 """,
                 (row[3],),
@@ -656,8 +712,8 @@ async def operator_retry_analysis(interview_id: str, actor_user_id: str) -> Dict
             cursor.execute(
                 """
                 UPDATE Interviews
-                SET status = 'analysis_pending', analysis_status = 'queued', analysis_job_id = %s
-                WHERE interview_id = %s
+                SET status = 'analysis_pending', analysis_status = 'queued', analysis_job_id = ?
+                WHERE interview_id = ?
                 """,
                 (row[3], interview_id),
             )
@@ -684,11 +740,11 @@ async def _record_worker_heartbeat(worker_id: str, worker_type: str = "analysis"
         """
         INSERT INTO WorkerHeartbeats (
             worker_id, worker_type, version, metadata, started_at, heartbeat_at
-        ) VALUES (%s, %s, %s, '{}'::jsonb, NOW(), NOW())
+        ) VALUES (?, ?, ?, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         ON CONFLICT (worker_id) DO UPDATE
         SET worker_type = EXCLUDED.worker_type,
             version = EXCLUDED.version,
-            heartbeat_at = NOW()
+            heartbeat_at = CURRENT_TIMESTAMP
         """,
         (worker_id, worker_type, ANALYSIS_STAGE_VERSION),
     )
@@ -697,31 +753,28 @@ async def _record_worker_heartbeat(worker_id: str, worker_type: str = "analysis"
 async def claim_analysis_job(worker_id: str) -> Optional[tuple[str, str, str]]:
     return await async_execute(
         """
-        WITH candidate AS (
+        UPDATE AnalysisJobs
+        SET status = 'running',
+            lease_owner = ?,
+            lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+            heartbeat_at = CURRENT_TIMESTAMP,
+            started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = (
             SELECT job_id
             FROM AnalysisJobs
-            WHERE retry_count < %s
-              AND COALESCE(next_attempt_at, NOW()) <= NOW()
+            WHERE retry_count < ?
+              AND COALESCE(next_attempt_at, CURRENT_TIMESTAMP) <= CURRENT_TIMESTAMP
               AND (
                   status = 'queued'
-                  OR (status = 'running' AND lease_expires_at < NOW())
+                  OR (status = 'running' AND lease_expires_at < CURRENT_TIMESTAMP)
               )
             ORDER BY created_at ASC
-            FOR UPDATE SKIP LOCKED
             LIMIT 1
         )
-        UPDATE AnalysisJobs AS job
-        SET status = 'running',
-            lease_owner = %s,
-            lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-            heartbeat_at = NOW(),
-            started_at = COALESCE(started_at, NOW()),
-            updated_at = NOW()
-        FROM candidate
-        WHERE job.job_id = candidate.job_id
-        RETURNING job.job_id, job.interview_id, job.user_id
+        RETURNING job_id, interview_id, user_id
         """,
-        (ANALYSIS_MAX_RETRIES, worker_id, ANALYSIS_LEASE_SECONDS),
+        (worker_id, ANALYSIS_LEASE_SECONDS, ANALYSIS_MAX_RETRIES),
         fetchone=True,
     )
 
@@ -730,14 +783,14 @@ async def _claim_specific_analysis_job(job_id: str, worker_id: str) -> Optional[
     return await async_execute(
         """
         UPDATE AnalysisJobs
-        SET status = 'running', lease_owner = %s,
-            lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-            heartbeat_at = NOW(), started_at = COALESCE(started_at, NOW()),
-            updated_at = NOW()
-        WHERE job_id = %s
-          AND retry_count < %s
-          AND COALESCE(next_attempt_at, NOW()) <= NOW()
-          AND (status = 'queued' OR (status = 'running' AND lease_expires_at < NOW()))
+        SET status = 'running', lease_owner = ?,
+            lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+            heartbeat_at = CURRENT_TIMESTAMP, started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = ?
+          AND retry_count < ?
+          AND COALESCE(next_attempt_at, CURRENT_TIMESTAMP) <= CURRENT_TIMESTAMP
+          AND (status = 'queued' OR (status = 'running' AND lease_expires_at < CURRENT_TIMESTAMP))
         RETURNING job_id, interview_id, user_id
         """,
         (worker_id, ANALYSIS_LEASE_SECONDS, job_id, ANALYSIS_MAX_RETRIES),
@@ -749,9 +802,9 @@ async def _renew_analysis_lease(job_id: str, worker_id: str) -> None:
     row = await async_execute(
         """
         UPDATE AnalysisJobs
-        SET lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-            heartbeat_at = NOW(), updated_at = NOW()
-        WHERE job_id = %s AND status = 'running' AND lease_owner = %s
+        SET lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+            heartbeat_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = ? AND status = 'running' AND lease_owner = ?
         RETURNING job_id
         """,
         (ANALYSIS_LEASE_SECONDS, job_id, worker_id),
@@ -759,6 +812,246 @@ async def _renew_analysis_lease(job_id: str, worker_id: str) -> None:
     )
     if not row:
         raise RuntimeError("analysis_job_lease_lost")
+
+
+async def claim_report_side_effect(
+    worker_id: str,
+) -> Optional[tuple[str, str, str, str, str, Any, Any, int, int]]:
+    return await async_execute(
+        """
+        UPDATE ReportSideEffectOutbox
+        SET status = 'processing',
+            attempt_count = attempt_count + 1,
+            lease_owner = ?,
+            lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE event_id = (
+            SELECT event_id
+            FROM ReportSideEffectOutbox
+            WHERE attempt_count < max_attempts
+              AND available_at <= CURRENT_TIMESTAMP
+              AND (
+                  status = 'queued'
+                  OR (status = 'processing' AND lease_expires_at < CURRENT_TIMESTAMP)
+              )
+            ORDER BY created_at ASC
+            LIMIT 1
+        )
+        RETURNING event_id, event_type, analysis_id,
+                  interview_id, user_id, payload_encrypted, payload,
+                  attempt_count, max_attempts
+        """,
+        (worker_id, REPORT_SIDE_EFFECT_LEASE_SECONDS),
+        fetchone=True,
+    )
+
+
+async def _renew_report_side_effect_lease(event_id: str, worker_id: str) -> None:
+    renewed = await async_execute(
+        """
+        UPDATE ReportSideEffectOutbox
+        SET lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE event_id = ? AND status = 'processing' AND lease_owner = ?
+        RETURNING event_id
+        """,
+        (REPORT_SIDE_EFFECT_LEASE_SECONDS, event_id, worker_id),
+        fetchone=True,
+    )
+    if not renewed:
+        raise RuntimeError("report_side_effect_lease_lost")
+
+
+async def _complete_report_side_effect(
+    event_id: str,
+    worker_id: str,
+    *,
+    delivery_note: Optional[str] = None,
+) -> None:
+    completed = await async_execute(
+        """
+        UPDATE ReportSideEffectOutbox
+        SET status = 'completed', completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+            updated_at = CURRENT_TIMESTAMP, lease_owner = NULL, lease_expires_at = NULL,
+            last_error = ?
+        WHERE event_id = ? AND status = 'processing' AND lease_owner = ?
+        RETURNING event_id
+        """,
+        (delivery_note, event_id, worker_id),
+        fetchone=True,
+    )
+    if not completed:
+        raise RuntimeError("report_side_effect_lease_lost")
+
+
+async def _fail_report_side_effect(event_id: str, worker_id: str, exc: Exception) -> str:
+    safe_error = f"{type(exc).__name__}:report_side_effect_failed"[:240]
+    row = await async_execute(
+        """
+        UPDATE ReportSideEffectOutbox
+        SET status = CASE
+                WHEN attempt_count >= max_attempts THEN 'dead_letter'
+                ELSE 'queued'
+            END,
+            available_at = CASE
+                WHEN attempt_count >= max_attempts THEN available_at
+                ELSE datetime(
+                    CURRENT_TIMESTAMP,
+                    '+' || CAST(MIN(1800, (1 << MAX(attempt_count - 1, 0)) * 5) AS TEXT) || ' seconds'
+                )
+            END,
+            dead_letter_at = CASE
+                WHEN attempt_count >= max_attempts THEN COALESCE(dead_letter_at, CURRENT_TIMESTAMP)
+                ELSE NULL
+            END,
+            last_error = ?, updated_at = CURRENT_TIMESTAMP,
+            lease_owner = NULL, lease_expires_at = NULL
+        WHERE event_id = ? AND status = 'processing' AND lease_owner = ?
+        RETURNING status
+        """,
+        (safe_error, event_id, worker_id),
+        fetchone=True,
+    )
+    return str((row or ["lease_lost"])[0])
+
+
+def _acquire_report_side_effect_fence(interview_id: str) -> tuple[Any, Any]:
+    from database import get_db_connection
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # SQLite serializes the publication transaction itself; worker claims and
+    # unique publication keys provide the cross-thread idempotency fence.
+    cursor.execute("BEGIN IMMEDIATE")
+    return conn, cursor
+
+
+def _release_report_side_effect_fence(lock: tuple[Any, Any]) -> None:
+    from database import return_db_connection
+
+    conn, cursor = lock
+    try:
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        return_db_connection(conn)
+
+
+async def process_report_side_effect(
+    event: tuple[str, str, str, str, str, Any, Any, int, int],
+    worker_id: str,
+) -> None:
+    (
+        event_id, event_type, analysis_id, interview_id, user_id,
+        encrypted_payload, legacy_payload, _, _,
+    ) = event
+    lock: Optional[tuple[Any, Any]] = None
+    try:
+        if str(event_type or "") != "improve_sync":
+            raise RuntimeError("unsupported_report_side_effect_type")
+        lock = await asyncio.to_thread(
+            _acquire_report_side_effect_fence,
+            interview_id,
+        )
+        current = await async_execute(
+            """
+            SELECT is_current, status, producer_version,
+                   evidence_status, overall_score
+            FROM SessionPerformanceAnalyses
+            WHERE analysis_id = ? AND interview_id = ? AND user_id = ?
+            """,
+            (analysis_id, interview_id, user_id),
+            fetchone=True,
+        )
+        if not current:
+            raise RuntimeError("report_side_effect_analysis_missing")
+        if (
+            not bool(current[0])
+            or str(current[1] or "") != "ready"
+            or str(current[2] or "") != ANALYSIS_STAGE_VERSION
+        ):
+            await _complete_report_side_effect(
+                event_id,
+                worker_id,
+                delivery_note="superseded_before_delivery",
+            )
+            return
+
+        # Improve is downstream of a gradable canonical report.  A ready
+        # publication can still legitimately carry insufficient, draft-only,
+        # or run-only evidence; those states must remain visible in Report and
+        # Performance without generating coaching exercises.
+        evidence_status = str(current[3] or "") if len(current) > 3 else "sufficient"
+        overall_score = current[4] if len(current) > 4 else True
+        if evidence_status != "sufficient" or overall_score is None:
+            await _complete_report_side_effect(
+                event_id,
+                worker_id,
+                delivery_note="improve_not_available_for_insufficient_evidence",
+            )
+            return
+
+        payload = decrypt_json_field(encrypted_payload, legacy_payload, {})
+        if not isinstance(payload, dict) or str(payload.get("analysis_id") or "") != analysis_id:
+            raise RuntimeError("report_side_effect_payload_invalid")
+        observations = [
+            item for item in (payload.get("observations") or [])
+            if isinstance(item, dict)
+        ]
+        weak_topics = [
+            item for item in (payload.get("weak_topics") or [])
+            if isinstance(item, dict)
+        ]
+        mode = "technical" if str(payload.get("mode") or "") == "technical" else "mock"
+
+        await retire_superseded_analysis_evidence(interview_id, analysis_id)
+        await _renew_report_side_effect_lease(event_id, worker_id)
+        await persist_weakness_states(user_id, analysis_id, interview_id, observations)
+        await _renew_report_side_effect_lease(event_id, worker_id)
+        await validate_mission_with_analysis(
+            user_id, interview_id, analysis_id, mode, observations
+        )
+        await _renew_report_side_effect_lease(event_id, worker_id)
+        await _queue_learning_from_analysis(
+            interview_id,
+            user_id,
+            suppress_errors=False,
+        )
+        await _renew_report_side_effect_lease(event_id, worker_id)
+
+        report_focus_mission = None
+        if mode == "technical":
+            report_focus_mission = await ensure_mission_from_technical_report(
+                user_id,
+                interview_id,
+                analysis_id,
+                weak_topics,
+            )
+        if not report_focus_mission:
+            await ensure_mission_from_weakness(
+                user_id,
+                interview_id,
+                analysis_id,
+                mode,
+            )
+        await _complete_report_side_effect(event_id, worker_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        outcome = await _fail_report_side_effect(event_id, worker_id, exc)
+        logger.warning(
+            "Report side-effect delivery %s for %s (state=%s)",
+            type(exc).__name__, stable_hash(interview_id, "interview"), outcome,
+        )
+    finally:
+        if lock is not None:
+            await asyncio.to_thread(
+                _release_report_side_effect_fence,
+                lock,
+            )
 
 
 async def analysis_worker_loop(
@@ -775,11 +1068,17 @@ async def analysis_worker_loop(
                 await _purge_expired_media_assets()
                 next_retention_sweep = now + 60.0
             await _record_worker_heartbeat(worker_id)
+            did_work = False
+            side_effect = await claim_report_side_effect(worker_id)
+            if side_effect:
+                did_work = True
+                await process_report_side_effect(side_effect, worker_id)
             claimed = await claim_analysis_job(worker_id)
-            if not claimed:
+            if claimed:
+                did_work = True
+                await run_analysis_job(claimed[0], worker_id=worker_id, claimed_job=claimed)
+            if not did_work:
                 await asyncio.sleep(idle_seconds)
-                continue
-            await run_analysis_job(claimed[0], worker_id=worker_id, claimed_job=claimed)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -796,10 +1095,10 @@ async def _purge_expired_media_assets() -> int:
         DELETE FROM InterviewMediaAssets
         WHERE storage_provider = 'local_manifest'
           AND (
-              (delete_after IS NOT NULL AND delete_after <= NOW())
-              OR (status = 'pending' AND created_at < NOW() - INTERVAL '1 hour')
-              OR (%s AND media_kind = 'video')
-              OR (%s AND media_kind = 'audio')
+              (delete_after IS NOT NULL AND delete_after <= CURRENT_TIMESTAMP)
+              OR (status = 'pending' AND created_at < datetime(CURRENT_TIMESTAMP, '-1 hour'))
+              OR (? AND media_kind = 'video')
+              OR (? AND media_kind = 'audio')
           )
         RETURNING asset_id
         """,
@@ -814,15 +1113,20 @@ async def analysis_job_reconciler(interval_seconds: int = 20) -> None:
     await analysis_worker_loop(f"legacy-analysis-{uuid.uuid4().hex[:10]}", idle_seconds=float(interval_seconds))
 
 
-async def _queue_learning_from_analysis(interview_id: str, user_id: str) -> None:
+async def _queue_learning_from_analysis(
+    interview_id: str,
+    user_id: str,
+    *,
+    suppress_errors: bool = True,
+) -> None:
     try:
         profile_row = await async_execute(
             """
             SELECT u.profile_json, u.resume_json, s.resume_payload_encrypted
             FROM UserInfo u
             LEFT JOIN AttemptContextSnapshots s
-              ON s.interview_id = %s AND s.user_id = u.user_id
-            WHERE u.user_id = %s
+              ON s.interview_id = ? AND s.user_id = u.user_id
+            WHERE u.user_id = ?
             """,
             (interview_id, user_id),
             fetchone=True,
@@ -850,194 +1154,9 @@ async def _queue_learning_from_analysis(interview_id: str, user_id: str) -> None
         ]
         await ingest_interview_evidence(user_id, interview_id, learning_turns, profile_context)
     except Exception:
+        if not suppress_errors:
+            raise
         logger.warning("Learning exercise generation skipped for %s", stable_hash(interview_id, "interview"))
-
-
-
-async def _run_analysis_job_legacy(job_id: str) -> None:
-    job = await async_execute(
-        """
-        UPDATE AnalysisJobs
-        SET status = 'running',
-            started_at = COALESCE(started_at, NOW()),
-            updated_at = NOW()
-        WHERE job_id = %s
-          AND (
-            status = 'queued'
-            OR (status = 'running' AND updated_at < NOW() - INTERVAL '5 minutes')
-          )
-        RETURNING job_id, interview_id, user_id
-        """,
-        (job_id,),
-        fetchone=True,
-    )
-    if not job:
-        return
-
-    _, interview_id, user_id = job
-    logger.info("Starting async analysis job %s for %s", stable_hash(job_id, "analysis"), stable_hash(interview_id, "interview"))
-    try:
-        await async_execute(
-            """
-            UPDATE Interviews
-            SET status = 'analysis_running'
-            WHERE interview_id = %s
-              AND status <> 'cancelled'
-              AND NOT (status IN ('completed', 'report_ready', 'partial', 'failed') AND report_json IS NOT NULL)
-            """,
-            (interview_id,),
-        )
-
-        stage_outputs: Dict[str, Dict[str, Any]] = {}
-        for index, stage in enumerate(ANALYSIS_EXECUTION_STAGES, start=1):
-            started = datetime.now(timezone.utc)
-
-            if stage == "report_generation":
-                await async_execute(
-                    """
-                    UPDATE AnalysisJobs
-                    SET progress = 90, current_stage = %s, updated_at = NOW()
-                    WHERE job_id = %s
-                    """,
-                    (stage, job_id),
-                )
-
-            try:
-                output = await _run_stage(stage, interview_id, user_id, stage_outputs)
-                stage_outputs[stage] = output
-                status = "completed"
-                error = None
-            except Exception as exc:
-                logger.error("Analysis stage %s failed for %s", stage, stable_hash(interview_id, "interview"))
-                output = {"error": "stage_failed", "stage": stage}
-                stage_outputs[stage] = output
-                status = "failed"
-                error = str(exc)[:500]
-
-            await async_execute(
-                """
-                INSERT INTO AnalysisStageOutputs (
-                    output_id, job_id, interview_id, stage_name, status, output_json,
-                    error_message, started_at, completed_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                """,
-                (
-                    str(uuid.uuid4()),
-                    job_id,
-                    interview_id,
-                    stage,
-                    status,
-                    _json_dumps(output),
-                    error,
-                    started,
-                ),
-            )
-            progress = 100 if stage == "complete" else math.floor(index / len(ANALYSIS_STAGES) * 100)
-            await async_execute(
-                """
-                UPDATE AnalysisJobs
-                SET progress = %s, current_stage = %s, updated_at = NOW()
-                WHERE job_id = %s
-                """,
-                (progress, stage, job_id),
-            )
-
-        legacy_stage_outputs = _legacy_stage_outputs(stage_outputs)
-        report = legacy_stage_outputs.get("report_generation") or {}
-        partial = _report_has_noncritical_degradation(report, stage_outputs)
-        final_status = "partial" if partial else "completed"
-        existing_artifact = await async_execute(
-            """
-            SELECT artifact_id
-            FROM ReportArtifacts
-            WHERE interview_id = %s AND user_id = %s AND audience = 'candidate'
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (interview_id, user_id),
-            fetchone=True,
-        )
-        if existing_artifact:
-            await async_execute(
-                """
-                UPDATE ReportArtifacts
-                SET report_type = %s,
-                    payload = %s
-                WHERE artifact_id = %s
-                """,
-                (
-                    report.get("report_type") or "interview",
-                    _json_dumps(report),
-                    existing_artifact[0],
-                ),
-            )
-        else:
-            await async_execute(
-                """
-                INSERT INTO ReportArtifacts (artifact_id, interview_id, user_id, report_type, audience, payload)
-                VALUES (%s, %s, %s, %s, 'candidate', %s)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    interview_id,
-                    user_id,
-                    report.get("report_type") or "interview",
-                    _json_dumps(report),
-                ),
-            )
-        await async_execute(
-            """
-            UPDATE Interviews
-            SET status = %s,
-                overall_score = %s,
-                feedback_summary = %s,
-                report_json = %s,
-                completed_at = COALESCE(completed_at, NOW())
-            WHERE interview_id = %s
-              AND status <> 'cancelled'
-              AND NOT (status IN ('completed', 'report_ready', 'partial', 'failed') AND report_json IS NOT NULL)
-            """,
-            (
-                final_status,
-                report.get("overall_score", 0),
-                report.get("summary", "Analysis completed."),
-                _json_dumps(report),
-                interview_id,
-            ),
-        )
-        await async_execute(
-            """
-            UPDATE AnalysisJobs
-            SET status = %s, progress = 100, current_stage = 'complete',
-                completed_at = NOW(), updated_at = NOW()
-            WHERE job_id = %s
-            """,
-            (final_status, job_id),
-        )
-        await _queue_learning_from_analysis(interview_id, user_id)
-        await _schedule_media_cleanup(interview_id)
-    except Exception as exc:
-        logger.error("Async analysis job failed for %s", stable_hash(interview_id, "interview"))
-        await async_execute(
-            """
-            UPDATE AnalysisJobs
-            SET status = 'failed', error_message = %s, updated_at = NOW(), completed_at = NOW()
-            WHERE job_id = %s
-            """,
-            (str(exc)[:500], job_id),
-        )
-        await async_execute(
-            """
-            UPDATE Interviews
-            SET status = 'failed'
-            WHERE interview_id = %s
-              AND status <> 'cancelled'
-              AND report_json IS NULL
-            """,
-            (interview_id,),
-        )
-
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode("utf-8")).hexdigest()
@@ -1088,16 +1207,24 @@ def _technical_source_excerpt(source_code: str, legacy_excerpt: Any = None, limi
     return source_code[:limit].rsplit("\n", 1)[0]
 
 
+def _candidate_authored_technical_draft(source_code: Any, starter_code: Any, metadata: Any) -> bool:
+    if isinstance(metadata, dict) and metadata.get("candidate_edited") is False:
+        return False
+    normalized_source = str(source_code or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized_starter = str(starter_code or "").replace("\r\n", "\n").replace("\r", "\n")
+    return bool(normalized_source) and normalized_source != normalized_starter
+
+
 def _safe_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
     allowed = {
         "version", "interview_id", "analysis_id", "report_type", "profile_type",
         "overall_score", "score_breakdown", "counts", "dimension_scores",
         "behavioral_metrics", "technical_process", "evidence_summary", "evidence_status",
         "report_state", "strengths", "summary", "duration_seconds", "time_used_seconds",
-        "time_allowed_seconds", "round_analysis", "timeline", "integrity_summary",
-        "candidate_visible_integrity", "ai_enhanced", "ai_provider_policy",
+        "time_allowed_seconds", "round_analysis", "timeline", "self_review_summary",
+        "candidate_visible_self_review", "ai_enhanced", "ai_provider_policy",
         "ai_fallback_reason", "evidence_hash", "evidence_manifest_id",
-        "generation_provenance", "score_provenance",
+        "generation_provenance", "score_provenance", "findings",
     }
     safe = {key: value for key, value in report.items() if key in allowed}
     technical = report.get("technical")
@@ -1105,13 +1232,15 @@ def _safe_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
         safe["technical"] = {
             key: value
             for key, value in technical.items()
-            if key not in {"problems", "test_matrix"}
+            if key not in {"problems", "test_matrix", "hidden_tests", "reference_solution"}
         }
         safe["technical"]["problems"] = [
             {
                 key: value
                 for key, value in item.items()
-                if key not in {"source_code", "prompt"}
+                if key not in {
+                    "source_code", "prompt", "hidden_tests", "reference_solution", "solution",
+                }
             }
             for item in technical.get("problems") or []
             if isinstance(item, dict)
@@ -1121,9 +1250,26 @@ def _safe_report_payload(report: Dict[str, Any]) -> Dict[str, Any]:
             {
                 item_key: item_value
                 for item_key, item_value in item.items()
-                if item_key not in {"response", "transcript", "what_candidate_answered"}
+                if item_key not in {
+                    "response", "transcript", "what_candidate_answered",
+                    "hidden_tests", "reference_solution", "solution",
+                }
             }
             for item in report.get(key) or []
+            if isinstance(item, dict)
+        ]
+    findings = report.get("findings")
+    if isinstance(findings, list):
+        safe["findings"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key in {
+                    "finding_key", "id", "title", "label", "what_happened",
+                    "detail", "summary", "why_matters", "evidence_ids",
+                }
+            }
+            for item in findings
             if isinstance(item, dict)
         ]
     return safe
@@ -1163,8 +1309,8 @@ def _stage_provenance(stage: str, output: Dict[str, Any], input_hash: str) -> Di
         "pipeline_version": ANALYSIS_STAGE_VERSION,
         "stage": stage,
         "input_hash": input_hash,
-        "engine": "openai_narrative_enhancement" if ai_enhanced else "deterministic_inter_pipeline",
-        "model": settings.OPENAI_REPORT_MODEL if ai_enhanced else None,
+        "engine": "local_provider_narrative_enhancement" if ai_enhanced else "deterministic_inter_pipeline",
+        "model": get_local_preferences().get("model") if ai_enhanced else None,
         "prompt_version": "report-narrative-v1" if ai_enhanced else None,
         "evaluator_versions": sorted({
             str(item.get("evaluator_version"))
@@ -1240,7 +1386,7 @@ async def _validate_report_for_publication(
     ownership = await async_execute(
         """
         SELECT attempt_status, completion_kind, evidence_hash
-        FROM Interviews WHERE interview_id = %s AND user_id = %s
+        FROM Interviews WHERE interview_id = ? AND user_id = ?
         """,
         (interview_id, user_id), fetchone=True,
     )
@@ -1249,7 +1395,7 @@ async def _validate_report_for_publication(
     manifest = await async_execute(
         """
         SELECT manifest_json FROM EvidenceManifests
-        WHERE manifest_id = %s AND interview_id = %s AND user_id = %s AND evidence_hash = %s
+        WHERE manifest_id = ? AND interview_id = ? AND user_id = ? AND evidence_hash = ?
         """,
         (manifest_id, interview_id, user_id, evidence_hash), fetchone=True,
     )
@@ -1340,7 +1486,7 @@ def _legacy_stage_outputs(outputs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[
         "video_features": evidence.get("video") or {},
         "nlp_content": outputs.get("transcript_analysis") or {},
         "technical_code": outputs.get("technical_analysis") or {},
-        "cheating_risk": outputs.get("integrity_summary") or {},
+        "self_review_signals": outputs.get("self_review_summary") or {},
         "report_generation": (
             outputs.get("complete")
             or outputs.get("report_validation")
@@ -1387,6 +1533,8 @@ def _turn_observations(turns: List[Dict[str, Any]], mode: str = "mock") -> List[
                 "response_id": turn.get("response_id"),
                 "round_id": round_id,
                 "question_spec_id": turn.get("question_spec_id"),
+                "question": turn.get("question"),
+                "topic": turn.get("topic"),
                 "score": turn.get("overall_score"),
                 "confidence": turn.get("confidence_value") or turn.get("confidence"),
                 "flags": turn.get("answer_quality_flags") or [],
@@ -1396,18 +1544,18 @@ def _turn_observations(turns: List[Dict[str, Any]], mode: str = "mock") -> List[
     return observations
 
 
-async def _persist_canonical_performance(
+async def _stage_canonical_performance(
     *,
     interview_id: str,
     user_id: str,
     stage_outputs: Dict[str, Dict[str, Any]],
     report: Dict[str, Any],
     job_evidence_hash: str,
-) -> str:
+) -> Dict[str, Any]:
     meta = await async_execute(
         """
         SELECT interview_mode, interview_type, duration_seconds
-        FROM Interviews WHERE interview_id = %s AND user_id = %s
+        FROM Interviews WHERE interview_id = ? AND user_id = ?
         """,
         (interview_id, user_id), fetchone=True,
     )
@@ -1502,7 +1650,7 @@ async def _persist_canonical_performance(
             "video": stage_outputs.get("video_features") or {},
         },
         "technical": technical,
-        "integrity": stage_outputs.get("cheating_risk") or {},
+        "integrity": stage_outputs.get("self_review_signals") or {},
         "dimension_scores": report.get("dimension_scores") or {},
         "overall_score": report.get("overall_score"),
         "evidence_status": evidence_status,
@@ -1619,26 +1767,31 @@ async def _persist_canonical_performance(
             "snapshot_ids": safe_evidence_index["snapshot_ids"],
         },
     })
-    safe_canonical_json = _json_dumps(safe_canonical)
-    safe_evidence_index_json = _json_dumps(safe_evidence_index)
+    # Keep the legacy JSON columns as non-sensitive markers. The complete
+    # candidate report and evidence graph live in the encrypted companion
+    # columns; retaining a second plaintext copy defeats local-at-rest
+    # protection and makes raw SQLite backups disclose interview content.
+    encrypted_column_marker = "[encrypted]"
+    safe_canonical_json = encrypted_column_marker
+    safe_evidence_index_json = encrypted_column_marker
     canonical_encrypted = _encrypted_bytes(canonical)
     evidence_index_encrypted = _encrypted_bytes(evidence_index)
 
-    def _persist_revision() -> tuple[str, bool]:
+    def _stage_revision() -> tuple[str, bool, bool]:
         from database import get_db_connection, return_db_connection
 
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
                 """
                 SELECT analysis_id, evidence_hash, revision_no,
                        analysis_json_encrypted, evidence_index_encrypted,
-                       producer_version
+                       producer_version, status
                 FROM SessionPerformanceAnalyses
-                WHERE interview_id = %s AND mode = %s
-                  AND schema_version = %s AND is_current = TRUE
-                FOR UPDATE
+                WHERE interview_id = ? AND mode = ?
+                  AND schema_version = ? AND is_current = TRUE
                 """,
                 (interview_id, mode, SESSION_PERFORMANCE_VERSION),
             )
@@ -1649,21 +1802,65 @@ async def _persist_canonical_performance(
                 and existing[3] is not None
                 and existing[4] is not None
                 and str(existing[5] or "") == ANALYSIS_STAGE_VERSION
+                and str(existing[6] or "") == "ready"
             ):
                 conn.commit()
-                return str(existing[0]), False
+                return str(existing[0]), False, True
 
             previous_analysis_id = str(existing[0]) if existing else None
-            next_revision = int(existing[2] or 0) + 1 if existing else 1
-            if existing:
+            cursor.execute(
+                """
+                SELECT analysis_id
+                FROM SessionPerformanceAnalyses
+                WHERE interview_id = ? AND mode = ?
+                  AND schema_version = ? AND evidence_hash = ?
+                  AND producer_version = ? AND status = 'staged'
+                ORDER BY revision_no DESC
+                LIMIT 1
+                """,
+                (
+                    interview_id, mode, SESSION_PERFORMANCE_VERSION,
+                    evidence_hash, ANALYSIS_STAGE_VERSION,
+                ),
+            )
+            staged = cursor.fetchone()
+            if staged:
                 cursor.execute(
                     """
                     UPDATE SessionPerformanceAnalyses
-                    SET is_current = FALSE, updated_at = NOW()
-                    WHERE analysis_id = %s
+                    SET model = ?, analysis_json = ?,
+                        evidence_index_json = ?,
+                        analysis_json_encrypted = ?,
+                        evidence_index_encrypted = ?,
+                        overall_score = ?, evaluator_version = ?,
+                        taxonomy_version = ?, rubric_version = ?,
+                        duration_seconds = ?, evidence_status = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE analysis_id = ? AND status = 'staged'
                     """,
-                    (existing[0],),
+                    (
+                        ",".join(evaluator_versions) or None,
+                        safe_canonical_json, safe_evidence_index_json,
+                        canonical_encrypted, evidence_index_encrypted,
+                        report.get("overall_score"),
+                        ",".join(evaluator_versions) or "none",
+                        TAXONOMY_VERSION, RUBRIC_VERSION,
+                        (meta or [None, None, None])[2], evidence_status,
+                        staged[0],
+                    ),
                 )
+                conn.commit()
+                return str(staged[0]), False, False
+
+            cursor.execute(
+                """
+                SELECT COALESCE(MAX(revision_no), 0)
+                FROM SessionPerformanceAnalyses
+                WHERE interview_id = ? AND mode = ? AND schema_version = ?
+                """,
+                (interview_id, mode, SESSION_PERFORMANCE_VERSION),
+            )
+            next_revision = int((cursor.fetchone() or [0])[0] or 0) + 1
 
             analysis_id = str(uuid.uuid4())
             cursor.execute(
@@ -1676,16 +1873,16 @@ async def _persist_canonical_performance(
                     duration_seconds, evidence_status, revision_no, is_current,
                     supersedes_analysis_id, producer_version, created_at, updated_at
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, 'ready', %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, TRUE, %s, %s, NOW(), NOW()
+                    ?, ?, ?, ?, ?, ?, 'staged', ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, FALSE, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
                 """,
                 (
                     analysis_id, user_id, interview_id, mode,
                     SESSION_PERFORMANCE_VERSION, evidence_hash,
                     ",".join(evaluator_versions) or None,
-                    safe_canonical_json, safe_evidence_index_json,
+                        safe_canonical_json, safe_evidence_index_json,
                     canonical_encrypted, evidence_index_encrypted,
                     report.get("overall_score"),
                     ",".join(evaluator_versions) or "none",
@@ -1695,7 +1892,7 @@ async def _persist_canonical_performance(
                 ),
             )
             conn.commit()
-            return analysis_id, True
+            return analysis_id, True, False
         except Exception:
             conn.rollback()
             raise
@@ -1703,14 +1900,392 @@ async def _persist_canonical_performance(
             cursor.close()
             return_db_connection(conn)
 
-    analysis_id, created = await asyncio.to_thread(_persist_revision)
-    if created:
-        await retire_superseded_analysis_evidence(interview_id, analysis_id)
-        await persist_weakness_states(user_id, analysis_id, interview_id, observations)
-        await validate_mission_with_analysis(
-            user_id, interview_id, analysis_id, mode, observations
-        )
-    return analysis_id
+    analysis_id, created, already_published = await asyncio.to_thread(_stage_revision)
+    return {
+        "analysis_id": analysis_id,
+        "evidence_hash": evidence_hash,
+        "created": created,
+        "already_published": already_published,
+        "mode": mode,
+        "observations": observations,
+        "evidence_status": evidence_status,
+    }
+
+
+def _report_publication_key(analysis_id: str) -> str:
+    return f"report:{analysis_id}:candidate"
+
+
+async def _stage_candidate_report_artifact(
+    *,
+    interview_id: str,
+    user_id: str,
+    analysis_id: str,
+    report: Dict[str, Any],
+    safe_report: Dict[str, Any],
+    report_encrypted: bytes,
+    manifest_evidence_hash: str,
+    canonical_evidence_hash: str,
+) -> Dict[str, str]:
+    publication_key = _report_publication_key(analysis_id)
+    default_artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, publication_key))
+
+    def _stage() -> Dict[str, str]:
+        from database import get_db_connection, return_db_connection
+
+        # Keep the closure's artifact identity explicit.  Assigning to the
+        # outer name in the existing-row branch would make it a local and
+        # crash first-time publication with UnboundLocalError.
+        artifact_id_for_stage = default_artifact_id
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT status, is_current, evidence_hash, producer_version
+                FROM SessionPerformanceAnalyses
+                WHERE analysis_id = ? AND interview_id = ? AND user_id = ?
+                """,
+                (analysis_id, interview_id, user_id),
+            )
+            analysis = cursor.fetchone()
+            if not analysis:
+                raise RuntimeError("staged_analysis_not_found")
+            if str(analysis[2] or "") != canonical_evidence_hash:
+                raise RuntimeError("staged_analysis_evidence_mismatch")
+            if str(analysis[3] or "") != ANALYSIS_STAGE_VERSION:
+                raise RuntimeError("staged_analysis_producer_mismatch")
+            if str(analysis[0] or "") not in {"staged", "ready"}:
+                raise RuntimeError("staged_analysis_has_invalid_status")
+
+            cursor.execute(
+                """
+                SELECT artifact_id, status
+                FROM ReportArtifacts
+                WHERE publication_key = ?
+                """,
+                (publication_key,),
+            )
+            existing = cursor.fetchone()
+            if existing and str(existing[1] or "") != "staged":
+                conn.commit()
+                return {
+                    "artifact_id": str(existing[0]),
+                    "publication_key": publication_key,
+                }
+            if existing:
+                cursor.execute(
+                    """
+                    UPDATE ReportArtifacts
+                    SET report_type = ?, payload = ?,
+                        payload_encrypted = ?, evidence_hash = ?,
+                        provenance_json = ?, analysis_id = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE artifact_id = ? AND status = 'staged'
+                    """,
+                    (
+                        report.get("report_type") or "interview",
+                        "[encrypted]", report_encrypted, manifest_evidence_hash,
+                        _json_dumps(report.get("generation_provenance") or {}),
+                        analysis_id, existing[0],
+                    ),
+                )
+                artifact_id_for_stage = str(existing[0])
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO ReportArtifacts (
+                        artifact_id, interview_id, user_id, analysis_id,
+                        publication_key, report_type, audience, payload,
+                        payload_encrypted, evidence_hash, status, provenance_json
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, 'candidate', ?,
+                        ?, ?, 'staged', ?
+                    )
+                    """,
+                    (
+                        artifact_id_for_stage, interview_id, user_id, analysis_id,
+                        publication_key, report.get("report_type") or "interview",
+                        "[encrypted]", report_encrypted, manifest_evidence_hash,
+                        _json_dumps(report.get("generation_provenance") or {}),
+                    ),
+                )
+            conn.commit()
+            return {"artifact_id": artifact_id_for_stage, "publication_key": publication_key}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            return_db_connection(conn)
+
+    return await asyncio.to_thread(_stage)
+
+
+async def _publish_staged_report(
+    *,
+    job_id: str,
+    worker_id: str,
+    interview_id: str,
+    user_id: str,
+    analysis_id: str,
+    artifact_id: str,
+    publication_key: str,
+    final_status: str,
+    report: Dict[str, Any],
+    safe_report: Dict[str, Any],
+    report_encrypted: bytes,
+    manifest_evidence_hash: str,
+    canonical_evidence_hash: str,
+    mode: str,
+    observations: List[Dict[str, Any]],
+    weak_topics: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Make canonical Performance, Report, History, and the Improve event visible together."""
+
+    def _publish() -> Dict[str, Any]:
+        from database import get_db_connection, return_db_connection
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                SELECT status, lease_owner, manifest_id, evidence_hash
+                FROM AnalysisJobs
+                WHERE job_id = ? AND interview_id = ? AND user_id = ?
+                """,
+                (job_id, interview_id, user_id),
+            )
+            job = cursor.fetchone()
+            if not job or str(job[0] or "") != "running" or str(job[1] or "") != worker_id:
+                raise RuntimeError("analysis_job_lease_lost_before_publication")
+            if not job[2] or str(job[3] or "") != manifest_evidence_hash:
+                raise RuntimeError("analysis_job_manifest_mismatch_before_publication")
+
+            cursor.execute(
+                """
+                SELECT evidence_hash, is_current, producer_version
+                FROM EvidenceManifests
+                WHERE manifest_id = ? AND interview_id = ? AND user_id = ?
+                """,
+                (job[2], interview_id, user_id),
+            )
+            manifest = cursor.fetchone()
+            if (
+                not manifest
+                or str(manifest[0] or "") != manifest_evidence_hash
+                or str(manifest[2] or "") != ANALYSIS_STAGE_VERSION
+            ):
+                raise RuntimeError("analysis_job_manifest_invalid_before_publication")
+
+            if not bool(manifest[1]):
+                cursor.execute(
+                    """
+                    UPDATE SessionPerformanceAnalyses
+                    SET status = 'superseded', is_current = FALSE, updated_at = CURRENT_TIMESTAMP
+                    WHERE analysis_id = ? AND status = 'staged'
+                    """,
+                    (analysis_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE ReportArtifacts
+                    SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
+                    WHERE artifact_id = ? AND status = 'staged'
+                    """,
+                    (artifact_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE AnalysisJobs
+                    SET status = 'completed', progress = 100,
+                        current_stage = 'complete', completed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP, lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        error_message = 'superseded_by_newer_evidence'
+                    WHERE job_id = ? AND lease_owner = ? AND status = 'running'
+                    """,
+                    (job_id, worker_id),
+                )
+                conn.commit()
+                return {
+                    "analysis_id": analysis_id,
+                    "artifact_id": artifact_id,
+                    "publication_key": publication_key,
+                    "superseded": True,
+                }
+
+            cursor.execute(
+                """
+                SELECT status
+                FROM Interviews
+                WHERE interview_id = ? AND user_id = ?
+                """,
+                (interview_id, user_id),
+            )
+            interview = cursor.fetchone()
+            if not interview:
+                raise RuntimeError("report_publication_owner_missing")
+            if str(interview[0] or "") == "cancelled":
+                raise RuntimeError("cancelled_interview_cannot_publish_report")
+
+            cursor.execute(
+                """
+                SELECT status, is_current, evidence_hash, producer_version,
+                       analysis_json_encrypted, evidence_index_encrypted, mode
+                FROM SessionPerformanceAnalyses
+                WHERE analysis_id = ? AND interview_id = ? AND user_id = ?
+                """,
+                (analysis_id, interview_id, user_id),
+            )
+            analysis = cursor.fetchone()
+            if not analysis:
+                raise RuntimeError("staged_analysis_not_found")
+            if str(analysis[0] or "") not in {"staged", "ready"}:
+                raise RuntimeError("staged_analysis_has_invalid_status")
+            if str(analysis[2] or "") != canonical_evidence_hash:
+                raise RuntimeError("staged_analysis_evidence_mismatch")
+            if str(analysis[3] or "") != ANALYSIS_STAGE_VERSION:
+                raise RuntimeError("staged_analysis_producer_mismatch")
+            if analysis[4] is None or analysis[5] is None:
+                raise RuntimeError("staged_analysis_payload_missing")
+            if str(analysis[6] or "") != mode:
+                raise RuntimeError("staged_analysis_mode_mismatch")
+
+            cursor.execute(
+                """
+                SELECT status, evidence_hash, analysis_id, payload_encrypted
+                FROM ReportArtifacts
+                WHERE artifact_id = ? AND publication_key = ?
+                  AND interview_id = ? AND user_id = ?
+                """,
+                (artifact_id, publication_key, interview_id, user_id),
+            )
+            artifact = cursor.fetchone()
+            if not artifact or str(artifact[0] or "") not in {"staged", "completed", "partial"}:
+                raise RuntimeError("staged_report_artifact_not_found")
+            if (
+                str(artifact[1] or "") != manifest_evidence_hash
+                or str(artifact[2] or "") != analysis_id
+            ):
+                raise RuntimeError("staged_report_artifact_mismatch")
+            if artifact[3] is None:
+                raise RuntimeError("staged_report_artifact_payload_missing")
+
+            if not bool(analysis[1]):
+                cursor.execute(
+                    """
+                    UPDATE SessionPerformanceAnalyses
+                    SET is_current = FALSE, updated_at = CURRENT_TIMESTAMP
+                    WHERE interview_id = ? AND mode = ?
+                      AND schema_version = ? AND is_current = TRUE
+                      AND analysis_id <> ?
+                    """,
+                    (interview_id, mode, SESSION_PERFORMANCE_VERSION, analysis_id),
+                )
+            cursor.execute(
+                """
+                UPDATE SessionPerformanceAnalyses
+                SET status = 'ready', is_current = TRUE, updated_at = CURRENT_TIMESTAMP
+                WHERE analysis_id = ?
+                """,
+                (analysis_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE ReportArtifacts
+                SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
+                WHERE interview_id = ? AND user_id = ? AND audience = 'candidate'
+                  AND artifact_id <> ?
+                  AND status IN ('completed', 'partial')
+                """,
+                (interview_id, user_id, artifact_id),
+            )
+            cursor.execute(
+                """
+                UPDATE ReportArtifacts
+                SET status = ?, published_at = COALESCE(published_at, CURRENT_TIMESTAMP),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE artifact_id = ? AND status IN ('staged', 'completed', 'partial')
+                """,
+                (final_status, artifact_id),
+            )
+            cursor.execute(
+                """
+                UPDATE Interviews
+                SET status = ?, overall_score = ?, feedback_summary = ?,
+                    analysis_status = CASE WHEN ? = 'completed' THEN 'ready' ELSE ? END,
+                    report_json = ?, report_json_encrypted = ?,
+                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP)
+                WHERE interview_id = ? AND user_id = ? AND status <> 'cancelled'
+                """,
+                (
+                    final_status, report.get("overall_score"),
+                    "Analysis completed.",
+                    final_status, final_status, "[encrypted]",
+                    report_encrypted, interview_id, user_id,
+                ),
+            )
+
+            outbox_payload = {
+                "schema_version": "report-side-effects-v1",
+                "analysis_id": analysis_id,
+                "interview_id": interview_id,
+                "mode": mode,
+                "observations": observations,
+                "weak_topics": weak_topics,
+                "producer_version": ANALYSIS_STAGE_VERSION,
+            }
+            outbox_idempotency_key = f"improve:{analysis_id}:{ANALYSIS_STAGE_VERSION}"
+            event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, outbox_idempotency_key))
+            cursor.execute(
+                """
+                INSERT INTO ReportSideEffectOutbox (
+                    event_id, idempotency_key, publication_key, event_type,
+                    analysis_id, interview_id, user_id, payload, payload_encrypted, status,
+                    max_attempts, available_at
+                ) VALUES (
+                    ?, ?, ?, 'improve_sync', ?, ?, ?,
+                    ?, ?, 'queued', ?, CURRENT_TIMESTAMP
+                )
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                (
+                    event_id, outbox_idempotency_key, publication_key,
+                    analysis_id, interview_id, user_id,
+                    _json_dumps({"encrypted": True, "schema_version": "report-side-effects-v1"}),
+                    _encrypted_bytes(outbox_payload), REPORT_SIDE_EFFECT_MAX_ATTEMPTS,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE AnalysisJobs
+                SET status = ?, progress = 100, current_stage = 'complete',
+                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP,
+                    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = CURRENT_TIMESTAMP,
+                    error_message = NULL
+                WHERE job_id = ? AND lease_owner = ? AND status = 'running'
+                """,
+                (final_status, job_id, worker_id),
+            )
+            conn.commit()
+            return {
+                "analysis_id": analysis_id,
+                "artifact_id": artifact_id,
+                "outbox_event_id": event_id,
+                "publication_key": publication_key,
+            }
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            return_db_connection(conn)
+
+    return await asyncio.to_thread(_publish)
 
 
 async def _load_completed_stage(
@@ -1722,8 +2297,8 @@ async def _load_completed_stage(
         """
         SELECT output_encrypted, output_json
         FROM AnalysisStageOutputs
-        WHERE job_id = %s AND stage_name = %s AND stage_version = %s
-          AND evidence_hash = %s AND status = 'completed'
+        WHERE job_id = ? AND stage_name = ? AND stage_version = ?
+          AND evidence_hash = ? AND status = 'completed'
         LIMIT 1
         """,
         (job_id, stage, ANALYSIS_STAGE_VERSION, evidence_hash),
@@ -1747,27 +2322,24 @@ async def _refresh_analysis_job_manifest(
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                (f"analysis:{interview_id}",),
-            )
+            cursor.execute("BEGIN IMMEDIATE")
             manifest_id, evidence_hash = _seal_evidence_manifest(
                 cursor, interview_id, user_id
             )
             cursor.execute(
                 """
                 UPDATE AnalysisJobs
-                SET manifest_id = %s, evidence_hash = %s,
-                    producer_version = %s, updated_at = NOW()
-                WHERE job_id = %s
+                SET manifest_id = ?, evidence_hash = ?,
+                    producer_version = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ?
                 """,
                 (manifest_id, evidence_hash, ANALYSIS_STAGE_VERSION, job_id),
             )
             cursor.execute(
                 """
                 UPDATE Interviews
-                SET evidence_hash = %s, evidence_sealed_at = NOW()
-                WHERE interview_id = %s AND user_id = %s
+                SET evidence_hash = ?, evidence_sealed_at = CURRENT_TIMESTAMP
+                WHERE interview_id = ? AND user_id = ?
                 """,
                 (evidence_hash, interview_id, user_id),
             )
@@ -1803,13 +2375,13 @@ async def run_analysis_job(
         await async_execute(
             """
             UPDATE Interviews SET status = 'analysis_running', analysis_status = 'running'
-            WHERE interview_id = %s AND status <> 'cancelled'
+            WHERE interview_id = ? AND status <> 'cancelled'
               AND NOT (status IN ('completed', 'report_ready', 'partial', 'failed') AND report_json IS NOT NULL)
             """,
             (interview_id,),
         )
         job_evidence_row = await async_execute(
-            "SELECT evidence_hash, manifest_id FROM AnalysisJobs WHERE job_id = %s",
+            "SELECT evidence_hash, manifest_id FROM AnalysisJobs WHERE job_id = ?",
             (job_id,), fetchone=True,
         )
         job_evidence_hash = (job_evidence_row or [""])[0] or ""
@@ -1818,7 +2390,7 @@ async def run_analysis_job(
             raise RuntimeError("analysis_job_is_missing_sealed_evidence")
         stage_outputs: Dict[str, Dict[str, Any]] = {}
 
-        for index, stage in enumerate(ANALYSIS_STAGES, start=1):
+        for index, stage in enumerate(ANALYSIS_EXECUTION_STAGES, start=1):
             await _renew_analysis_lease(job_id, worker_id)
             started = datetime.now(timezone.utc)
             upstream_hashes = {
@@ -1839,49 +2411,53 @@ async def run_analysis_job(
             })
             cached_output = await _load_completed_stage(job_id, stage, stage_evidence_hash)
             if cached_output is not None:
-                stage_outputs[stage] = cached_output
-                continue
-
-            try:
-                output = await _run_stage(stage, interview_id, user_id, stage_outputs)
+                output = cached_output
                 status, error = "completed", None
-            except Exception as exc:
-                logger.exception(
-                    "Analysis stage %s failed for %s",
-                    stage, stable_hash(interview_id, "interview"),
+            else:
+                try:
+                    output = await _run_stage(stage, interview_id, user_id, stage_outputs)
+                    status, error = "completed", None
+                except Exception as exc:
+                    logger.exception(
+                        "Analysis stage %s failed for %s",
+                        stage, stable_hash(interview_id, "interview"),
+                    )
+                    output = {"error": "stage_failed", "stage": stage}
+                    status, error = "failed", str(exc)[:500]
+                provenance = _stage_provenance(stage, output, input_hash)
+                await async_execute(
+                    """
+                    INSERT INTO AnalysisStageOutputs (
+                        output_id, job_id, interview_id, stage_name, stage_version,
+                        evidence_hash, input_hash, model, prompt_version, provenance_json,
+                        status, output_json, output_encrypted,
+                        error_message, started_at, completed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (job_id, stage_name, stage_version, evidence_hash) DO UPDATE
+                    SET input_hash = EXCLUDED.input_hash,
+                        model = EXCLUDED.model,
+                        prompt_version = EXCLUDED.prompt_version,
+                        provenance_json = EXCLUDED.provenance_json,
+                        status = EXCLUDED.status,
+                        output_json = EXCLUDED.output_json,
+                        output_encrypted = EXCLUDED.output_encrypted,
+                        error_message = EXCLUDED.error_message,
+                        started_at = EXCLUDED.started_at,
+                        completed_at = EXCLUDED.completed_at
+                    """,
+                    (
+                        str(uuid.uuid4()), job_id, interview_id, stage,
+                        ANALYSIS_STAGE_VERSION, stage_evidence_hash, input_hash,
+                        provenance.get("model"), provenance.get("prompt_version"), _json_dumps(provenance), status,
+                        _json_dumps({"encrypted": True, "stage": stage}),
+                        _encrypted_bytes(output), error, started,
+                    ),
                 )
-                output = {"error": "stage_failed", "stage": stage}
-                status, error = "failed", str(exc)[:500]
             stage_outputs[stage] = output
-            provenance = _stage_provenance(stage, output, input_hash)
-            await async_execute(
-                """
-                INSERT INTO AnalysisStageOutputs (
-                    output_id, job_id, interview_id, stage_name, stage_version,
-                    evidence_hash, input_hash, model, prompt_version, provenance_json,
-                    status, output_json, output_encrypted,
-                    error_message, started_at, completed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (job_id, stage_name, stage_version, evidence_hash) DO UPDATE
-                SET input_hash = EXCLUDED.input_hash,
-                    model = EXCLUDED.model,
-                    prompt_version = EXCLUDED.prompt_version,
-                    provenance_json = EXCLUDED.provenance_json,
-                    status = EXCLUDED.status,
-                    output_json = EXCLUDED.output_json,
-                    output_encrypted = EXCLUDED.output_encrypted,
-                    error_message = EXCLUDED.error_message,
-                    started_at = EXCLUDED.started_at,
-                    completed_at = EXCLUDED.completed_at
-                """,
-                (
-                    str(uuid.uuid4()), job_id, interview_id, stage,
-                    ANALYSIS_STAGE_VERSION, stage_evidence_hash, input_hash,
-                    provenance.get("model"), provenance.get("prompt_version"), _json_dumps(provenance), status,
-                    _json_dumps(_safe_stage_payload(stage, output)),
-                    _encrypted_bytes(output), error, started,
-                ),
-            )
+            if stage == "assessment_completion" and int(output.get("repaired_count") or 0):
+                manifest_id, job_evidence_hash = await _refresh_analysis_job_manifest(
+                    job_id, interview_id, user_id
+                )
             progress = (
                 100
                 if stage == "complete"
@@ -1889,15 +2465,11 @@ async def run_analysis_job(
             )
             await async_execute(
                 """
-                UPDATE AnalysisJobs SET progress = %s, current_stage = %s, updated_at = NOW()
-                WHERE job_id = %s AND lease_owner = %s
+                UPDATE AnalysisJobs SET progress = ?, current_stage = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND lease_owner = ?
                 """,
                 (progress, stage, job_id, worker_id),
             )
-            if stage == "assessment_completion" and int(output.get("repaired_count") or 0):
-                manifest_id, job_evidence_hash = await _refresh_analysis_job_manifest(
-                    job_id, interview_id, user_id
-                )
             if status == "failed" and stage in CRITICAL_ANALYSIS_STAGES:
                 raise RuntimeError(f"critical_analysis_stage_failed:{stage}:{error or 'unknown'}")
 
@@ -1939,25 +2511,15 @@ async def run_analysis_job(
             if report_is_partial
             else "completed"
         )
-        analysis_id = await _persist_canonical_performance(
+        staged_analysis = await _stage_canonical_performance(
             interview_id=interview_id,
             user_id=user_id,
             stage_outputs=legacy_stage_outputs,
             report=report,
             job_evidence_hash=job_evidence_hash,
         )
-        mode = "technical" if str(report.get("report_type") or "").lower() == "technical" else "mock"
-        await _queue_learning_from_analysis(interview_id, user_id)
-        report_focus_mission = None
-        if mode == "technical":
-            report_focus_mission = await ensure_mission_from_technical_report(
-                user_id,
-                interview_id,
-                analysis_id,
-                (legacy_stage_outputs.get("technical_code") or {}).get("weak_topics") or [],
-            )
-        if not report_focus_mission:
-            await ensure_mission_from_weakness(user_id, interview_id, analysis_id, mode)
+        analysis_id = str(staged_analysis["analysis_id"])
+        mode = str(staged_analysis["mode"])
         report = {
             **report,
             "analysis_id": analysis_id,
@@ -1965,91 +2527,63 @@ async def run_analysis_job(
         report.pop("recruiter_only", None)
         safe_report = _safe_report_payload(report)
         full_report_encrypted = _encrypted_bytes(report)
-        existing_artifact = await async_execute(
-            """
-            SELECT artifact_id FROM ReportArtifacts
-            WHERE interview_id = %s AND user_id = %s AND audience = 'candidate'
-            ORDER BY created_at DESC LIMIT 1
-            """,
-            (interview_id, user_id), fetchone=True,
+        staged_artifact = await _stage_candidate_report_artifact(
+            interview_id=interview_id,
+            user_id=user_id,
+            analysis_id=analysis_id,
+            report=report,
+            safe_report=safe_report,
+            report_encrypted=full_report_encrypted,
+            manifest_evidence_hash=job_evidence_hash,
+            canonical_evidence_hash=str(staged_analysis["evidence_hash"]),
         )
-        if existing_artifact:
-            await async_execute(
-                """
-                UPDATE ReportArtifacts
-                SET report_type = %s, payload = %s, payload_encrypted = %s,
-                    evidence_hash = %s, status = %s, provenance_json = %s, updated_at = NOW()
-                WHERE artifact_id = %s
-                """,
-                (
-                    report.get("report_type") or "interview",
-                    _json_dumps(safe_report), full_report_encrypted, job_evidence_hash,
-                    final_status, _json_dumps(report.get("generation_provenance") or {}), existing_artifact[0],
-                ),
-            )
-        else:
-            await async_execute(
-                """
-                INSERT INTO ReportArtifacts (
-                    artifact_id, interview_id, user_id, report_type, audience,
-                    payload, payload_encrypted, evidence_hash, status, provenance_json
-                ) VALUES (%s, %s, %s, %s, 'candidate', %s, %s, %s, %s, %s)
-                """,
-                (
-                    str(uuid.uuid4()), interview_id, user_id,
-                    report.get("report_type") or "interview",
-                    _json_dumps(safe_report), full_report_encrypted, job_evidence_hash,
-                    final_status, _json_dumps(report.get("generation_provenance") or {}),
-                ),
-            )
-        await async_execute(
-            """
-            UPDATE Interviews
-            SET status = %s, overall_score = %s, feedback_summary = %s,
-                analysis_status = CASE WHEN %s = 'completed' THEN 'ready' ELSE %s END,
-                report_json = %s, report_json_encrypted = %s,
-                completed_at = COALESCE(completed_at, NOW())
-            WHERE interview_id = %s AND status <> 'cancelled'
-              AND (
-                  report_json IS NULL
-                  OR report_json_encrypted IS NULL
-                  OR analysis_status IN ('not_requested', 'queued', 'running', 'failed', 'partial')
-                  OR status IN ('analysis_pending', 'analysis_running')
-              )
-            """,
-            (
-                final_status, report.get("overall_score"),
-                str(report.get("summary") or "Analysis completed.")[:1000],
-                final_status, final_status,
-                _json_dumps(safe_report), full_report_encrypted, interview_id,
+        await _renew_analysis_lease(job_id, worker_id)
+        await _publish_staged_report(
+            job_id=job_id,
+            worker_id=worker_id,
+            interview_id=interview_id,
+            user_id=user_id,
+            analysis_id=analysis_id,
+            artifact_id=staged_artifact["artifact_id"],
+            publication_key=staged_artifact["publication_key"],
+            final_status=final_status,
+            report=report,
+            safe_report=safe_report,
+            report_encrypted=full_report_encrypted,
+            manifest_evidence_hash=job_evidence_hash,
+            canonical_evidence_hash=str(staged_analysis["evidence_hash"]),
+            mode=mode,
+            observations=list(staged_analysis.get("observations") or []),
+            weak_topics=list(
+                (legacy_stage_outputs.get("technical_code") or {}).get("weak_topics")
+                or []
             ),
         )
-        await async_execute(
-            """
-            UPDATE AnalysisJobs
-            SET status = %s, progress = 100, current_stage = 'complete',
-                completed_at = NOW(), updated_at = NOW(), lease_owner = NULL,
-                lease_expires_at = NULL, heartbeat_at = NOW()
-            WHERE job_id = %s AND lease_owner = %s
-            """,
-            (final_status, job_id, worker_id),
-        )
-        await _schedule_media_cleanup(interview_id)
+        try:
+            await _schedule_media_cleanup(interview_id)
+        except Exception:
+            logger.warning(
+                "Media cleanup scheduling deferred for %s",
+                stable_hash(interview_id, "interview"),
+            )
     except Exception as exc:
         logger.exception("Async analysis job failed for %s", stable_hash(interview_id, "interview"))
         retry_row = await async_execute(
             """
             UPDATE AnalysisJobs
             SET retry_count = retry_count + 1,
-                status = CASE WHEN retry_count + 1 >= %s THEN 'failed' ELSE 'queued' END,
+                status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'queued' END,
                 next_attempt_at = CASE
-                    WHEN retry_count + 1 >= %s THEN NULL
-                    ELSE NOW() + (POWER(2, retry_count) * INTERVAL '5 seconds')
+                    WHEN retry_count + 1 >= ? THEN NULL
+                    ELSE datetime(
+                        CURRENT_TIMESTAMP,
+                        '+' || CAST((1 << retry_count) * 5 AS TEXT) || ' seconds'
+                    )
                 END,
-                error_message = %s, updated_at = NOW(),
-                completed_at = CASE WHEN retry_count + 1 >= %s THEN NOW() ELSE NULL END,
+                error_message = ?, updated_at = CURRENT_TIMESTAMP,
+                completed_at = CASE WHEN retry_count + 1 >= ? THEN CURRENT_TIMESTAMP ELSE NULL END,
                 lease_owner = NULL, lease_expires_at = NULL
-            WHERE job_id = %s AND lease_owner = %s
+            WHERE job_id = ? AND lease_owner = ?
             RETURNING status
             """,
             (
@@ -2064,7 +2598,7 @@ async def run_analysis_job(
                 UPDATE Interviews
                 SET status = CASE WHEN attempt_status = 'completed' THEN 'completed' ELSE status END,
                     analysis_status = 'failed'
-                WHERE interview_id = %s AND status <> 'cancelled' AND report_json IS NULL
+                WHERE interview_id = ? AND status <> 'cancelled' AND report_json IS NULL
                 """,
                 (interview_id,),
             )
@@ -2090,12 +2624,13 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             FROM InterviewResponses response
             JOIN InterviewQuestions question
               ON question.question_id = response.question_id
-            WHERE response.interview_id = %s
+            WHERE response.interview_id = ?
+              AND question.question_type NOT IN ('warmup', 'introduction')
               AND NOT EXISTS (
                   SELECT 1
                   FROM ResponseAssessments assessment
                   WHERE assessment.response_id = response.response_id
-                    AND assessment.evaluator_version = %s
+                    AND assessment.evaluator_version = ?
               )
             ORDER BY response.created_at
             LIMIT 60
@@ -2124,7 +2659,6 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 "question_type": str(row[6] or "main"),
                 "taxonomy_keys": taxonomy_keys if isinstance(taxonomy_keys, list) else [],
                 "semantic_analysis_enabled": True,
-                "semantic_budget_available": True,
                 "recovery_assessment": True,
             }
             try:
@@ -2170,8 +2704,8 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                     INSERT INTO ResponseAssessments (
                         assessment_id, response_id, interview_id,
                         evaluator_version, evidence_hash, overall_score,
-                        assessment_json, created_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        assessment_json, assessment_json_encrypted, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT (response_id, evaluator_version, evidence_hash)
                     DO NOTHING
                     """,
@@ -2181,7 +2715,8 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                         assessment.get("overall_score")
                         if isinstance(assessment.get("overall_score"), (int, float))
                         else None,
-                        _json_dumps(assessment),
+                        _json_dumps({"encrypted": True}),
+                        _encrypted_bytes(assessment),
                     ),
                 )
                 repaired.append(response_id)
@@ -2205,10 +2740,10 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             "technical_code", interview_id, user_id,
             {"nlp_content": outputs.get("transcript_analysis") or {}},
         )
-    if stage == "integrity_summary":
+    if stage == "self_review_summary":
         evidence = outputs.get("evidence_load") or {}
         return await _run_stage(
-            "cheating_risk", interview_id, user_id,
+            "self_review_signals", interview_id, user_id,
             {
                 "video_features": evidence.get("video") or {},
                 "technical_code": outputs.get("technical_analysis") or {},
@@ -2261,29 +2796,117 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                    r.answer_text_encrypted, r.user_response, r.created_at
             FROM InterviewQuestions q
             LEFT JOIN InterviewResponses r ON r.question_id = q.question_id
-            WHERE q.interview_id = %s
+            WHERE q.interview_id = ?
             ORDER BY q.question_order, r.created_at
             """,
             (interview_id,),
             fetchall=True,
         )
         transcript: List[Dict[str, Any]] = []
+        seen_turns: set[tuple[str, str]] = set()
+
+        def append_turn(role_value: Any, text_value: Any, *, label: Optional[str] = None) -> None:
+            role = _candidate_transcript_role(role_value)
+            text = str(text_value or "").strip()
+            if not role or not text:
+                return
+            key = (role, " ".join(text.split()).lower())
+            if key in seen_turns:
+                return
+            seen_turns.add(key)
+            turn: Dict[str, Any] = {"role": role, "text": text}
+            if label:
+                turn["label"] = label
+            transcript.append(turn)
+
         seen_questions: set[tuple[int, str]] = set()
         for question_text, question_order, _, answer_encrypted, legacy_answer, _ in rows or []:
             question_key = (int(question_order or 0), str(question_text or ""))
             if question_key not in seen_questions:
-                transcript.append({"role": "interviewer", "text": question_text or ""})
+                append_turn("interviewer", question_text)
                 seen_questions.add(question_key)
             answer = _decrypt_storage_text(answer_encrypted) if answer_encrypted else ""
             if not answer and legacy_answer != "[encrypted]":
                 answer = str(legacy_answer or "")
             if answer:
-                transcript.append({"role": "candidate", "text": answer})
+                append_turn("candidate", answer)
+
+        # The websocket completion payload is an encrypted fallback for a
+        # connection that ended after a transcript turn but before its normal
+        # question/response row was committed. Merge it without duplicating
+        # the canonical persisted turns above.
+        stored_transcript_row = await async_execute(
+            """
+            SELECT transcript_encrypted
+            FROM Interviews
+            WHERE interview_id = ? AND user_id = ?
+            """,
+            (interview_id, user_id),
+            fetchone=True,
+        )
+        if stored_transcript_row and stored_transcript_row[0]:
+            try:
+                stored_transcript = _json_value(
+                    _decrypt_storage_text(stored_transcript_row[0]),
+                    [],
+                )
+            except Exception:
+                stored_transcript = []
+            for item in stored_transcript if isinstance(stored_transcript, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                append_turn(
+                    item.get("role"),
+                    item.get("text") or item.get("content") or item.get("transcript"),
+                )
+
+        # Coding rounds persist spoken and written reasoning separately from
+        # InterviewResponses. Include those encrypted evidence rows so a
+        # Technical report cannot silently publish an empty transcript.
+        technical_rows = await async_execute(
+            """
+            SELECT round.round_id, round.prompt, round.round_number,
+                   evidence.evidence_type, evidence.content_encrypted
+            FROM TechnicalInterviewRounds round
+            LEFT JOIN TechnicalReasoningEvidence evidence
+              ON evidence.round_id = round.round_id
+             AND evidence.user_id = round.user_id
+            WHERE round.interview_id = ? AND round.user_id = ?
+            ORDER BY round.round_number, round.created_at,
+                     evidence.created_at, evidence.evidence_id
+            """,
+            (interview_id, user_id),
+            fetchall=True,
+        )
+        seen_technical_rounds: set[str] = set()
+        for round_id, prompt, _, evidence_type, encrypted_payload in technical_rows or []:
+            round_key = str(round_id or "")
+            if round_key and round_key not in seen_technical_rounds:
+                append_turn("interviewer", prompt, label="Technical problem")
+                seen_technical_rounds.add(round_key)
+            entry = _technical_reasoning_transcript_entry(
+                evidence_type,
+                encrypted_payload,
+            )
+            if entry:
+                append_turn(
+                    entry["role"],
+                    entry["text"],
+                    label=entry.get("label"),
+                )
+
         candidate_word_count = _candidate_word_count(transcript)
         return {
             "provider": "local_existing_turns",
             "transcript": transcript,
-            "speaker_segments": [{"speaker": item["role"], "text": item["text"]} for item in transcript],
+            "speaker_segments": [
+                {
+                    "speaker": item["role"],
+                    "text": item["text"],
+                    **({"label": item["label"]} if item.get("label") else {}),
+                }
+                for item in transcript
+            ],
             "word_count": sum(len((item["text"] or "").split()) for item in transcript),
             "candidate_word_count": candidate_word_count,
             "interviewer_word_count": sum(_word_count(item["text"]) for item in transcript if item["role"] == "interviewer"),
@@ -2294,16 +2917,20 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
     if stage == "audio_features":
         rows = await async_execute(
             """
-            SELECT ir.timing_json, ir.input_mode, ra.assessment_json
-            FROM InterviewResponses ir
-            LEFT JOIN LATERAL (
-                SELECT assessment_json
+            WITH latest_assessments AS (
+                SELECT response_id, assessment_json_encrypted, assessment_json,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY response_id
+                           ORDER BY created_at DESC, assessment_id DESC
+                       ) AS assessment_rank
                 FROM ResponseAssessments
-                WHERE response_id = ir.response_id
-                ORDER BY created_at DESC
-                LIMIT 1
-            ) ra ON TRUE
-            WHERE ir.interview_id = %s
+            )
+            SELECT ir.timing_json, ir.input_mode,
+                   ra.assessment_json_encrypted, ra.assessment_json
+            FROM InterviewResponses ir
+            LEFT JOIN latest_assessments ra
+              ON ra.response_id = ir.response_id AND ra.assessment_rank = 1
+            WHERE ir.interview_id = ?
             ORDER BY ir.created_at
             """,
             (interview_id,),
@@ -2314,11 +2941,11 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         response_latencies: List[float] = []
         audio_word_count = 0
         filler_count = 0
-        for timing_raw, input_mode, assessment_raw in rows or []:
+        for timing_raw, input_mode, assessment_encrypted, assessment_legacy in rows or []:
             if str(input_mode or "").lower() not in {"voice", "audio", "voice_or_text"}:
                 continue
             timing = _json_value(timing_raw, {})
-            assessment = _json_value(assessment_raw, {})
+            assessment = decrypt_json_field(assessment_encrypted, assessment_legacy, {})
             signals = assessment.get("signals") if isinstance(assessment, dict) else {}
             if not isinstance(signals, dict):
                 signals = {}
@@ -2360,7 +2987,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT payload
             FROM ClientBodyLanguageMetrics
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             ORDER BY created_at DESC
             LIMIT 200
             """,
@@ -2383,7 +3010,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         if face_missing >= 5:
             flags.append({"event_type": "face_missing", "count": face_missing})
         return {
-            "source": "browser_mediapipe_metrics",
+            "source": "browser_local_camera_metrics",
             "face_present_percent": (
                 round((sum(face_values) / len(face_values)) * 100, 1)
                 if face_values
@@ -2402,7 +3029,13 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
 
     if stage == "nlp_content":
         turns = await _load_turns(interview_id)
-        scored_turns = [_score_turn(turn) for turn in turns]
+        # The greeting and context-only introduction are persisted for an
+        # auditable transcript, but they are never candidate evidence.
+        scored_turns = [
+            _score_turn(turn)
+            for turn in turns
+            if not turn.get("scoring_excluded")
+        ]
         return {
             "turns": scored_turns,
             "average_star_score": _average_available([turn["star_score"] for turn in scored_turns]),
@@ -2417,7 +3050,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT started_at, completed_at, duration_seconds, deadline_at, settings
             FROM Interviews
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             """,
             (interview_id,),
             fetchone=True,
@@ -2442,7 +3075,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                    status, created_at, completed_at, duration_seconds,
                    deadline_at, round_number, started_at
             FROM TechnicalInterviewRounds
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             ORDER BY created_at, round_id
             """,
             (interview_id,),
@@ -2481,7 +3114,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                    tir.prompt, tir.metadata, ts.source_code_encrypted
             FROM TechnicalSubmissions ts
             JOIN TechnicalInterviewRounds tir ON tir.round_id = ts.round_id
-            WHERE ts.interview_id = %s
+            WHERE ts.interview_id = ?
             ORDER BY ts.round_id, ts.submit_number DESC, ts.created_at DESC
             """,
             (interview_id,),
@@ -2548,7 +3181,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                    tir.prompt, tir.metadata, tre.source_code_encrypted, tre.created_at
             FROM TechnicalRunEvents tre
             JOIN TechnicalInterviewRounds tir ON tir.round_id = tre.round_id
-            WHERE tir.interview_id = %s
+            WHERE tir.interview_id = ?
             ORDER BY tre.created_at DESC
             """,
             (interview_id,),
@@ -2594,34 +3227,48 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         latest = submissions[0] if submissions else {}
         draft_rows = await async_execute(
             """
-            SELECT DISTINCT ON (tcs.round_id)
-                   tcs.snapshot_id, tcs.round_id, tcs.language, tcs.source_chars,
-                   tcs.source_excerpt, tcs.source_code,
-                   tcs.metadata, tcs.created_at, tir.prompt, tir.metadata, tcs.source_code_encrypted
-            FROM TechnicalCodeSnapshots tcs
-            JOIN TechnicalInterviewRounds tir ON tir.round_id = tcs.round_id
-            WHERE tcs.interview_id = %s
-              AND tcs.source_chars > 0
-            ORDER BY tcs.round_id, tcs.created_at DESC
+            WITH ranked_snapshots AS (
+                SELECT tcs.snapshot_id, tcs.round_id, tcs.language, tcs.source_chars,
+                       tcs.source_excerpt, tcs.source_code,
+                       tcs.metadata AS snapshot_metadata, tcs.created_at,
+                       tir.prompt, tir.metadata AS round_metadata,
+                       tcs.source_code_encrypted, tir.starter_code,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY tcs.round_id
+                           ORDER BY tcs.created_at DESC, tcs.snapshot_id DESC
+                       ) AS snapshot_rank
+                FROM TechnicalCodeSnapshots tcs
+                JOIN TechnicalInterviewRounds tir ON tir.round_id = tcs.round_id
+                WHERE tcs.interview_id = ?
+                  AND tcs.source_chars > 0
+            )
+            SELECT snapshot_id, round_id, language, source_chars,
+                   source_excerpt, source_code, snapshot_metadata, created_at,
+                   prompt, round_metadata, source_code_encrypted, starter_code
+            FROM ranked_snapshots
+            WHERE snapshot_rank = 1
             """,
             (interview_id,),
             fetchall=True,
         )
-        drafts = [
-            {
+        drafts = []
+        for row in draft_rows or []:
+            source_code = _technical_source_text(row[10], row[5], row[4])
+            snapshot_metadata = _json_value(row[6], {})
+            if not _candidate_authored_technical_draft(source_code, row[11], snapshot_metadata):
+                continue
+            drafts.append({
                 "snapshot_id": row[0],
                 "round_id": row[1],
                 "language": row[2],
                 "source_chars": row[3],
                 "source_excerpt": row[4] or "",
-                "source_code": _technical_source_text(row[10], row[5], row[4]),
-                "metadata": _json_value(row[6], {}),
+                "source_code": source_code,
+                "metadata": snapshot_metadata,
                 "created_at": row[7],
                 "prompt": row[8] or "",
                 "round_metadata": _json_value(row[9], {}),
-            }
-            for row in draft_rows or []
-        ]
+            })
         for item in drafts:
             metadata = item.get("round_metadata") or item.get("metadata") or {}
             item["algorithm_pattern"] = metadata.get("algorithm_pattern")
@@ -2637,10 +3284,10 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
         latest_signal = latest or (drafts[0] if drafts else {})
         reasoning_rows = await async_execute(
             """
-            SELECT evidence_id::text, round_id, evidence_type, content,
+            SELECT evidence_id, round_id, evidence_type, content,
                    content_encrypted, payload, created_at
             FROM TechnicalReasoningEvidence
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             ORDER BY created_at
             """,
             (interview_id,),
@@ -2678,7 +3325,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT round_id, event_type, payload, created_at
             FROM TechnicalTelemetryEvents
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             ORDER BY created_at
             """,
             (interview_id,),
@@ -3039,18 +3686,18 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             },
         }
 
-    if stage == "cheating_risk":
+    if stage == "self_review_signals":
         rows = await async_execute(
             """
             SELECT event_type, COUNT(*)
-            FROM AntiCheatEvents
-            WHERE interview_id = %s
+            FROM SelfReviewEvents
+            WHERE interview_id = ?
             GROUP BY event_type
             """,
             (interview_id,),
             fetchall=True,
         )
-        return aggregate_cheating_risk(
+        return summarize_self_review_signals(
             _event_counts(rows or []),
             outputs.get("video_features", {}),
             outputs.get("technical_code", {}),
@@ -3061,7 +3708,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT interview_mode, interview_type, job_title, strictness_level, settings
             FROM Interviews
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             """,
             (interview_id,),
             fetchone=True,
@@ -3073,7 +3720,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
             """
             SELECT 1
             FROM TechnicalInterviewRounds
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             LIMIT 1
             """,
             (interview_id,),
@@ -3091,7 +3738,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 profile_type=profile_type,
                 nlp_output=outputs.get("nlp_content", {}),
                 technical_output=outputs.get("technical_code", {}),
-                cheating_output=outputs.get("cheating_risk", {}),
+                self_review_output=outputs.get("self_review_signals", {}),
             )
         else:
             heuristic_report = build_async_behavioral_report(
@@ -3100,7 +3747,7 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 nlp_output=outputs.get("nlp_content", {}),
                 audio_output=outputs.get("audio_features", {}),
                 video_output=outputs.get("video_features", {}),
-                cheating_output=outputs.get("cheating_risk", {}),
+                self_review_output=outputs.get("self_review_signals", {}),
             )
         # Canonical reports expose only persisted evaluator and execution evidence.
         # The legacy premium builder inferred unsupported traits from transcript/code
@@ -3123,29 +3770,37 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
 async def _load_turns(interview_id: str) -> List[Dict[str, Any]]:
     rows = await async_execute(
         """
+        WITH latest_responses AS (
+            SELECT candidate_response.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY candidate_response.question_id
+                       ORDER BY candidate_response.created_at DESC, candidate_response.response_id DESC
+                   ) AS response_rank
+            FROM InterviewResponses candidate_response
+        ),
+        latest_assessments AS (
+            SELECT response_id, evaluator_version,
+                   assessment_json_encrypted, assessment_json,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY response_id
+                       ORDER BY created_at DESC, assessment_id DESC
+                   ) AS assessment_rank
+            FROM ResponseAssessments
+        )
         SELECT ir.response_id, iq.question_id, iq.question_text, iq.question_type, iq.topic_label,
                iq.is_followup, ir.answer_text_encrypted, ir.user_response, ir.response_time_seconds,
                iq.question_spec_id, iq.taxonomy_keys, iq.blueprint_section_id,
                iq.parent_question_id, assessment.evaluator_version,
-               assessment.assessment_json, ir.timing_json, ir.input_mode,
+               assessment.assessment_json_encrypted, assessment.assessment_json,
+               ir.timing_json, ir.input_mode,
                iq.provenance, iq.expected_points, iq.rubric_json, iq.question_order,
                ir.created_at
         FROM InterviewQuestions iq
-        LEFT JOIN LATERAL (
-            SELECT *
-            FROM InterviewResponses candidate_response
-            WHERE candidate_response.question_id = iq.question_id
-            ORDER BY candidate_response.created_at DESC
-            LIMIT 1
-        ) ir ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT evaluator_version, assessment_json
-            FROM ResponseAssessments
-            WHERE response_id = ir.response_id
-            ORDER BY created_at DESC
-            LIMIT 1
-        ) assessment ON TRUE
-        WHERE iq.interview_id = %s
+        LEFT JOIN latest_responses ir
+          ON ir.question_id = iq.question_id AND ir.response_rank = 1
+        LEFT JOIN latest_assessments assessment
+          ON assessment.response_id = ir.response_id AND assessment.assessment_rank = 1
+        WHERE iq.interview_id = ?
         ORDER BY iq.question_order, ir.created_at NULLS LAST
         """,
         (interview_id,),
@@ -3160,6 +3815,7 @@ async def _load_turns(interview_id: str) -> List[Dict[str, Any]]:
             "question_id": row[1],
             "question": row[2] or "",
             "question_type": row[3] or "main",
+            "scoring_excluded": str(row[3] or "").strip().lower() in {"warmup", "introduction"},
             "topic": row[4] or "General",
             "is_followup": bool(row[5]),
             "response": encrypted_answer or legacy_answer,
@@ -3169,14 +3825,14 @@ async def _load_turns(interview_id: str) -> List[Dict[str, Any]]:
             "blueprint_section_id": row[11],
             "parent_question_id": row[12],
             "evaluator_version": row[13],
-            "assessment": _json_value(row[14], None),
-            "timing": _json_value(row[15], {}),
-            "input_mode": row[16],
-            "provenance": _json_value(row[17], {}),
-            "expected_points": _json_value(row[18], []),
-            "rubric_json": _json_value(row[19], {}),
-            "question_order": row[20],
-            "created_at": row[21],
+            "assessment": decrypt_json_field(row[14], row[15], None),
+            "timing": _json_value(row[16], {}),
+            "input_mode": row[17],
+            "provenance": _json_value(row[18], {}),
+            "expected_points": _json_value(row[19], []),
+            "rubric_json": _json_value(row[20], {}),
+            "question_order": row[21],
+            "created_at": row[22],
         })
     return turns
 
@@ -3553,7 +4209,12 @@ def _technical_weak_topics(
         pass_rate = round((bucket["passed"] / total) * 100, 1) if total else 0.0
         evidence_states = sorted(bucket["evidence_states"])
         draft_or_run_only = any(state != "final_submission" for state in evidence_states)
-        if pass_rate < 80 or draft_or_run_only:
+        failed_final_case = (
+            "final_submission" in evidence_states
+            and total > 0
+            and bucket["passed"] < total
+        )
+        if pass_rate < 80 or draft_or_run_only or failed_final_case:
             weak.append({
                 "topic": bucket["topic"],
                 "pass_rate": pass_rate,
@@ -3594,13 +4255,13 @@ async def _schedule_media_cleanup(interview_id: str) -> None:
         await async_execute(
             """
             UPDATE InterviewMediaAssets
-            SET delete_after = LEAST(COALESCE(delete_after, %s), %s),
+            SET delete_after = MIN(COALESCE(delete_after, ?), ?),
                 retention_status = CASE
                     WHEN retention_status IN ('retained', 'cleanup_scheduled')
                     THEN 'cleanup_scheduled'
                     ELSE retention_status
                 END
-            WHERE interview_id = %s AND media_kind = %s
+            WHERE interview_id = ? AND media_kind = ?
             """,
             (now + window, now + window, interview_id, media_kind),
         )

@@ -46,7 +46,66 @@ sys.modules.setdefault("database", database_stub)
 import learning_engine
 
 
+class _GateCursor:
+    def __init__(self, ready: bool):
+        self.ready = ready
+        self.queries = []
+
+    def execute(self, query, params=None):
+        self.queries.append((query, params))
+
+    def fetchone(self):
+        return (self.ready,)
+
+    def close(self):
+        return None
+
+
+class _GateConnection:
+    def __init__(self, cursor):
+        self.cursor_value = cursor
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_value
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        return None
+
+
 class LearningEnginePureTests(unittest.IsolatedAsyncioTestCase):
+    def test_improve_gate_requires_current_sufficient_performance(self):
+        cursor = _GateCursor(True)
+        assert learning_engine._has_current_performance_analysis(
+            cursor,
+            "user-1",
+            interview_id="interview-1",
+            analysis_id="analysis-1",
+        ) is True
+        query = cursor.queries[0][0]
+        assert "evidence_status = 'sufficient'" in query
+        assert "analysis.analysis_id = ?" in query
+        assert "analysis.evidence_status = 'sufficient'" in query
+        assert "FROM ReportArtifacts artifact" in query
+        assert "artifact.payload_encrypted IS NOT NULL" in query
+        assert "HAVING COUNT(*) >= 2" not in query
+
+    def test_response_assessment_cannot_create_improve_before_performance(self):
+        cursor = _GateCursor(False)
+        connection = _GateConnection(cursor)
+        with patch.object(learning_engine, "get_db_connection", return_value=connection), patch.object(
+            learning_engine, "return_db_connection"
+        ):
+            result = learning_engine._ensure_mission_from_response_assessment_sync(
+                "user-1", "interview-1"
+            )
+        assert result is None
+        assert connection.commits == 1
+        assert len(cursor.queries) == 1
+
     def test_skill_key_uses_project_anchor_for_project_questions(self):
         turn = {
             "question": "Can you explain the project you built and your exact part?",
@@ -112,7 +171,7 @@ class LearningEngineAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_count"], 1)
         self.assertTrue(any("INSERT INTO LearnerSkillStates" in call[0] for call in calls))
 
-    async def test_submit_exercise_attempt_updates_status_and_mastery_with_fallback(self):
+    async def test_unbound_legacy_exercise_cannot_fabricate_score_or_mastery(self):
         calls = []
 
         async def fake_execute(query, params=None, fetchone=False, fetchall=False):
@@ -146,12 +205,14 @@ class LearningEngineAsyncTests(unittest.IsolatedAsyncioTestCase):
             learning_engine,
             "complete_json_async",
             side_effect=RuntimeError("model unavailable"),
-        ):
-            result = await learning_engine.submit_exercise_attempt("user-1", "exercise-1", answer, {})
+        ) as model_call:
+            with self.assertRaisesRegex(ValueError, "active improvement mission"):
+                await learning_engine.submit_exercise_attempt("user-1", "exercise-1", answer, {})
 
-        self.assertTrue(result["mastery_passed"])
-        self.assertTrue(any("INSERT INTO ExerciseAttempts" in call[0] for call in calls))
-        self.assertTrue(any("UPDATE GeneratedExercises" in call[0] for call in calls))
+        model_call.assert_not_called()
+        self.assertFalse(any("INSERT INTO ExerciseAttempts" in call[0] for call in calls))
+        self.assertFalse(any("UPDATE GeneratedExercises" in call[0] for call in calls))
+        self.assertFalse(any("LearnerSkillStates" in call[0] for call in calls))
 
 
 if __name__ == "__main__":

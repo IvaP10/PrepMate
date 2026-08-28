@@ -1,7 +1,7 @@
-"""Durable technical-execution worker.
+"""Local technical-execution worker.
 
-The FastAPI process only enqueues jobs.  This worker claims PostgreSQL rows with
-leases, executes candidate code exclusively through private Piston, and commits
+The API only enqueues jobs. This local worker claims SQLite rows with
+leases, executes candidate code exclusively through the supported OS sandbox, and commits
 masked public results.  Restarting either process does not lose a queued job.
 """
 
@@ -19,12 +19,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from database import get_db_connection, return_db_connection
-from security_utils import decrypt_data
+from security_utils import decrypt_data, stable_hash
 from technical_mode import (
     EXECUTION_JOB_VERSION,
     _case_verdict,
     _execute_code,
-    _judge0_verdict,
+    _execution_verdict,
 )
 
 
@@ -86,11 +86,11 @@ def heartbeat(worker: str, metadata: Optional[Dict[str, Any]] = None) -> List[st
             UPDATE TechnicalExecutionJobs
             SET status = 'failed',
                 error_message = COALESCE(error_message, 'execution lease expired repeatedly'),
-                completed_at = NOW(), updated_at = NOW(),
+                completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP,
                 lease_owner = NULL, lease_expires_at = NULL
             WHERE status IN ('leased', 'running')
-              AND lease_expires_at < NOW()
-              AND retry_count >= %s
+              AND lease_expires_at < CURRENT_TIMESTAMP
+              AND retry_count >= ?
             RETURNING round_id, action
             """,
             (MAX_RETRIES,),
@@ -99,7 +99,7 @@ def heartbeat(worker: str, metadata: Optional[Dict[str, Any]] = None) -> List[st
         exhausted_interviews: List[str] = []
         for round_id, action in exhausted:
             cursor.execute(
-                "SELECT interview_id FROM TechnicalInterviewRounds WHERE round_id = %s",
+                "SELECT interview_id FROM TechnicalInterviewRounds WHERE round_id = ?",
                 (round_id,),
             )
             interview_row = cursor.fetchone()
@@ -107,7 +107,7 @@ def heartbeat(worker: str, metadata: Optional[Dict[str, Any]] = None) -> List[st
                 exhausted_interviews.append(str(interview_row[0]))
             if action == "submit":
                 cursor.execute(
-                    "UPDATE TechnicalInterviewRounds SET status = 'active' WHERE round_id = %s AND status = 'submitting'",
+                    "UPDATE TechnicalInterviewRounds SET status = 'active' WHERE round_id = ? AND status = 'submitting'",
                     (round_id,),
                 )
         cursor.execute(
@@ -115,11 +115,11 @@ def heartbeat(worker: str, metadata: Optional[Dict[str, Any]] = None) -> List[st
             INSERT INTO WorkerHeartbeats (
                 worker_id, worker_type, version, metadata, started_at, heartbeat_at
             )
-            VALUES (%s, 'technical', %s, %s, NOW(), NOW())
+            VALUES (?, 'technical', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT (worker_id) DO UPDATE SET
                 version = EXCLUDED.version,
                 metadata = EXCLUDED.metadata,
-                heartbeat_at = NOW()
+                heartbeat_at = CURRENT_TIMESTAMP
             """,
             (worker, WORKER_VERSION, json.dumps(metadata or {})),
         )
@@ -127,7 +127,10 @@ def heartbeat(worker: str, metadata: Optional[Dict[str, Any]] = None) -> List[st
             """
             SELECT interview.interview_id
             FROM Interviews interview
-            WHERE COALESCE((interview.settings->>'technical_finalize_requested')::boolean, FALSE) = TRUE
+            WHERE COALESCE(
+                    CAST(json_extract(interview.settings, '$.technical_finalize_requested') AS INTEGER),
+                    0
+                  ) = 1
               AND interview.status IN ('in_progress', 'uploading')
               AND NOT EXISTS (
                   SELECT 1 FROM TechnicalExecutionJobs job
@@ -158,8 +161,7 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
             """
             SELECT user_id, status, settings
             FROM Interviews
-            WHERE interview_id = %s
-            FOR UPDATE
+            WHERE interview_id = ?
             """,
             (interview_id,),
         )
@@ -175,7 +177,7 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
             """
             SELECT COUNT(*)
             FROM TechnicalExecutionJobs
-            WHERE interview_id = %s AND status IN ('queued', 'leased', 'running')
+            WHERE interview_id = ? AND status IN ('queued', 'leased', 'running')
             """,
             (interview_id,),
         )
@@ -196,24 +198,27 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
                 attempt_status = 'completed',
                 analysis_status = 'queued',
                 completion_kind = CASE
-                    WHEN deadline_at IS NOT NULL AND NOW() >= deadline_at THEN 'deadline'
+                    WHEN deadline_at IS NOT NULL AND CURRENT_TIMESTAMP >= deadline_at THEN 'deadline'
                     ELSE 'natural'
                 END,
                 recovery_deadline_at = NULL,
                 lifecycle_revision = lifecycle_revision + 1,
-                settings = %s,
-                completed_at = COALESCE(completed_at, NOW()),
+                settings = ?,
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
                 duration_seconds = CASE
                     WHEN started_at IS NULL THEN duration_seconds
-                    ELSE GREATEST(0, EXTRACT(EPOCH FROM (COALESCE(completed_at, NOW()) - started_at))::integer)
+                    ELSE MAX(0, CAST(
+                        (julianday(COALESCE(completed_at, CURRENT_TIMESTAMP)) - julianday(started_at)) * 86400
+                        AS INTEGER
+                    ))
                 END,
-                transcript_encrypted = COALESCE(%s, transcript_encrypted),
+                transcript_encrypted = COALESCE(?, transcript_encrypted),
                 full_transcript = CASE
-                    WHEN %s IS NULL THEN full_transcript
-                    ELSE '{"encrypted":true,"captured":true}'::jsonb
+                    WHEN ? IS NULL THEN full_transcript
+                    ELSE '{"encrypted":true,"captured":true}'
                 END,
                 feedback_summary = 'Technical execution complete. Async analysis is queued.'
-            WHERE interview_id = %s
+            WHERE interview_id = ?
             """,
             (
                 json.dumps(settings_payload),
@@ -224,16 +229,16 @@ def _mark_finalize_requested_if_drained_sync(interview_id: str) -> Optional[str]
         )
         cursor.execute(
             """
-            UPDATE TechnicalInterviewRounds round
+            UPDATE TechnicalInterviewRounds AS round
             SET status = CASE
                     WHEN interview.completion_kind = 'deadline' THEN 'expired'
                     ELSE 'completed'
                 END,
-                completed_at = COALESCE(round.completed_at, interview.completed_at, NOW())
+                completed_at = COALESCE(round.completed_at, interview.completed_at, CURRENT_TIMESTAMP)
             FROM Interviews interview
             WHERE round.interview_id = interview.interview_id
               AND round.user_id = interview.user_id
-              AND interview.interview_id = %s
+              AND interview.interview_id = ?
               AND round.status NOT IN ('submitted', 'completed', 'expired', 'cancelled')
             """,
             (interview_id,),
@@ -271,7 +276,7 @@ async def finalize_requested_interview_if_drained(interview_id: str) -> Optional
             UPDATE Interviews
             SET analysis_status = 'failed',
                 feedback_summary = 'Technical execution completed, but analysis could not be queued. It will be retried automatically.'
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
               AND attempt_status = 'completed'
             """,
             (interview_id, user_id),
@@ -279,7 +284,7 @@ async def finalize_requested_interview_if_drained(interview_id: str) -> Optional
         return None
     if job_id:
         await async_execute(
-            "UPDATE Interviews SET analysis_job_id = %s WHERE interview_id = %s AND user_id = %s",
+            "UPDATE Interviews SET analysis_job_id = ? WHERE interview_id = ? AND user_id = ?",
             (job_id, interview_id, user_id),
         )
     else:
@@ -288,7 +293,7 @@ async def finalize_requested_interview_if_drained(interview_id: str) -> Optional
             UPDATE Interviews
             SET analysis_status = 'failed',
                 feedback_summary = 'Technical execution completed, but analysis could not be queued. It will be retried automatically.'
-            WHERE interview_id = %s AND user_id = %s
+            WHERE interview_id = ? AND user_id = ?
               AND attempt_status = 'completed'
             """,
             (interview_id, user_id),
@@ -302,42 +307,37 @@ def claim_execution_job(worker: str) -> Optional[Dict[str, Any]]:
     try:
         cursor.execute(
             """
-            WITH candidate AS (
+            UPDATE TechnicalExecutionJobs
+            SET status = 'leased',
+                lease_owner = ?,
+                lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+                heartbeat_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                error_message = NULL,
+                retry_count = CASE
+                    WHEN status IN ('leased', 'running')
+                    THEN retry_count + 1
+                    ELSE retry_count
+                END
+            WHERE job_id = (
                 SELECT job_id
                 FROM TechnicalExecutionJobs
                 WHERE (
                     status = 'queued'
-                    AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+                    AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP)
                 ) OR (
                     status IN ('leased', 'running')
-                    AND lease_expires_at < NOW()
-                    AND retry_count < %s
+                    AND lease_expires_at < CURRENT_TIMESTAMP
+                    AND retry_count < ?
                 )
                 ORDER BY created_at, job_id
-                FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            UPDATE TechnicalExecutionJobs target
-            SET status = 'leased',
-                lease_owner = %s,
-                lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-                heartbeat_at = NOW(),
-                updated_at = NOW(),
-                error_message = NULL,
-                retry_count = CASE
-                    WHEN target.status IN ('leased', 'running')
-                    THEN target.retry_count + 1
-                    ELSE target.retry_count
-                END
-            FROM candidate
-            WHERE target.job_id = candidate.job_id
-            RETURNING target.job_id, target.idempotency_key, target.user_id,
-                      target.interview_id, target.round_id, target.action,
-                      target.suite, target.language, target.source_code_encrypted,
-                      target.source_hash, target.cases_encrypted,
-                      target.retry_count, target.result_json
+            RETURNING job_id, idempotency_key, user_id, interview_id,
+                      round_id, action, suite, language, source_code_encrypted,
+                      source_hash, cases_encrypted, retry_count, result_json
             """,
-            (MAX_RETRIES, worker, LEASE_SECONDS),
+            (worker, LEASE_SECONDS, MAX_RETRIES),
         )
         row = cursor.fetchone()
         connection.commit()
@@ -373,10 +373,10 @@ def mark_running(job_id: str, worker: str) -> bool:
         cursor.execute(
             """
             UPDATE TechnicalExecutionJobs
-            SET status = 'running', heartbeat_at = NOW(),
-                lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-                updated_at = NOW()
-            WHERE job_id = %s AND lease_owner = %s AND status = 'leased'
+            SET status = 'running', heartbeat_at = CURRENT_TIMESTAMP,
+                lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ? AND lease_owner = ? AND status = 'leased'
             RETURNING job_id
             """,
             (LEASE_SECONDS, job_id, worker),
@@ -399,11 +399,11 @@ def refresh_lease(job_id: str, worker: str, result: Dict[str, Any]) -> bool:
         cursor.execute(
             """
             UPDATE TechnicalExecutionJobs
-            SET heartbeat_at = NOW(),
-                lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
-                result_json = %s,
-                updated_at = NOW()
-            WHERE job_id = %s AND lease_owner = %s AND status = 'running'
+            SET heartbeat_at = CURRENT_TIMESTAMP,
+                lease_expires_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+                result_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ? AND lease_owner = ? AND status = 'running'
             RETURNING job_id
             """,
             (LEASE_SECONDS, json.dumps(result), job_id, worker),
@@ -438,7 +438,7 @@ async def execute_claimed_job(job: Dict[str, Any], worker: str) -> Dict[str, Any
         "pass_count": 0,
         "runtime_ms": 0,
         "memory_kb": 0,
-        "executor": "isolated_sandbox",
+        "executor": "local-sandbox",
     }
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
@@ -446,7 +446,7 @@ async def execute_claimed_job(job: Dict[str, Any], worker: str) -> Dict[str, Any
         execution = await _execute_code(job["language"], source, str(case.get("stdin") or ""))
         hidden = not bool(case.get("visible", index < visible_total))
         has_expected = case.get("expected") is not None
-        verdict = _case_verdict(execution, case) if has_expected else _judge0_verdict(execution)
+        verdict = _case_verdict(execution, case) if has_expected else _execution_verdict(execution)
         passed = verdict == "Accepted"
         if passed and hidden:
             result["hidden_passed"] += 1
@@ -495,10 +495,10 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
         cursor.execute(
             """
             UPDATE TechnicalExecutionJobs
-            SET status = 'completed', result_json = %s, error_message = NULL,
-                completed_at = NOW(), updated_at = NOW(), heartbeat_at = NOW(),
+            SET status = 'completed', result_json = ?, error_message = NULL,
+                completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP,
                 lease_owner = NULL, lease_expires_at = NULL
-            WHERE job_id = %s AND lease_owner = %s AND status = 'running'
+            WHERE job_id = ? AND lease_owner = ? AND status = 'running'
             RETURNING job_id
             """,
             (json.dumps(result), job["job_id"], worker),
@@ -516,8 +516,8 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
                 source_code, source_code_encrypted, code_hash, stdout, stderr, exit_code, error_signature,
                 runtime_ms, metadata, hidden_validation_result
             )
-            VALUES (%s, %s, %s, %s, 0, '[encrypted]', '[encrypted]', %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s)
+            VALUES (?, ?, ?, ?, 0, '[encrypted]', '[encrypted]', ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (run_id) DO NOTHING
             """,
             (
@@ -538,7 +538,7 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
         )
         if job["action"] == "submit":
             cursor.execute(
-                "SELECT COUNT(*) FROM TechnicalSubmissions WHERE round_id = %s AND user_id = %s",
+                "SELECT COUNT(*) FROM TechnicalSubmissions WHERE round_id = ? AND user_id = ?",
                 (job["round_id"], job["user_id"]),
             )
             submit_number = int((cursor.fetchone() or [0])[0] or 0) + 1
@@ -550,8 +550,8 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
                     visible_passed, visible_total, hidden_passed, hidden_total,
                     runtime_ms, memory_kb, status, result_json, execution_job_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, '[encrypted]', '[encrypted]', %s, %s,
-                        %s, %s, %s, %s, %s, %s, 'submitted', %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, '[encrypted]', '[encrypted]', ?, ?,
+                        ?, ?, ?, ?, ?, ?, 'submitted', ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
@@ -573,7 +573,7 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
                 ),
             )
             cursor.execute(
-                "SELECT mode, max_submissions, workflow_state FROM TechnicalInterviewRounds WHERE round_id = %s FOR UPDATE",
+            "SELECT mode, max_submissions, workflow_state FROM TechnicalInterviewRounds WHERE round_id = ?",
                 (job["round_id"],),
             )
             round_policy = cursor.fetchone() or ("mock", 1, {})
@@ -595,8 +595,8 @@ def complete_execution_job(job: Dict[str, Any], worker: str, result: Dict[str, A
             cursor.execute(
                 """
                 UPDATE TechnicalInterviewRounds
-                SET status = %s, workflow_state = %s, completed_at = NULL
-                WHERE round_id = %s
+                SET status = ?, workflow_state = ?, completed_at = NULL
+                WHERE round_id = ?
                 """,
                 ("awaiting_explanation" if terminal else "active", json.dumps(workflow_state), job["round_id"]),
             )
@@ -615,7 +615,7 @@ def fail_execution_job(job: Dict[str, Any], worker: str, error: str) -> str:
     cursor = connection.cursor()
     try:
         cursor.execute(
-            "SELECT retry_count FROM TechnicalExecutionJobs WHERE job_id = %s AND lease_owner = %s FOR UPDATE",
+            "SELECT retry_count FROM TechnicalExecutionJobs WHERE job_id = ? AND lease_owner = ?",
             (job["job_id"], worker),
         )
         row = cursor.fetchone()
@@ -628,11 +628,11 @@ def fail_execution_job(job: Dict[str, Any], worker: str, error: str) -> str:
             cursor.execute(
                 """
                 UPDATE TechnicalExecutionJobs
-                SET status = 'queued', retry_count = %s,
-                    next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
-                    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NOW(),
-                    error_message = %s, updated_at = NOW()
-                WHERE job_id = %s AND lease_owner = %s
+                SET status = 'queued', retry_count = ?,
+                    next_attempt_at = datetime(CURRENT_TIMESTAMP, '+' || CAST(? AS TEXT) || ' seconds'),
+                    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = CURRENT_TIMESTAMP,
+                    error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND lease_owner = ?
                 """,
                 (retry_count, delay_seconds, error[:2000], job["job_id"], worker),
             )
@@ -641,16 +641,16 @@ def fail_execution_job(job: Dict[str, Any], worker: str, error: str) -> str:
             cursor.execute(
                 """
                 UPDATE TechnicalExecutionJobs
-                SET status = 'failed', retry_count = %s, error_message = %s,
-                    completed_at = NOW(), updated_at = NOW(), heartbeat_at = NOW(),
+                SET status = 'failed', retry_count = ?, error_message = ?,
+                    completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP,
                     lease_owner = NULL, lease_expires_at = NULL
-                WHERE job_id = %s AND lease_owner = %s
+                WHERE job_id = ? AND lease_owner = ?
                 """,
                 (retry_count, error[:2000], job["job_id"], worker),
             )
             if job["action"] == "submit":
                 cursor.execute(
-                    "UPDATE TechnicalInterviewRounds SET status = 'active' WHERE round_id = %s AND status = 'submitting'",
+                    "UPDATE TechnicalInterviewRounds SET status = 'active' WHERE round_id = ? AND status = 'submitting'",
                     (job["round_id"],),
                 )
             next_status = "failed"
@@ -674,9 +674,15 @@ async def run_once(worker: str) -> bool:
         result = await execute_claimed_job(job, worker)
         committed = await asyncio.to_thread(complete_execution_job, job, worker, result)
         if not committed:
-            logger.warning("Technical job lease lost before commit: %s", job["job_id"])
+            logger.warning(
+                "Technical job lease lost before commit: %s",
+                stable_hash(job["job_id"], "technical-job"),
+            )
     except Exception as exc:
-        logger.exception("Technical execution job failed: %s", job["job_id"])
+        logger.exception(
+            "Technical execution job failed: %s",
+            stable_hash(job["job_id"], "technical-job"),
+        )
         await asyncio.to_thread(fail_execution_job, job, worker, str(exc))
     finally:
         exhausted = await asyncio.to_thread(
@@ -686,7 +692,10 @@ async def run_once(worker: str) -> bool:
             try:
                 await finalize_requested_interview_if_drained(interview_id)
             except Exception:
-                logger.exception("Deferred technical finalization failed for %s", interview_id)
+                logger.exception(
+                    "Deferred technical finalization failed for %s",
+                    stable_hash(interview_id, "interview"),
+                )
     return True
 
 
@@ -700,7 +709,10 @@ async def serve(worker: str, poll_seconds: float = 0.5, once: bool = False) -> N
                 try:
                     await finalize_requested_interview_if_drained(interview_id)
                 except Exception:
-                    logger.exception("Deferred technical finalization failed for %s", interview_id)
+                    logger.exception(
+                        "Deferred technical finalization failed for %s",
+                        stable_hash(interview_id, "interview"),
+                    )
             last_heartbeat = now
         worked = await run_once(worker)
         if once:

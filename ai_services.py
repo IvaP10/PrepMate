@@ -1,15 +1,14 @@
 # ============================================================================
 # MODULE: ai_services.py
-# PURPOSE: OpenAI STT + Kokoro TTS + LLM-backed response evaluation +
-#          coaching-hint generation. Rate-limited and circuit-broken.
+# PURPOSE: Provider STT + LLM-backed response evaluation and coaching hints.
 # STRUCTURE:
 #   - OpenAI client lazy init
-#   - Process-local rate limiters (lines 49-53)
+#   - Direct provider audio/evaluation helpers
 #   - CircuitBreaker (lines 55+)
-#   - transcribe_audio / generate_speech / evaluate_response_realtime /
+#   - transcribe_audio / evaluate_response_realtime /
 #     generate_coaching_hint (later in file)
 # ENDPOINTS: none (consumed via WS handler in interview.py)
-# DEPENDS ON: config, rate_limiter, llm_router, prompt_security, security_utils
+# DEPENDS ON: config, llm_router, prompt_security, security_utils
 # CONSUMED BY: interview.py, technical_mode.py
 # DATA TABLES: none (telemetry flows through observability.log_ai_event)
 # ============================================================================
@@ -21,11 +20,12 @@ import binascii
 import tempfile
 import uuid as _uuid
 import asyncio
+import hashlib
 from typing import Dict, List, Optional
 from datetime import datetime, timezone
 
 from config import settings
-from rate_limiter import RateLimiter
+from local_runtime import get_local_preferences, get_provider_api_key
 from llm_router import complete_json_async, complete_text_async, chunk_text
 from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
 from security_utils import redact_text
@@ -33,21 +33,29 @@ from security_utils import redact_text
 logger = logging.getLogger("ai_services")
 
 _openai_client = None
+_openai_client_key_fingerprint = ""
 
 
 def _get_openai_client():
-    global _openai_client
-    if _openai_client is None:
-        if not settings.OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is not configured")
+    global _openai_client, _openai_client_key_fingerprint
+    preferences = get_local_preferences()
+    provider = str(preferences.get("provider") or "").strip().lower()
+    if provider != "openai":
+        raise RuntimeError("Audio transcription is available when OpenAI is selected in Settings")
+    api_key = get_provider_api_key(provider)
+    if not api_key:
+        raise RuntimeError("Add the selected provider API key in Settings")
+    fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    if _openai_client is None or fingerprint != _openai_client_key_fingerprint:
         from openai import OpenAI
 
-        _openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        _openai_client = OpenAI(
+            api_key=api_key,
+            timeout=settings.OPENAI_TIMEOUT_SECONDS,
+            max_retries=settings.OPENAI_MAX_RETRIES,
+        )
+        _openai_client_key_fingerprint = fingerprint
     return _openai_client
-
-transcription_limiter = RateLimiter(max_calls=settings.RATE_LIMIT_CALLS, time_window=settings.RATE_LIMIT_WINDOW)
-evaluation_limiter = RateLimiter(max_calls=settings.RATE_LIMIT_CALLS, time_window=settings.RATE_LIMIT_WINDOW)
-speech_limiter = RateLimiter(max_calls=settings.RATE_LIMIT_CALLS, time_window=settings.RATE_LIMIT_WINDOW)
 
 class CircuitBreaker:
     def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
@@ -79,7 +87,6 @@ class CircuitBreaker:
 
 openai_circuit_breaker = CircuitBreaker()
 transcription_circuit_breaker = CircuitBreaker()
-speech_circuit_breaker = CircuitBreaker()
 
 LOW_QUALITY_FLAGS = {"off_topic", "too_short", "vague", "no_evidence"}
 MAX_AUDIO_BYTES = 2 * 1024 * 1024
@@ -157,7 +164,6 @@ def _normalize_evidence_quotes(quotes, response: str) -> List[str]:
     return normalized
 
 async def transcribe_audio(audio_base64: str, mime_type: Optional[str] = None) -> str:
-    await transcription_limiter.acquire()
     if not transcription_circuit_breaker.can_attempt():
         logger.error("Circuit breaker open - transcription unavailable")
         return ""
@@ -192,7 +198,7 @@ async def transcribe_audio(audio_base64: str, mime_type: Optional[str] = None) -
                 )
 
         # The OpenAI client is synchronous. Keep it off the WebSocket event
-        # loop so audio processing cannot freeze timers, TTS, or heartbeats.
+        # loop so audio processing cannot freeze timers or heartbeats.
         transcription = await asyncio.to_thread(_transcribe_file)
 
         transcribed_text = str(transcription.text or "").strip()
@@ -216,34 +222,6 @@ async def transcribe_audio(audio_base64: str, mime_type: Optional[str] = None) -
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
-
-async def generate_speech(text: str) -> str:
-    await speech_limiter.acquire()
-    if not speech_circuit_breaker.can_attempt():
-        logger.error("Circuit breaker open - speech generation unavailable")
-        return ""
-    try:
-        from streaming_tts import synthesize_text_to_base64
-
-        audio_base64 = await asyncio.wait_for(
-            synthesize_text_to_base64(text[:4096]),
-            timeout=max(1, int(getattr(settings, "KOKORO_TIMEOUT_SECONDS", 8))),
-        )
-        if not audio_base64:
-            return ""
-        logger.info("Generated Kokoro speech")
-        speech_circuit_breaker.record_success()
-        return audio_base64
-
-    except asyncio.TimeoutError:
-        logger.warning("Speech generation timed out; continuing without TTS audio")
-        speech_circuit_breaker.record_failure()
-        return ""
-
-    except Exception as e:
-        logger.error("Speech generation failed: %s", redact_text(e))
-        speech_circuit_breaker.record_failure()
-        return ""
 
 async def stream_llm_response(
     messages: list,
@@ -281,7 +259,6 @@ async def evaluate_response_realtime(
     battleground_label: str = "",
     interview_mode: str = "mock"
 ) -> Dict:
-    await evaluation_limiter.acquire()
     if not response or len(response.strip()) < 10:
         return {
             "score": 0,
@@ -518,46 +495,24 @@ def validate_and_adjust_scores(evaluation: Dict, difficulty: str) -> Dict:
     return evaluation
 
 def _fallback_evaluation(response: str, avg_confidence: float = 50, posture: str = "unknown") -> Dict:
-    word_count = len(response.split())
-    sentence_count = len([s for s in response.split('.') if s.strip()])
-    if word_count < 20:
-        base_score = 25
-        feedback = "Response too brief. Provide more detail and reasoning."
-    elif word_count < 50:
-        base_score = 45
-        feedback = "Basic response. Add technical depth and specific examples."
-    elif word_count < 100:
-        base_score = 60
-        feedback = "Good coverage. Consider discussing trade-offs or edge cases."
-    elif word_count < 200:
-        base_score = 70
-        feedback = "Well-detailed response. Minor areas could be expanded."
-    else:
-        base_score = 65
-        feedback = "Very detailed. Ensure all points directly address the question."
-    if sentence_count > 0:
-        words_per_sentence = word_count / sentence_count
-        if words_per_sentence > 30:
-            base_score -= 5
-        elif words_per_sentence < 8:
-            base_score -= 3
+    """Return an explicit no-assessment result when the evaluator is unavailable.
+
+    Text length and camera telemetry are not evidence of correctness.  Keeping
+    the score empty prevents a transient model outage from publishing an
+    authoritative-looking heuristic mark.
+    """
     return {
-        "score": (base_score + avg_confidence) / 2,
-        "feedback": feedback,
-        "scores": {
-            "technical_accuracy": base_score,
-            "communication": base_score,
-            "problem_solving": base_score - 5,
-            "confidence": avg_confidence,
-            "relevance": base_score
-        },
-        "strengths": ["Attempted to answer the question"],
-        "improvements": ["Add more technical depth", "Provide specific examples"],
-        "answer_quality_flags": ["too_short"] if word_count < 20 else (["vague"] if word_count < 50 else []),
+        "score": None,
+        "status": "incomplete",
+        "feedback": "This response could not be assessed because the evaluator was unavailable.",
+        "scores": {},
+        "strengths": [],
+        "improvements": [],
+        "answer_quality_flags": ["insufficient_evidence"],
         "evidence_quotes": [],
         "nonverbal_summary": {
             "avg_confidence": avg_confidence,
-            "eye_contact_percentage": 50,
+            "eye_contact_percentage": None,
             "posture_quality": posture
         }
     }

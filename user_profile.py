@@ -1,42 +1,32 @@
 # ============================================================================
 # MODULE: user_profile.py
-# PURPOSE: Account-level reads/writes — profile, avatar, account info, history,
-#          stats, GDPR export, notification prefs. Mounted under /api/profile.
-# STRUCTURE:
-#   - Pydantic request/response models (lines 25-44)
-#   - Route handlers (lines 46-700)
+# PURPOSE: Local profile, resume-source privacy controls, interview history,
+#          statistics, and portable data export. Mounted under /api/profile.
 # ENDPOINTS (prefix /api/profile):
-#   - GET    /me                    -> get_profile (line 46)
-#   - PUT    /update                -> update_profile (103)
-#   - DELETE /resume                -> wipe resume (157)
-#   - GET    /completion-status     -> profile completion check (194)
-#   - GET    /interview-history     -> list interviews (250)
-#   - GET    /statistics            -> per-user stats (301)
-#   - PUT    /update-account        -> change name/email (356)
-#   - POST   /avatar                -> upload avatar (base64) (405)
-#   - GET    /export-data           -> GDPR export JSON (439)
-#   - DELETE /session-history       -> wipe interviews + responses (546)
-#   - GET    /notification-prefs    -> read JSONB prefs (582)
-#   - PUT    /notification-prefs    -> upsert JSONB prefs (611)
-# DEPENDS ON: auth, database, security_utils
-# CONSUMED BY: app.py, Frontend/lib/api.ts (updateAccountInfo, uploadAvatar,
-#              exportUserData, deleteSessionHistory, getNotificationPrefs,
-#              updateNotificationPrefs), settings tabs in dashboard
-# DATA TABLES: UserInfo (all), Interviews, InterviewResponses (history/export/delete)
+#   - GET    /me                    -> local profile
+#   - PUT    /update                -> update local display/profile fields
+#   - DELETE /resume                -> delete resume sources and setup snapshots
+#   - GET    /completion-status     -> local setup completion check
+#   - GET    /interview-history     -> list local interviews
+#   - GET    /statistics            -> local aggregate statistics
+#   - GET    /export-data           -> portable local JSON export
+#   - DELETE /session-history       -> delete interview-derived history
+# DEPENDS ON: database, local_runtime, security_utils
+# DATA TABLES: UserInfo, ResumeVersions, Interviews, InterviewResponses,
+#              reports, performance analyses, and related local evidence
 # ============================================================================
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
 import logging
 
-from auth import get_current_user
+from local_runtime import local_user
 from database import get_db_connection, return_db_connection
-from entitlements import get_active_subscription_plan_type, get_entitlements_for_user
-from security_utils import stable_hash, encrypt_json, decrypt_json, decrypt_data
+from security_utils import stable_hash, encrypt_json, decrypt_json, decrypt_data, decrypt_json_field
 
 router = APIRouter(tags=["Profile"])
 logger = logging.getLogger("ai_interviewer.profile")
@@ -53,12 +43,14 @@ def _export_value(value: Any) -> Any:
 
 
 _JSON_ENCRYPTED_EXPORT_COLUMNS = {
+    "assessment_json_encrypted",
     "analysis_json_encrypted",
     "blueprint_context_encrypted",
     "evidence_index_encrypted",
     "facts_encrypted",
     "job_context_encrypted",
     "manifest_encrypted",
+    "output_encrypted",
     "output_json_encrypted",
     "payload_encrypted",
     "report_json_encrypted",
@@ -90,7 +82,9 @@ def _export_row(columns: List[str], row: Any) -> Dict[str, Any]:
     exported: Dict[str, Any] = {}
     for column, value in zip(columns, row):
         if column.endswith("_encrypted"):
-            logical_name = column.removesuffix("_encrypted")
+            logical_name = {
+                "output_encrypted": "output_json",
+            }.get(column, column.removesuffix("_encrypted"))
             decoded = _decrypt_export_blob(column, value)
             if decoded is not None or logical_name not in exported:
                 exported[logical_name] = decoded
@@ -104,7 +98,7 @@ def _export_row(columns: List[str], row: Any) -> Dict[str, Any]:
 
 
 def _fetch_user_table_rows(cursor, table_name: str, user_id: str) -> List[Dict[str, Any]]:
-    cursor.execute(f"SELECT * FROM {table_name} WHERE user_id = %s", (user_id,))
+    cursor.execute(f"SELECT * FROM {table_name} WHERE user_id = ?", (user_id,))
     columns = [desc[0] for desc in cursor.description]
     return [_export_row(columns, row) for row in cursor.fetchall()]
 
@@ -115,7 +109,7 @@ def _fetch_interview_table_rows(cursor, table_name: str, user_id: str) -> List[D
         SELECT target.*
         FROM {table_name} target
         JOIN Interviews interview ON interview.interview_id = target.interview_id
-        WHERE interview.user_id = %s
+        WHERE interview.user_id = ?
         """,
         (user_id,),
     )
@@ -130,7 +124,7 @@ def _fetch_weakness_evidence_rows(cursor, user_id: str) -> List[Dict[str, Any]]:
         FROM WeaknessEvidenceLinks link
         JOIN WeaknessStates weakness
           ON weakness.weakness_state_id = link.weakness_state_id
-        WHERE weakness.user_id = %s
+        WHERE weakness.user_id = ?
         """,
         (user_id,),
     )
@@ -144,7 +138,7 @@ def _fetch_analysis_stage_outputs(cursor, user_id: str) -> List[Dict[str, Any]]:
         SELECT aso.*
         FROM AnalysisStageOutputs aso
         JOIN AnalysisJobs aj ON aj.job_id = aso.job_id
-        WHERE aj.user_id = %s
+        WHERE aj.user_id = ?
         """,
         (user_id,),
     )
@@ -172,24 +166,9 @@ class ProfileResponse(BaseModel):
     practice_interview_count: int
     date_created: datetime
 
-@router.get("/entitlements")
-async def get_entitlements(current_user: Dict = Depends(get_current_user)):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        active_plan_type = get_active_subscription_plan_type(
-            cursor,
-            current_user["user_id"],
-            datetime.now(timezone.utc),
-        )
-        return get_entitlements_for_user(cursor, current_user["user_id"], active_plan_type or "starter")
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
 @router.get("/me", response_model=ProfileResponse)
 async def get_profile(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -200,26 +179,36 @@ async def get_profile(
             SELECT 
                 u.user_id,
                 u.full_name,
-                l.email,
-                COALESCE(u.job_id::text, selected_job.profile_id::text),
+                NULL,
+                COALESCE(
+                    CAST(u.job_id AS TEXT),
+                    (
+                        SELECT CAST(profile_id AS TEXT)
+                        FROM JobProfiles
+                        WHERE user_id = u.user_id AND is_selected = TRUE
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT 1
+                    )
+                ),
                 u.resume_json,
                 u.profile_json,
                 u.profile_completed,
                 u.mock_interview_count,
                 u.practice_interview_count,
                 u.date_created,
-                COALESCE(j.title, selected_job.role)
+                COALESCE(
+                    j.title,
+                    (
+                        SELECT role
+                        FROM JobProfiles
+                        WHERE user_id = u.user_id AND is_selected = TRUE
+                        ORDER BY updated_at DESC, created_at DESC
+                        LIMIT 1
+                    )
+                )
             FROM UserInfo u
-            JOIN Login l ON u.user_id = l.user_id
             LEFT JOIN Jobs j ON u.job_id = j.job_id
-            LEFT JOIN LATERAL (
-                SELECT profile_id, role
-                FROM JobProfiles
-                WHERE user_id = u.user_id AND is_selected = TRUE
-                ORDER BY updated_at DESC, created_at DESC
-                LIMIT 1
-            ) selected_job ON TRUE
-            WHERE u.user_id = %s
+            WHERE u.user_id = ?
             """,
             (current_user["user_id"],)
         )
@@ -254,14 +243,14 @@ async def get_profile(
 @router.put("/update")
 async def update_profile(
     request: UpdateProfileRequest,
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
 
     try:
         cursor.execute(
-            "SELECT profile_json FROM UserInfo WHERE user_id = %s",
+            "SELECT profile_json FROM UserInfo WHERE user_id = ?",
             (current_user["user_id"],)
         )
 
@@ -276,9 +265,9 @@ async def update_profile(
         cursor.execute(
             """
             UPDATE UserInfo
-            SET profile_json = %s,
-                full_name = COALESCE(%s, full_name)
-            WHERE user_id = %s
+            SET profile_json = ?,
+                full_name = COALESCE(?, full_name)
+            WHERE user_id = ?
             """,
             (
                 json.dumps(encrypt_json(existing_profile)),
@@ -307,27 +296,189 @@ async def update_profile(
         cursor.close()
         return_db_connection(connection)
 
+_RESUME_SOURCE_TERMINAL_STATUSES = {
+    "cancelled",
+    "completed",
+    "ended",
+    "expired",
+    "no_evidence",
+    "partial",
+    "partial_report",
+    "report_ready",
+}
+
+
+def delete_resume_sources(cursor: Any, *, user_id: str, resume_id: str | None = None) -> Dict[str, int]:
+    """Remove source resumes and setup snapshots while retaining past reports.
+
+    The caller must hold a write transaction. Active or analyzing interviews
+    keep their immutable resume context, so deletion fails clearly instead of
+    corrupting an attempt that could still publish or retry a report.
+    """
+    terminal_placeholders = ", ".join("?" for _ in _RESUME_SOURCE_TERMINAL_STATUSES)
+    terminal_values = tuple(sorted(_RESUME_SOURCE_TERMINAL_STATUSES))
+    scope_sql = ""
+    scope_params: tuple[Any, ...] = ()
+    if resume_id is not None:
+        scope_sql = """
+          AND (
+              interview.resume_id = ?
+              OR interview.context_snapshot_id IN (
+                  SELECT snapshot_id FROM AttemptContextSnapshots
+                  WHERE user_id = ? AND resume_id = ?
+              )
+              OR interview.blueprint_id IN (
+                  SELECT blueprint_id FROM InterviewBlueprints
+                  WHERE user_id = ? AND resume_id = ?
+              )
+          )
+        """
+        scope_params = (resume_id, user_id, resume_id, user_id, resume_id)
+    cursor.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM Interviews interview
+        WHERE interview.user_id = ?
+          AND LOWER(COALESCE(interview.status, '')) NOT IN ({terminal_placeholders})
+          {scope_sql}
+        """,
+        (user_id, *terminal_values, *scope_params),
+    )
+    if int((cursor.fetchone() or [0])[0] or 0):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Finish or cancel the active interview before deleting its resume.",
+        )
+
+    processing_params: tuple[Any, ...] = (user_id,)
+    processing_scope = ""
+    if resume_id is not None:
+        processing_scope = """
+          AND content_hash = (
+              SELECT content_hash FROM ResumeVersions
+              WHERE user_id = ? AND resume_id = ?
+          )
+        """
+        processing_params = (user_id, user_id, resume_id)
+    cursor.execute(
+        f"""
+        SELECT COUNT(*) FROM ResumeProcessingJobs
+        WHERE user_id = ? AND status = 'processing' {processing_scope}
+        """,
+        processing_params,
+    )
+    if int((cursor.fetchone() or [0])[0] or 0):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Wait for the active resume import to finish before deleting resume data.",
+        )
+
+    counts: Dict[str, int] = {}
+
+    def execute_count(label: str, query: str, params: tuple[Any, ...]) -> None:
+        cursor.execute(query, params)
+        counts[label] = max(int(cursor.rowcount or 0), 0)
+
+    if resume_id is None:
+        execute_count(
+            "interviews_detached",
+            """
+            UPDATE Interviews
+            SET resume_id = NULL, blueprint_id = NULL, context_snapshot_id = NULL
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        execute_count(
+            "attempt_context_snapshots",
+            "DELETE FROM AttemptContextSnapshots WHERE user_id = ?",
+            (user_id,),
+        )
+        execute_count(
+            "interview_blueprints",
+            "DELETE FROM InterviewBlueprints WHERE user_id = ?",
+            (user_id,),
+        )
+        execute_count(
+            "resume_processing_jobs",
+            "DELETE FROM ResumeProcessingJobs WHERE user_id = ?",
+            (user_id,),
+        )
+        execute_count(
+            "resume_versions",
+            "DELETE FROM ResumeVersions WHERE user_id = ?",
+            (user_id,),
+        )
+        execute_count(
+            "resume_upload_logs",
+            "DELETE FROM ResumeUploadLogs WHERE user_id = ?",
+            (user_id,),
+        )
+        return counts
+
+    execute_count(
+        "interviews_detached",
+        """
+        UPDATE Interviews
+        SET resume_id = NULL, blueprint_id = NULL, context_snapshot_id = NULL
+        WHERE user_id = ?
+          AND (
+              resume_id = ?
+              OR context_snapshot_id IN (
+                  SELECT snapshot_id FROM AttemptContextSnapshots
+                  WHERE user_id = ? AND resume_id = ?
+              )
+              OR blueprint_id IN (
+                  SELECT blueprint_id FROM InterviewBlueprints
+                  WHERE user_id = ? AND resume_id = ?
+              )
+          )
+        """,
+        (user_id, resume_id, user_id, resume_id, user_id, resume_id),
+    )
+    execute_count(
+        "attempt_context_snapshots",
+        "DELETE FROM AttemptContextSnapshots WHERE user_id = ? AND resume_id = ?",
+        (user_id, resume_id),
+    )
+    execute_count(
+        "interview_blueprints",
+        "DELETE FROM InterviewBlueprints WHERE user_id = ? AND resume_id = ?",
+        (user_id, resume_id),
+    )
+    execute_count(
+        "resume_versions",
+        "DELETE FROM ResumeVersions WHERE user_id = ? AND resume_id = ?",
+        (user_id, resume_id),
+    )
+    return counts
+
+
 @router.delete("/resume")
 async def delete_resume(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
 
     try:
-        cursor.execute(
-            "DELETE FROM ResumeVersions WHERE user_id = %s",
-            (current_user["user_id"],),
+        cursor.execute("BEGIN IMMEDIATE")
+        deleted_counts = delete_resume_sources(
+            cursor,
+            user_id=current_user["user_id"],
         )
         cursor.execute(
             """
             UPDATE UserInfo
-            SET resume_json = NULL,
-                resume_text_encrypted = NULL,
+            SET full_name = 'Local user',
+                resume_json = NULL,
+                profile_json = NULL,
                 resume_uploaded_at = NULL,
                 active_resume_id = NULL,
-                profile_completed = FALSE
-            WHERE user_id = %s
+                profile_completed = FALSE,
+                job_id = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
             """,
             (current_user["user_id"],)
         )
@@ -337,9 +488,13 @@ async def delete_resume(
 
         return {
             "message": "Resume versions removed successfully",
-            "retained_history": "Past interview evidence remains available after the resume references are detached.",
+            "retained_history": "Past interview reports and session evidence remain available after source resume snapshots are removed.",
+            "deleted_counts": deleted_counts,
         }
 
+    except HTTPException:
+        connection.rollback()
+        raise
     except Exception:
         connection.rollback()
         logger.error("Failed to delete resume")
@@ -354,7 +509,7 @@ async def delete_resume(
 
 @router.get("/completion-status")
 async def get_completion_status(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -376,7 +531,7 @@ async def get_completion_status(
                     WHERE user_id = UserInfo.user_id AND is_selected = TRUE
                 ) AS has_selected_job_profile
             FROM UserInfo
-            WHERE user_id = %s
+            WHERE user_id = ?
             """,
             (current_user["user_id"],)
         )
@@ -418,7 +573,7 @@ async def get_completion_status(
 
 @router.get("/interview-history")
 async def get_interview_history(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -436,7 +591,7 @@ async def get_interview_history(
                 created_at,
                 completed_at
             FROM Interviews
-            WHERE user_id = %s
+            WHERE user_id = ?
             ORDER BY created_at DESC
             LIMIT 50
             """,
@@ -469,7 +624,7 @@ async def get_interview_history(
 
 @router.get("/statistics")
 async def get_statistics(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -481,7 +636,7 @@ async def get_statistics(
                 mock_interview_count,
                 practice_interview_count
             FROM UserInfo
-            WHERE user_id = %s
+            WHERE user_id = ?
             """,
             (current_user["user_id"],)
         )
@@ -496,7 +651,7 @@ async def get_statistics(
                 AVG(overall_score) as avg_score,
                 COUNT(*) as completed_count
             FROM Interviews
-            WHERE user_id = %s
+            WHERE user_id = ?
             AND overall_score IS NOT NULL
             """,
             (current_user["user_id"],)
@@ -518,106 +673,19 @@ async def get_statistics(
         cursor.close()
         return_db_connection(connection)
 
-class UpdateAccountRequest(BaseModel):
-    full_name: Optional[str] = None
-    email: Optional[str] = None
-
-@router.put("/update-account")
-async def update_account(
-    request: UpdateAccountRequest,
-    current_user: Dict = Depends(get_current_user)
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        if request.email:
-            cursor.execute(
-                "SELECT user_id FROM Login WHERE email = %s AND user_id != %s",
-                (request.email.lower().strip(), current_user["user_id"])
-            )
-            if cursor.fetchone():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Email is already in use by another account"
-                )
-
-        if request.full_name:
-            cursor.execute(
-                "UPDATE UserInfo SET full_name = %s WHERE user_id = %s",
-                (request.full_name.strip(), current_user["user_id"])
-            )
-
-        if request.email:
-            cursor.execute(
-                "UPDATE Login SET email = %s WHERE user_id = %s",
-                (request.email.lower().strip(), current_user["user_id"])
-            )
-
-        connection.commit()
-        return {"message": "Account updated successfully"}
-    except HTTPException:
-        raise
-    except Exception:
-        connection.rollback()
-        logger.error("Failed to update account")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update account"
-        )
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-class AvatarRequest(BaseModel):
-    avatar_data: str
-
-@router.post("/avatar")
-async def upload_avatar(
-    request: AvatarRequest,
-    current_user: Dict = Depends(get_current_user)
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        data = request.avatar_data
-        if len(data) > 1_400_000:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Image is too large. Please use an image under 1 MB."
-            )
-
-        cursor.execute(
-            "UPDATE UserInfo SET avatar_url = %s WHERE user_id = %s",
-            (data, current_user["user_id"])
-        )
-        connection.commit()
-        return {"message": "Avatar updated", "avatar_url": data}
-    except HTTPException:
-        raise
-    except Exception:
-        connection.rollback()
-        logger.error("Failed to upload avatar")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to upload avatar"
-        )
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
 @router.get("/export-data")
 async def export_data(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
         cursor.execute(
-            """SELECT u.full_name, l.email, u.resume_json, u.profile_json,
+            """SELECT u.full_name, NULL, u.resume_json, u.profile_json,
                       u.mock_interview_count, u.practice_interview_count,
                       u.date_created
-               FROM UserInfo u JOIN Login l ON u.user_id = l.user_id
-               WHERE u.user_id = %s""",
+               FROM UserInfo u
+               WHERE u.user_id = ?""",
             (current_user["user_id"],)
         )
         profile_row = cursor.fetchone()
@@ -627,8 +695,9 @@ async def export_data(
                       strictness_level, status, overall_score, feedback_summary,
                       report_json, duration_seconds, full_transcript,
                       created_at, completed_at, report_json_encrypted,
-                      transcript_encrypted
-               FROM Interviews WHERE user_id = %s ORDER BY created_at DESC""",
+                      transcript_encrypted, questions_data,
+                      questions_data_encrypted
+               FROM Interviews WHERE user_id = ? ORDER BY created_at DESC""",
             (current_user["user_id"],)
         )
         interview_rows = cursor.fetchall()
@@ -641,7 +710,7 @@ async def export_data(
                           expected_points, rubric_json, selection_reason,
                           blueprint_section_id, provenance, profile_type,
                           rubric_version, source
-                   FROM InterviewQuestions WHERE interview_id = %s ORDER BY question_order""",
+                   FROM InterviewQuestions WHERE interview_id = ? ORDER BY question_order""",
                 (row[0],)
             )
             question_columns = [desc[0] for desc in cursor.description]
@@ -661,7 +730,7 @@ async def export_data(
                           communication, problem_solving, confidence, relevance,
                           answer_text_encrypted, transcript_encrypted,
                           input_mode, timing_json, evidence_hash
-                   FROM InterviewResponses WHERE interview_id = %s""",
+                   FROM InterviewResponses WHERE interview_id = ?""",
                 (row[0],)
             )
             responses = []
@@ -691,6 +760,7 @@ async def export_data(
             transcript = _decrypt_export_blob("transcript_encrypted", row[14])
             if transcript is None:
                 transcript = decrypt_json(row[10])
+            question_plan = decrypt_json_field(row[16], row[15], {})
 
             interviews.append({
                 "interview_id": row[0], "mode": row[1], "type": row[2],
@@ -699,9 +769,10 @@ async def export_data(
                 "feedback_summary": row[7],
                 "report": report,
                 "transcript": transcript,
+                "question_plan": question_plan,
                 "duration_seconds": row[9],
-                "created_at": row[11].isoformat() if row[11] else None,
-                "completed_at": row[12].isoformat() if row[12] else None,
+                "created_at": _export_value(row[11]),
+                "completed_at": _export_value(row[12]),
                 "questions": questions,
                 "responses": responses,
             })
@@ -709,8 +780,6 @@ async def export_data(
         job_profiles = _fetch_user_table_rows(cursor, "JobProfiles", current_user["user_id"])
 
         user_owned_tables = {
-            "ai_event_logs": "AIEventLogs",
-            "local_model_inference_logs": "LocalModelInferenceLogs",
             "learner_skill_states": "LearnerSkillStates",
             "skill_evidence_events": "SkillEvidenceEvents",
             "project_knowledge_gaps": "ProjectKnowledgeGaps",
@@ -721,8 +790,8 @@ async def export_data(
             "technical_run_events": "TechnicalRunEvents",
             "technical_mistake_clusters": "TechnicalMistakeClusters",
             "client_body_language_metrics": "ClientBodyLanguageMetrics",
-            "anti_cheat_events": "AntiCheatEvents",
-            "malpractice_events": "MalpracticeEvents",
+            "self_review_signals": "SelfReviewEvents",
+            "legacy_self_review_events": "SessionReviewEvents",
             "interview_media_assets": "InterviewMediaAssets",
             "analysis_jobs": "AnalysisJobs",
             "attempt_preflight_checks": "AttemptPreflightChecks",
@@ -737,7 +806,6 @@ async def export_data(
             "weakness_states": "WeaknessStates",
             "technical_execution_jobs": "TechnicalExecutionJobs",
             "technical_reasoning_evidence": "TechnicalReasoningEvidence",
-            "ai_usage_reservations": "AIUsageReservations",
             "improvement_missions": "ImprovementMissions",
             "improvement_mission_skills": "ImprovementMissionSkills",
             "improvement_roadmap_nodes": "ImprovementRoadmapNodes",
@@ -747,11 +815,8 @@ async def export_data(
             "technical_code_snapshots": "TechnicalCodeSnapshots",
             "technical_submissions": "TechnicalSubmissions",
             "technical_telemetry_events": "TechnicalTelemetryEvents",
-            "proctoring_flags": "ProctoringFlags",
-            "subscriptions": "Subscriptions",
-            "transactions": "Transactions",
+            "self_review_media_signals": "MediaCoachingSignals",
             "resume_upload_logs": "ResumeUploadLogs",
-            "support_submissions": "SupportSubmissions",
         }
         derived_data = {
             export_key: _fetch_user_table_rows(cursor, table_name, current_user["user_id"])
@@ -766,9 +831,6 @@ async def export_data(
         derived_data["response_assessments"] = _fetch_interview_table_rows(
             cursor, "ResponseAssessments", current_user["user_id"]
         )
-        derived_data["question_validation_results"] = _fetch_interview_table_rows(
-            cursor, "QuestionValidationResults", current_user["user_id"]
-        )
         derived_data["weakness_evidence_links"] = _fetch_weakness_evidence_rows(
             cursor, current_user["user_id"]
         )
@@ -782,7 +844,7 @@ async def export_data(
                 "profile_json": decrypt_json(profile_row[3]) if profile_row else None,
                 "mock_interview_count": profile_row[4] if profile_row else 0,
                 "practice_interview_count": profile_row[5] if profile_row else 0,
-                "date_created": profile_row[6].isoformat() if profile_row and profile_row[6] else None,
+                "date_created": _export_value(profile_row[6]) if profile_row else None,
             },
             "interviews": interviews,
             "job_profiles": job_profiles,
@@ -802,7 +864,7 @@ async def export_data(
 
 @router.delete("/session-history")
 async def delete_session_history(
-    current_user: Dict = Depends(get_current_user)
+    current_user: Dict = Depends(local_user)
 ):
     connection = get_db_connection()
     cursor = connection.cursor()
@@ -814,58 +876,56 @@ async def delete_session_history(
         deleted_counts[label] = max(cursor.rowcount or 0, 0)
 
     try:
-        cursor.execute("SELECT COUNT(*) FROM Interviews WHERE user_id = %s", (user_id,))
+        cursor.execute("SELECT COUNT(*) FROM Interviews WHERE user_id = ?", (user_id,))
         interview_count = int((cursor.fetchone() or [0])[0] or 0)
 
-        # Delete the complete session-derived graph. PostgreSQL cascades cover
-        # most interview children, while these explicit deletes also remove
+        # Delete the complete session-derived graph. SQLite cascades cover most
+        # interview children, while these explicit deletes also remove
         # learning state that intentionally survives an individual interview.
-        _delete("improvement_attempt_sessions", "DELETE FROM ImprovementAttemptSessions WHERE user_id = %s")
-        _delete("mission_validation_evidence", "DELETE FROM MissionValidationEvidence WHERE user_id = %s")
-        _delete("improvement_mission_events", "DELETE FROM ImprovementMissionEvents WHERE user_id = %s")
-        _delete("improvement_roadmap_nodes", "DELETE FROM ImprovementRoadmapNodes WHERE user_id = %s")
-        _delete("improvement_mission_skills", "DELETE FROM ImprovementMissionSkills WHERE user_id = %s")
-        _delete("improvement_missions", "DELETE FROM ImprovementMissions WHERE user_id = %s")
-        _delete("ai_event_logs", "DELETE FROM AIEventLogs WHERE user_id = %s")
-        _delete("local_model_inference_logs", "DELETE FROM LocalModelInferenceLogs WHERE user_id = %s")
-        _delete("exercise_attempts", "DELETE FROM ExerciseAttempts WHERE user_id = %s")
-        _delete("generated_exercises", "DELETE FROM GeneratedExercises WHERE user_id = %s")
-        _delete("coach_exercises", "DELETE FROM CoachExercises WHERE user_id = %s")
+        _delete("improvement_attempt_sessions", "DELETE FROM ImprovementAttemptSessions WHERE user_id = ?")
+        _delete("mission_validation_evidence", "DELETE FROM MissionValidationEvidence WHERE user_id = ?")
+        _delete("improvement_mission_events", "DELETE FROM ImprovementMissionEvents WHERE user_id = ?")
+        _delete("improvement_roadmap_nodes", "DELETE FROM ImprovementRoadmapNodes WHERE user_id = ?")
+        _delete("improvement_mission_skills", "DELETE FROM ImprovementMissionSkills WHERE user_id = ?")
+        _delete("improvement_missions", "DELETE FROM ImprovementMissions WHERE user_id = ?")
+        _delete("exercise_attempts", "DELETE FROM ExerciseAttempts WHERE user_id = ?")
+        _delete("generated_exercises", "DELETE FROM GeneratedExercises WHERE user_id = ?")
+        _delete("coach_exercises", "DELETE FROM CoachExercises WHERE user_id = ?")
         _delete(
             "weakness_evidence_links",
             """DELETE FROM WeaknessEvidenceLinks
                WHERE weakness_state_id IN (
-                   SELECT weakness_state_id FROM WeaknessStates WHERE user_id = %s
+                   SELECT weakness_state_id FROM WeaknessStates WHERE user_id = ?
                )""",
         )
-        _delete("weakness_states", "DELETE FROM WeaknessStates WHERE user_id = %s")
-        _delete("skill_evidence_events", "DELETE FROM SkillEvidenceEvents WHERE user_id = %s")
-        _delete("learner_skill_states", "DELETE FROM LearnerSkillStates WHERE user_id = %s")
-        _delete("project_knowledge_gaps", "DELETE FROM ProjectKnowledgeGaps WHERE user_id = %s")
-        _delete("technical_mistake_clusters", "DELETE FROM TechnicalMistakeClusters WHERE user_id = %s")
-        _delete("technical_telemetry_events", "DELETE FROM TechnicalTelemetryEvents WHERE user_id = %s")
-        _delete("technical_reasoning_evidence", "DELETE FROM TechnicalReasoningEvidence WHERE user_id = %s")
-        _delete("technical_execution_jobs", "DELETE FROM TechnicalExecutionJobs WHERE user_id = %s")
-        _delete("technical_submissions", "DELETE FROM TechnicalSubmissions WHERE user_id = %s")
-        _delete("technical_run_events", "DELETE FROM TechnicalRunEvents WHERE user_id = %s")
-        _delete("technical_code_snapshots", "DELETE FROM TechnicalCodeSnapshots WHERE user_id = %s")
-        _delete("technical_rounds", "DELETE FROM TechnicalInterviewRounds WHERE user_id = %s")
-        _delete("report_artifacts", "DELETE FROM ReportArtifacts WHERE user_id = %s")
+        _delete("weakness_states", "DELETE FROM WeaknessStates WHERE user_id = ?")
+        _delete("skill_evidence_events", "DELETE FROM SkillEvidenceEvents WHERE user_id = ?")
+        _delete("learner_skill_states", "DELETE FROM LearnerSkillStates WHERE user_id = ?")
+        _delete("project_knowledge_gaps", "DELETE FROM ProjectKnowledgeGaps WHERE user_id = ?")
+        _delete("technical_mistake_clusters", "DELETE FROM TechnicalMistakeClusters WHERE user_id = ?")
+        _delete("technical_telemetry_events", "DELETE FROM TechnicalTelemetryEvents WHERE user_id = ?")
+        _delete("technical_reasoning_evidence", "DELETE FROM TechnicalReasoningEvidence WHERE user_id = ?")
+        _delete("technical_execution_jobs", "DELETE FROM TechnicalExecutionJobs WHERE user_id = ?")
+        _delete("technical_submissions", "DELETE FROM TechnicalSubmissions WHERE user_id = ?")
+        _delete("technical_run_events", "DELETE FROM TechnicalRunEvents WHERE user_id = ?")
+        _delete("technical_code_snapshots", "DELETE FROM TechnicalCodeSnapshots WHERE user_id = ?")
+        _delete("technical_rounds", "DELETE FROM TechnicalInterviewRounds WHERE user_id = ?")
+        _delete("report_artifacts", "DELETE FROM ReportArtifacts WHERE user_id = ?")
         _delete(
             "analysis_stage_outputs",
             """DELETE FROM AnalysisStageOutputs
-               WHERE job_id IN (SELECT job_id FROM AnalysisJobs WHERE user_id = %s)""",
+               WHERE job_id IN (SELECT job_id FROM AnalysisJobs WHERE user_id = ?)""",
         )
-        _delete("analysis_jobs", "DELETE FROM AnalysisJobs WHERE user_id = %s")
-        _delete("interview_media_assets", "DELETE FROM InterviewMediaAssets WHERE user_id = %s")
-        _delete("interviews", "DELETE FROM Interviews WHERE user_id = %s")
-        _delete("interview_blueprints", "DELETE FROM InterviewBlueprints WHERE user_id = %s")
+        _delete("analysis_jobs", "DELETE FROM AnalysisJobs WHERE user_id = ?")
+        _delete("interview_media_assets", "DELETE FROM InterviewMediaAssets WHERE user_id = ?")
+        _delete("interviews", "DELETE FROM Interviews WHERE user_id = ?")
+        _delete("interview_blueprints", "DELETE FROM InterviewBlueprints WHERE user_id = ?")
         cursor.execute(
             """
             UPDATE UserInfo
             SET mock_interview_count = 0,
                 practice_interview_count = 0
-            WHERE user_id = %s
+            WHERE user_id = ?
             """,
             (user_id,),
         )
@@ -881,98 +941,6 @@ async def delete_session_history(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete session history",
-        )
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-@router.get("/notification-prefs")
-async def get_notification_prefs(
-    current_user: Dict = Depends(get_current_user)
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "SELECT notification_prefs FROM UserInfo WHERE user_id = %s",
-            (current_user["user_id"],)
-        )
-        row = cursor.fetchone()
-        prefs = row[0] if row and row[0] else {}
-        return {
-            "inactive_reminder_days": prefs.get("inactive_reminder_days"),
-            "target_date": prefs.get("target_date"),
-            "weekly_summary": prefs.get("weekly_summary", False),
-            "streak_reminder": prefs.get("streak_reminder", False),
-        }
-    finally:
-        cursor.close()
-        return_db_connection(connection)
-
-class NotificationPrefsRequest(BaseModel):
-    inactive_reminder_days: Optional[int] = None
-    target_date: Optional[str] = None
-    weekly_summary: bool = False
-    streak_reminder: bool = False
-
-    @field_validator("inactive_reminder_days")
-    @classmethod
-    def validate_inactive_days(cls, value):
-        if value is not None and value not in {3, 5, 7, 14}:
-            raise ValueError("Inactive reminder days must be one of: 3, 5, 7, 14")
-        return value
-
-    @field_validator("target_date")
-    @classmethod
-    def validate_target_date(cls, value):
-        if value is None:
-            return None
-        value = value.strip()
-        if not value:
-            return None
-        try:
-            datetime.strptime(value, "%Y-%m-%d")
-        except ValueError as exc:
-            raise ValueError("Target date must use YYYY-MM-DD format") from exc
-        return value
-
-@router.put("/notification-prefs")
-async def update_notification_prefs(
-    request: NotificationPrefsRequest,
-    current_user: Dict = Depends(get_current_user)
-):
-    connection = get_db_connection()
-    cursor = connection.cursor()
-    try:
-        cursor.execute(
-            "SELECT notification_prefs FROM UserInfo WHERE user_id = %s",
-            (current_user["user_id"],)
-        )
-        row = cursor.fetchone()
-        existing_prefs = row[0] if row and row[0] else {}
-        if isinstance(existing_prefs, str):
-            existing_prefs = json.loads(existing_prefs)
-        if not isinstance(existing_prefs, dict):
-            existing_prefs = {}
-
-        prefs_data = request.model_dump()
-        sent_metadata = existing_prefs.get("_sent")
-        if isinstance(sent_metadata, dict):
-            prefs_data["_sent"] = sent_metadata
-
-        prefs = json.dumps(prefs_data)
-        cursor.execute(
-            "UPDATE UserInfo SET notification_prefs = %s WHERE user_id = %s",
-            (prefs, current_user["user_id"])
-        )
-        connection.commit()
-        return {"message": "Notification preferences saved"}
-    except Exception:
-        connection.rollback()
-        logger.error("Failed to update notification prefs")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update notification preferences"
         )
     finally:
         cursor.close()

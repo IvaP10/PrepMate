@@ -1,41 +1,12 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-
-fastapi
-uvicorn[standard]
-python-dotenv
-psycopg2-binary
-SQLAlchemy>=2.0
-alembic>=1.13
-bcrypt
-PyJWT
-pydantic
-python-multipart
-google-auth
-razorpay
-redis
-openai
-pymupdf
-paddlepaddle==3.2.2; python_version < "3.14"
-paddleocr>=3.0.0,<4
-spacy>=3.8,<4
-python-docx
-numpy
-cryptography
-websockets
-aiohttp>=3.13.4
-requests>=2.33.0
-Pygments>=2.20.0
-torch==2.13.0+cpu; sys_platform == "linux"
-torch==2.13.0; sys_platform != "linux"
-kokoro==0.9.4
-soundfile
-sentry-sdk[fastapi]
-httpx>=0.28.1
-prometheus-client
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-exporter-otlp-proto-http
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-httpx
-opentelemetry-instrumentation-psycopg2
-opentelemetry-instrumentation-redis
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+python-multipart==0.0.32
+openai==2.15.0
+pypdfium2==4.30.0
+python-docx==1.2.0
+httpx==0.28.1
+keyring==25.7.0
+cryptography==50.0.0
+jsonschema==4.26.0

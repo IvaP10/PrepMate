@@ -1,8 +1,0 @@
-[
-  {
-    "cookie": "interai_session=DISPOSABLE_SESSION; csrf_token=DISPOSABLE_CSRF",
-    "csrf_token": "DISPOSABLE_CSRF",
-    "interview_id": "DISPOSABLE_ACTIVE_INTERVIEW_ID",
-    "client_session_id": "DISPOSABLE_UNIQUE_CLIENT_SESSION_ID"
-  }
-]

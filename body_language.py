@@ -38,7 +38,7 @@ def normalize_client_metrics(payload: Dict[str, Any], interview_mode: str = "moc
         "posture": posture,
         "engagement": confidence,
         "fidget_level": fidget_level,
-        "analysis_method": "browser_mediapipe",
+        "analysis_method": "browser_local_camera_coaching",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "feedback": feedback,
     }

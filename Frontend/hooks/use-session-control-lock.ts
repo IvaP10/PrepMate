@@ -23,7 +23,7 @@ export function useSessionControlLock(sessionId: string): SessionControlLockStat
     let releaseNavigatorLock: (() => void) | null = null
     let heartbeat: ReturnType<typeof setInterval> | null = null
     let retryTimer: ReturnType<typeof setInterval> | null = null
-    const lockName = `interai-session-control:${sessionId}`
+    const lockName = `prepmate-session-control:${sessionId}`
     const lockManager = (navigator as Navigator & { locks?: LockManager }).locks
 
     const holdNavigatorLock = async () => {
@@ -49,7 +49,7 @@ export function useSessionControlLock(sessionId: string): SessionControlLockStat
       })
     }
 
-    const storageKey = `interai-session-control:${sessionId}`
+    const storageKey = `prepmate-session-control:${sessionId}`
     const owner = ownerRef.current
     const readLease = () => {
       try {

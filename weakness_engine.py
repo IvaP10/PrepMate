@@ -145,6 +145,33 @@ def _safe_skill_key(value: Any) -> str:
     return (text or "general")[:160]
 
 
+def _observation_summary(observation: Dict[str, Any], skill_key: str) -> str:
+    """Describe the report-backed problem instead of exposing a taxonomy guess."""
+    flags = {
+        str(value).lower().replace("_", "-")
+        for value in observation.get("flags", [])
+    }
+    question = str(observation.get("question") or "").strip()
+    prefix = f"For “{question}”, " if question else "The report found that "
+    problems: List[str] = []
+    if flags.intersection({"rambling", "late-direct-answer", "weak-structure", "missing-structure", "indirect-response", "low-lexical-relevance"}):
+        problems.append("the answer did not lead with a direct, well-structured response")
+    if flags.intersection({"no-evidence", "unsupported-claim", "unsupported-or-unspecific", "missing-ownership", "ownership-unclear"}):
+        problems.append("it did not support the claim with a concrete action, result, or example")
+    if flags.intersection({"missing-metric", "no-metric"}):
+        problems.append("it did not include a measurable result")
+    if flags.intersection({"missing-tradeoff", "missing-complexity", "missing-explanation"}):
+        problems.append("the reasoning or trade-off was incomplete")
+    if problems:
+        return prefix + "; and ".join(problems) + "."
+
+    score = _number(observation.get("score"))
+    label = str(observation.get("topic") or skill_key.split(":", 1)[-1]).replace("-", " ").strip().title()
+    if score is not None:
+        return f"The report scored {label or 'this skill'} at {round(score)}%, below the practice threshold."
+    return f"The report recorded a specific weakness in {label or 'this answer'}."
+
+
 def _persist_sync(
     user_id: str,
     analysis_id: str,
@@ -155,6 +182,7 @@ def _persist_sync(
     cursor = conn.cursor()
     updated: List[Dict[str, Any]] = []
     try:
+        cursor.execute("BEGIN IMMEDIATE")
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for observation in observations:
             score = _number(observation.get("score"))
@@ -164,14 +192,12 @@ def _persist_sync(
             grouped.setdefault(skill_key, []).append({**observation, "score": score})
 
         for skill_key, current in grouped.items():
-            cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"weakness:{user_id}:{skill_key}",))
             cursor.execute(
                 """
                 SELECT weakness_state_id
                 FROM WeaknessStates
-                WHERE user_id = %s AND skill_key = %s
-                  AND taxonomy_version = %s AND rubric_version = %s
-                FOR UPDATE
+                WHERE user_id = ? AND skill_key = ?
+                  AND taxonomy_version = ? AND rubric_version = ?
                 """,
                 (user_id, skill_key, TAXONOMY_VERSION, RUBRIC_VERSION),
             )
@@ -186,7 +212,7 @@ def _persist_sync(
                         weakness_state_id, user_id, skill_key, taxonomy_version,
                         rubric_version, lifecycle_state, observation_count,
                         session_count, confidence, evidence_summary
-                    ) VALUES (%s, %s, %s, %s, %s, 'new', 0, 0, 0, '{}'::jsonb)
+                    ) VALUES (?, ?, ?, ?, ?, 'new', 0, 0, 0, '{}')
                     """,
                     (state_id, user_id, skill_key, TAXONOMY_VERSION, RUBRIC_VERSION),
                 )
@@ -205,7 +231,7 @@ def _persist_sync(
                     INSERT INTO WeaknessEvidenceLinks (
                         link_id, weakness_state_id, analysis_id, response_id,
                         round_id, score, confidence, evidence_json
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (link_id) DO NOTHING
                     """,
                     (
@@ -222,7 +248,7 @@ def _persist_sync(
                        spa.interview_id
                 FROM WeaknessEvidenceLinks wel
                 JOIN SessionPerformanceAnalyses spa ON spa.analysis_id = wel.analysis_id
-                WHERE wel.weakness_state_id = %s
+                WHERE wel.weakness_state_id = ?
                 ORDER BY wel.created_at, wel.link_id
                 """,
                 (state_id,),
@@ -245,23 +271,36 @@ def _persist_sync(
                 "latest_two_average": lifecycle.get("latest_two_average"),
                 "supporting_analysis_ids": list(dict.fromkeys(str(item["analysis_id"]) for item in history))[-5:],
             }
+            latest_negative = next(
+                (item for item in reversed(history) if float(item.get("score") or 0) < 75),
+                history[-1] if history else {},
+            )
+            if latest_negative:
+                summary["summary"] = _observation_summary(latest_negative, skill_key)
+                summary["latest_evidence"] = {
+                    "analysis_id": latest_negative.get("analysis_id"),
+                    "response_id": latest_negative.get("response_id"),
+                    "round_id": latest_negative.get("round_id"),
+                    "score": latest_negative.get("score"),
+                    "flags": latest_negative.get("flags") or [],
+                }
             cursor.execute(
                 """
                 UPDATE WeaknessStates
-                SET lifecycle_state = %s, observation_count = %s, session_count = %s,
-                    baseline_score = %s, latest_score = %s, confidence = %s,
-                    root_cause_hypothesis = %s, root_cause_confidence = %s,
-                    evidence_summary = %s,
+                SET lifecycle_state = ?, observation_count = ?, session_count = ?,
+                    baseline_score = ?, latest_score = ?, confidence = ?,
+                    root_cause_hypothesis = ?, root_cause_confidence = ?,
+                    evidence_summary = ?,
                     first_observed_at = COALESCE(
-                        (SELECT MIN(created_at) FROM WeaknessEvidenceLinks WHERE weakness_state_id = %s),
+                        (SELECT MIN(created_at) FROM WeaknessEvidenceLinks WHERE weakness_state_id = ?),
                         first_observed_at
                     ),
                     last_observed_at = COALESCE(
-                        (SELECT MAX(created_at) FROM WeaknessEvidenceLinks WHERE weakness_state_id = %s),
+                        (SELECT MAX(created_at) FROM WeaknessEvidenceLinks WHERE weakness_state_id = ?),
                         last_observed_at
                     ),
-                    resolved_at = %s, updated_at = NOW()
-                WHERE weakness_state_id = %s
+                    resolved_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE weakness_state_id = ?
                 """,
                 (
                     lifecycle["lifecycle_state"], lifecycle["observation_count"],
@@ -299,37 +338,39 @@ async def retire_superseded_analysis_evidence(interview_id: str, current_analysi
         try:
             cursor.execute(
                 """
-                DELETE FROM WeaknessEvidenceLinks link
-                USING SessionPerformanceAnalyses analysis
-                WHERE link.analysis_id = analysis.analysis_id
-                  AND analysis.interview_id = %s
-                  AND analysis.is_current = FALSE
-                  AND link.analysis_id <> %s
-                RETURNING link.weakness_state_id
+                DELETE FROM WeaknessEvidenceLinks
+                WHERE analysis_id IN (
+                    SELECT analysis_id
+                    FROM SessionPerformanceAnalyses
+                    WHERE interview_id = ? AND is_current = FALSE
+                )
+                  AND analysis_id <> ?
+                RETURNING weakness_state_id
                 """,
                 (interview_id, current_analysis_id),
             )
             affected_state_ids = list({row[0] for row in cursor.fetchall() or [] if row and row[0]})
             if affected_state_ids:
+                state_placeholders = ",".join(["?"] * len(affected_state_ids))
                 cursor.execute(
                     """
-                    UPDATE WeaknessStates state
+                    UPDATE WeaknessStates
                     SET lifecycle_state = 'resolved',
                         observation_count = 0,
                         session_count = 0,
                         baseline_score = NULL,
                         latest_score = NULL,
                         confidence = 0,
-                        resolved_at = NOW(),
-                        updated_at = NOW()
-                    WHERE state.weakness_state_id = ANY(%s)
+                        resolved_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE weakness_state_id IN ({state_placeholders})
                       AND NOT EXISTS (
                           SELECT 1
                           FROM WeaknessEvidenceLinks remaining
-                          WHERE remaining.weakness_state_id = state.weakness_state_id
+                          WHERE remaining.weakness_state_id = WeaknessStates.weakness_state_id
                       )
-                    """,
-                    (affected_state_ids,),
+                    """.format(state_placeholders=state_placeholders),
+                    tuple(affected_state_ids),
                 )
             conn.commit()
         except Exception:

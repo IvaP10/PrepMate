@@ -242,10 +242,18 @@ def compile_interview_blueprint(
         raise ValueError("Unsupported blueprint difficulty")
     focus_set = {str(item).strip().lower() for item in (focus or ["mixed"]) if str(item).strip()}
     mixed = not focus_set or "mixed" in focus_set
-    skills = _skill_names(resume_data.get("skills"))
-    for jd_skill in _jd_skill_names(job_description):
-        if jd_skill.lower() not in {item.lower() for item in skills}:
-            skills.append(jd_skill)
+    resume_skills = _skill_names(resume_data.get("skills"))
+    jd_skills = _jd_skill_names(job_description)
+    jd_skill_keys = {canonical_skill_key(skill) for skill in jd_skills}
+    resume_skill_keys = {canonical_skill_key(skill) for skill in resume_skills}
+    # Keep confirmed resume claims as the source of experience questions, but
+    # move claims that also appear in the JD ahead of unrelated resume skills.
+    skills = [skill for skill in resume_skills if canonical_skill_key(skill) in jd_skill_keys]
+    skills.extend(skill for skill in resume_skills if canonical_skill_key(skill) not in jd_skill_keys)
+    jd_only_skills = [
+        skill for skill in jd_skills
+        if canonical_skill_key(skill) not in resume_skill_keys
+    ]
     weaknesses = [item for item in (previous_weaknesses or []) if isinstance(item, dict)]
     sections: List[Dict[str, Any]] = []
     projects = _project_items(resume_data)
@@ -292,6 +300,19 @@ def compile_interview_blueprint(
             ))
             if description:
                 sections[-1]["source_anchors"].append(description)
+
+    if mixed or focus_set & {"role", "role-specific", "technical", "resume"}:
+        for index, skill in enumerate(jd_only_skills[:1], start=1):
+            add(_section(
+                section_id=f"jd-required-{index}",
+                label=skill,
+                kind="technical",
+                anchor=skill,
+                question=f"Where would {skill} fit in this role, and what trade-off would guide that choice?",
+                importance="critical",
+                difficulty="stretch" if profile_type == "top_tier" else "matched",
+                selection_reason="Explicit job-description requirement not present in confirmed resume evidence",
+            ))
 
     # Skills are assessed through named work whenever project evidence exists.
     # This avoids generic trivia such as "what did you do with Python?" and
@@ -517,6 +538,10 @@ def validate_blueprint(blueprint: Dict[str, Any]) -> Dict[str, Any]:
                 "walk through requirements",
                 "go one level deeper",
                 "provide a comprehensive",
+                "tell me something",
+                "tell me anything",
+                "anything about",
+                "what should i know",
             )
         ):
             raise ValueError(f"Blueprint section {section_id} is not naturally phrased")

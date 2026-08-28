@@ -4,19 +4,63 @@ from unittest.mock import MagicMock, patch
 os.environ.setdefault("ENVIRONMENT", "test")
 
 from workspace_api import (
+    _answer_problem_type,
+    _answer_status,
     _build_performance_page_payload,
     _canonical_communication_summary,
     _canonical_dimension_directions,
+    _combined_report_findings,
     _canonical_performance_cohort,
     _canonical_performance_payloads,
     _canonical_project_explanation,
+    _canonical_round_findings,
     _cumulative_performance_analytics,
     _interview_performance_payload,
     _legacy_performance_history,
     _merge_recorded_technical_analytics,
     _performance_payload_trend,
+    _performance_ready_count,
     _recorded_technical_analytics,
 )
+
+
+def test_missing_assessment_never_becomes_a_properly_answered_performance_row():
+    response = {
+        "response": "I used Redis to cache profile reads.",
+        "answer_quality_flags": [],
+        "score": None,
+        "evidence_status": "assessment_missing",
+        "authoritative": False,
+    }
+
+    assert _answer_status(response) == "Unable to evaluate"
+    assert _answer_problem_type(response) == "Assessment unavailable"
+
+
+def test_improve_unlock_count_only_uses_current_sufficient_performance():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (2,)
+
+    assert _performance_ready_count(cursor, "user-1") == 2
+    query, params = cursor.execute.call_args.args
+    assert "status = 'ready'" in query
+    assert "evidence_status = 'sufficient'" in query
+    assert "is_current = TRUE" in query
+    assert "GROUP BY mode" in query
+    assert params[0] == "user-1"
+
+
+def test_insufficient_assessment_stays_explicitly_unscored():
+    response = {
+        "response": "I helped on the service.",
+        "answer_quality_flags": ["insufficient_evidence"],
+        "score": None,
+        "evidence_status": "insufficient_evidence",
+        "authoritative": False,
+    }
+
+    assert _answer_status(response) == "Needs reframing"
+    assert _answer_problem_type(response) == "Missing evidence"
 
 
 def _session(interview_id: str, communication: float, technical: float, project_score: float):
@@ -121,11 +165,14 @@ def test_canonical_performance_orders_by_interview_time_not_reconciliation_time(
 
     query = cursor.execute.call_args.args[0]
     assert "JOIN Interviews interview" in query
+    assert "FROM ReportArtifacts artifact" in query
+    assert "artifact.status IN ('completed', 'partial')" in query
     assert "COALESCE(interview.completed_at, interview.created_at) AS session_at" in query
     assert (
         "ORDER BY COALESCE(interview.completed_at, interview.created_at) DESC"
         in query
     )
+    assert "LIMIT" not in query
 
 
 def test_legacy_history_excludes_interviews_with_canonical_v4_analysis():
@@ -139,6 +186,7 @@ def test_legacy_history_excludes_interviews_with_canonical_v4_analysis():
     assert "SessionPerformanceAnalyses analysis" in query
     assert "analysis.schema_version = 'session-performance-v4'" in query
     assert "analysis.is_current = TRUE" in query
+    assert "FROM ReportArtifacts artifact" in query
 
 
 def test_communication_patterns_are_only_marked_recurring_across_sessions():
@@ -403,6 +451,213 @@ def test_cumulative_technical_analytics_separates_attempts_from_unattempted_prob
     assert analytics["topics"][0]["label"] == "Hashing"
 
 
+def test_interview_round_findings_stay_question_specific_and_report_linkable():
+    session = {
+        "interview_id": "i-1",
+        "evidence_status": "sufficient",
+        "analysis": {
+            "question_analyses": [
+                {
+                    "response_id": "r-strong",
+                    "question": "Walk me through the architecture you built",
+                    "overall_score": 84,
+                    "answer_quality_flags": [],
+                },
+                {
+                    "response_id": "r-weak",
+                    "question": "Why did you choose that database over the alternatives?",
+                    "overall_score": 54,
+                    "answer_quality_flags": ["missing_tradeoffs"],
+                    "dimension_scores": {"tradeoffs": 42},
+                },
+            ],
+            "report": {
+                "summary": "Two questions were evaluated.",
+                "questions": [
+                    {
+                        "response_id": "r-strong",
+                        "status": "Completed",
+                        "what_was_good": ["The architecture and ownership were supported by recorded project evidence."],
+                    },
+                    {
+                        "response_id": "r-weak",
+                        "status": "Completed",
+                        "what_reduced_score": ["The answer named the selected database but did not compare alternatives or trade-offs."],
+                    },
+                ],
+            },
+        },
+    }
+
+    findings = _canonical_round_findings(session, "interview")
+
+    assert findings["strengths"][0]["evidence_ids"] == ["r-strong"]
+    assert findings["issues"][0]["label"] == "Missing justification or trade-offs"
+    assert findings["issues"][0]["source_label"].startswith("Why did you choose")
+    assert findings["issues"][0]["evidence_ids"] == ["r-weak"]
+    assert "trade-offs" in findings["issues"][0]["detail"]
+    assert findings["takeaway"]
+
+
+def test_interview_round_findings_use_scored_question_evidence_when_report_has_no_question_breakdown():
+    findings = _canonical_round_findings({
+        "interview_id": "i-scored",
+        "evidence_status": "sufficient",
+        "analysis": {
+            "question_analyses": [{
+                "response_id": "r-scored",
+                "question": "Describe a production decision you owned",
+                "overall_score": 82,
+                "dimension_scores": {"ownership": 84, "communication": 80},
+                "answer_quality_flags": [],
+            }],
+            "report": {
+                "summary": "The answer showed evidence-backed ownership.",
+                "strengths": ["Clear ownership"],
+            },
+        },
+    }, "interview")
+
+    assert findings["issues"] == []
+    assert findings["strengths"][0]["source_label"] == "Describe a production decision you owned"
+    assert findings["strengths"][0]["evidence_ids"] == ["r-scored"]
+    assert "82%" in findings["strengths"][0]["detail"]
+    assert "Project / Resume Knowledge" in findings["strengths"][0]["detail"]
+
+
+def test_technical_round_findings_distinguish_solved_and_failed_problem_evidence():
+    session = {
+        "interview_id": "t-1",
+        "evidence_status": "sufficient",
+        "analysis": {
+            "report": {
+                "summary": "Two problems were submitted; one was solved.",
+                "technical": {
+                    "problems": [
+                        {
+                            "round_id": "p-1",
+                            "title": "Graph traversal",
+                            "status": "Submitted",
+                            "score": 100,
+                            "final_submission": True,
+                            "visible_passed": 3,
+                            "visible_total": 3,
+                            "hidden_passed": 4,
+                            "hidden_total": 4,
+                            "evidence_ids": ["s-1"],
+                        },
+                        {
+                            "round_id": "p-2",
+                            "title": "Sliding window",
+                            "status": "Submitted",
+                            "score": 50,
+                            "final_submission": True,
+                            "main_issue": "The final submission failed two evaluated edge cases.",
+                            "what_happened": "The approach was selected, but the left boundary was not advanced after invalidation.",
+                            "evidence_ids": ["s-2"],
+                        },
+                    ],
+                },
+            },
+        },
+    }
+
+    findings = _canonical_round_findings(session, "technical")
+
+    assert findings["strengths"][0]["source_label"] == "Graph traversal"
+    assert findings["strengths"][0]["evidence_ids"] == ["s-1", "p-1"]
+    assert findings["issues"][0]["label"] == "Correctness or edge cases"
+    assert findings["issues"][0]["source_label"] == "Sliding window"
+    assert findings["issues"][0]["evidence_ids"] == ["s-2", "p-2"]
+    assert "left boundary" in findings["issues"][0]["what_happened"]
+
+
+def test_combined_findings_use_every_report_without_averaging_incompatible_scores():
+    rows = []
+    for index, date in enumerate(("2026-08-10T10:00:00", "2026-08-01T10:00:00"), start=1):
+        rows.append({
+            "analysis_id": f"a-{index}",
+            "interview_id": f"i-{index}",
+            "created_at": date,
+            "role": "Backend Engineer",
+            "overall_score": 70 + index,
+            "evidence_status": "sufficient",
+            "taxonomy_version": f"taxonomy-{index}",
+            "rubric_version": f"rubric-{index}",
+            "analysis": {
+                "question_analyses": [
+                    {
+                        "response_id": f"r-weak-{index}",
+                        "question": f"Why did you choose storage option {index}?",
+                        "overall_score": 55,
+                        "answer_quality_flags": ["missing_tradeoffs"],
+                    },
+                    {
+                        "response_id": f"r-strong-{index}",
+                        "question": f"Explain the production incident {index}",
+                        "overall_score": 84,
+                        "answer_quality_flags": [],
+                    },
+                ],
+                "report": {
+                    "questions": [
+                        {
+                            "response_id": f"r-weak-{index}",
+                            "what_reduced_score": [f"Report {index} did not compare the rejected storage alternatives."],
+                        },
+                        {
+                            "response_id": f"r-strong-{index}",
+                            "what_was_good": [f"Report {index} connected the action to a measured recovery result."],
+                        },
+                    ],
+                },
+            },
+        })
+
+    combined = _combined_report_findings(rows, "interview")
+
+    assert combined["summary"]["total_reports"] == 2
+    assert combined["summary"]["official_reports"] == 2
+    assert combined["summary"]["reports_with_issues"] == 2
+    assert combined["summary"]["reports_with_strengths"] == 2
+    assert combined["summary"]["recurring_issue_count"] == 1
+    assert combined["issues"][0]["label"] == "Missing justification or trade-offs"
+    assert combined["issues"][0]["round_count"] == 2
+    assert combined["issues"][0]["evidence_count"] == 2
+    assert combined["issues"][0]["evidence"][0]["source_label"] == "Why did you choose storage option 1?"
+    assert combined["issues"][0].get("average_score") is None
+    assert len(combined["strengths"]) == 2
+
+
+def test_combined_technical_findings_do_not_inflate_one_execution_failure_into_topics():
+    combined = _combined_report_findings([{
+        "analysis_id": "a-technical",
+        "interview_id": "i-technical",
+        "created_at": "2026-08-10T10:00:00",
+        "overall_score": None,
+        "evidence_status": "draft_or_run_only",
+        "analysis": {
+            "report": {
+                "technical": {
+                    "problems": [{
+                        "round_id": "round-1",
+                        "title": "Target-sum subarrays",
+                        "status": "Draft only",
+                        "evidence_state": "draft_only",
+                        "main_issue": "The implementation was incomplete and had no final submission.",
+                        "topics": ["Arrays", "Hashing", "Sliding Window"],
+                    }],
+                },
+            },
+        },
+    }], "technical")
+
+    assert combined["summary"]["total_reports"] == 1
+    assert combined["summary"]["official_reports"] == 0
+    assert [item["label"] for item in combined["issues"]] == ["Incomplete execution"]
+    assert combined["issues"][0]["evidence"][0]["source_label"] == "Target-sum subarrays"
+
+
 def test_draft_technical_evidence_surfaces_unsubmitted_code_without_a_score():
     recorded = _recorded_technical_analytics(
         problem_rows=[{
@@ -448,3 +703,44 @@ def test_draft_technical_evidence_surfaces_unsubmitted_code_without_a_score():
 
     assert merged["analytics"]["submission"]["coded_not_submitted"] == 1
     assert merged["comparison_notice"].startswith("Saved coding evidence is shown")
+
+
+def test_recorded_technical_merge_deduplicates_the_same_round_problem():
+    merged = _merge_recorded_technical_analytics(
+        {
+            "score_state": "run_only",
+            "analytics": {
+                "submission": {
+                    "coded_not_submitted": 1,
+                    "problems": [{
+                        "interview_id": "t-1",
+                        "round_id": "p-1",
+                        "problem": "Target-Sum Subarrays",
+                        "issue": "No final submission",
+                        "evidence": [],
+                    }],
+                },
+            },
+        },
+        {
+            "has_data": True,
+            "analytics": {
+                "submission": {
+                    "coded_not_submitted": 1,
+                    "problems": [{
+                        "interview_id": "t-1",
+                        "round_id": "p-1",
+                        "problem": "Target-Sum Subarrays",
+                        "issue": "No final submission",
+                        "run_count": 1,
+                        "evidence": [{"interview_id": "t-1", "round_id": "p-1"}],
+                    }],
+                },
+            },
+        },
+    )
+
+    problems = merged["analytics"]["submission"]["problems"]
+    assert len(problems) == 1
+    assert problems[0]["run_count"] == 1
+    assert problems[0]["evidence"] == [{"interview_id": "t-1", "round_id": "p-1"}]

@@ -1,5 +1,4 @@
 import { API_CONFIG, API_ENDPOINTS } from './config'
-import { getAuthHeaders } from './auth'
 import type {
   ResumeData,
   UploadResponse,
@@ -9,19 +8,8 @@ import type {
 
 function friendlyMessage(raw: string): string {
   const lower = raw.toLowerCase()
-  if (
-    lower.includes('no interviews remaining') ||
-    lower.includes('no credits') ||
-    lower.includes('limit reached') ||
-    lower.includes('technical rounds are locked') ||
-    lower.includes('requires the premium plan') ||
-    lower.includes('require the premium plan') ||
-    lower.includes('require the pro or premium plan') ||
-    lower.includes('your plan includes') ||
-    lower.includes('upgrade your plan')
-  ) return raw
-  if (lower.includes('forbidden') || lower.includes('403')) return 'Access denied. Please log in again.'
-  if (lower.includes('unauthorized') || lower.includes('401')) return 'Session expired. Please log in again.'
+  if (lower.includes('forbidden') || lower.includes('403')) return 'The local request was not allowed.'
+  if (lower.includes('unauthorized') || lower.includes('401')) return 'The local service rejected this request.'
   if (lower.includes('not found') || lower.includes('404')) return 'The requested resource was not found.'
   if (lower.includes('429') || lower.includes('too many')) return 'Too many requests. Please wait a moment.'
   if (lower.includes('500') || lower.includes('internal server')) return 'Something went wrong. Please try again.'
@@ -54,7 +42,6 @@ async function fetchWithRetry(
 
     const response = await fetch(url, {
       ...options,
-      credentials: 'include',
       signal: controller.signal,
     })
 
@@ -94,6 +81,7 @@ async function fetchWithRetry(
 
 export type FlowPreflightStatus = {
   flow: 'interview' | 'technical'
+  input_mode?: 'voice' | 'text'
   ready: boolean
   status: 'ready' | 'not_ready' | string
   message: string
@@ -102,18 +90,20 @@ export type FlowPreflightStatus = {
 }
 
 const FLOW_PREFLIGHT_CACHE_TTL_MS = 10_000
-const flowPreflightCache = new Map<'interview' | 'technical', { value: FlowPreflightStatus; expiresAt: number }>()
-const flowPreflightRequests = new Map<'interview' | 'technical', Promise<FlowPreflightStatus>>()
+const flowPreflightCache = new Map<string, { value: FlowPreflightStatus; expiresAt: number }>()
+const flowPreflightRequests = new Map<string, Promise<FlowPreflightStatus>>()
 
 export async function fetchFlowPreflight(
   flow: 'interview' | 'technical',
-  options: { force?: boolean } = {},
+  options: { force?: boolean; inputMode?: 'voice' | 'text' } = {},
 ): Promise<FlowPreflightStatus> {
-  const activeRequest = flowPreflightRequests.get(flow)
+  const inputMode = options.inputMode || 'text'
+  const cacheKey = `${flow}:${inputMode}`
+  const activeRequest = flowPreflightRequests.get(cacheKey)
   if (activeRequest) return activeRequest
 
   if (!options.force) {
-    const cached = flowPreflightCache.get(flow)
+    const cached = flowPreflightCache.get(cacheKey)
     if (cached && cached.expiresAt > Date.now()) return cached.value
   }
 
@@ -121,9 +111,7 @@ export async function fetchFlowPreflight(
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), API_CONFIG.TIMEOUT)
     try {
-      const response = await fetch(`${API_CONFIG.BASE_URL}/preflight?flow=${flow}`, {
-        credentials: 'include',
-        headers: getAuthHeaders(),
+      const response = await fetch(`${API_CONFIG.BASE_URL}/preflight?flow=${flow}&input_mode=${inputMode}`, {
         signal: controller.signal,
       })
       const payload = await response.json().catch(() => null)
@@ -142,13 +130,13 @@ export async function fetchFlowPreflight(
     }
   })()
 
-  flowPreflightRequests.set(flow, request)
+  flowPreflightRequests.set(cacheKey, request)
   try {
     const result = await request
-    flowPreflightCache.set(flow, { value: result, expiresAt: Date.now() + FLOW_PREFLIGHT_CACHE_TTL_MS })
+    flowPreflightCache.set(cacheKey, { value: result, expiresAt: Date.now() + FLOW_PREFLIGHT_CACHE_TTL_MS })
     return result
   } finally {
-    if (flowPreflightRequests.get(flow) === request) flowPreflightRequests.delete(flow)
+    if (flowPreflightRequests.get(cacheKey) === request) flowPreflightRequests.delete(cacheKey)
   }
 }
 
@@ -161,6 +149,7 @@ export type PersistedPreflight = FlowPreflightStatus & {
 export async function persistBrowserPreflight(payload: {
   blueprint_id: string
   flow: 'interview' | 'technical'
+  input_mode: 'voice' | 'text'
   camera_ready: boolean
   microphone_ready: boolean
   microphone_level_detected: boolean
@@ -170,7 +159,7 @@ export async function persistBrowserPreflight(payload: {
 }): Promise<PersistedPreflight> {
   const response = await fetchWithRetry(`${API_CONFIG.BASE_URL}/preflight`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   })
   return await response.json()
@@ -190,9 +179,7 @@ export async function uploadResume(file: File): Promise<{ uploadResponse: Upload
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.UPLOAD}`,
       {
         method: 'POST',
-        credentials: 'include',
         headers: {
-          ...getAuthHeaders(),
           'X-Request-ID': requestId,
         },
         body: formData,
@@ -214,7 +201,36 @@ export async function uploadResume(file: File): Promise<{ uploadResponse: Upload
       } as ApiError
     }
 
-    const data = await response.json()
+    let data = await response.json()
+    if (response.status === 202 && data.job_id) {
+      const deadline = Date.now() + 60_000
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 750))
+        const statusResponse = await fetchWithRetry(
+          `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.JOB(String(data.job_id))}`,
+          { method: 'GET' },
+        )
+        const statusData = await statusResponse.json().catch(() => ({}))
+        if (statusData.status === 'completed' || statusData.job?.status === 'completed') {
+          data = statusData
+          break
+        }
+        if (statusData.status === 'dead_letter' || statusData.job?.status === 'dead_letter') {
+          throw {
+            code: 'UPLOAD_FAILED',
+            message: 'Resume processing failed. Please try the upload again.',
+            details: { request_id: requestId, retryable: true },
+          } as ApiError
+        }
+      }
+      if (data.status !== 'completed' && data.job?.status !== 'completed') {
+        throw {
+          code: 'UPLOAD_TIMEOUT',
+          message: 'Resume processing is still running. Please try again in a moment.',
+          details: { request_id: requestId, retryable: true },
+        } as ApiError
+      }
+    }
 
     const profile = data.extracted_profile || {}
 
@@ -336,7 +352,6 @@ export async function submitResume(data: ResumeData, resumeId?: string): Promise
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...getAuthHeaders(),
         },
         body: JSON.stringify({ profile, resume_id: resumeId || data.metadata?.resumeId || null }),
       }
@@ -367,9 +382,6 @@ export async function getResume(): Promise<ResumeData> {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.FORM}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -474,7 +486,7 @@ export async function fetchResumeVersions(): Promise<ResumeVersionsResponse> {
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.VERSIONS}`,
-      { method: 'GET', headers: { ...getAuthHeaders() } },
+      { method: 'GET' },
     )
     const data = await response.json()
     const resumes = Array.isArray(data) ? data : Array.isArray(data.resumes) ? data.resumes : []
@@ -496,7 +508,7 @@ export async function activateResumeVersion(resumeId: string): Promise<ResumeVer
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.VERSIONS}/${encodeURIComponent(resumeId)}/activate`,
       {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        headers: { 'Content-Type': 'application/json' },
       },
     )
     const data = await response.json()
@@ -513,7 +525,7 @@ export async function deleteResumeVersion(resumeId: string): Promise<void> {
   try {
     await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.VERSIONS}/${encodeURIComponent(resumeId)}`,
-      { method: 'DELETE', headers: { ...getAuthHeaders() } },
+      { method: 'DELETE' },
     )
   } catch (error) {
     throw {
@@ -533,7 +545,7 @@ export async function updateResumeFacts(resumeId: string, decisions: Array<{
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.RESUME.VERSIONS}/${encodeURIComponent(resumeId)}/facts`,
       {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ decisions }),
       },
     )
@@ -622,7 +634,6 @@ export async function createInterviewBlueprint(
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': idempotencyKey,
-          ...getAuthHeaders(),
         },
         body: JSON.stringify({ ...payload, request_idempotency_key: idempotencyKey }),
       },
@@ -641,7 +652,7 @@ export async function fetchInterviewBlueprint(blueprintId: string): Promise<Inte
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.BLUEPRINTS}/${encodeURIComponent(blueprintId)}`,
-      { method: 'GET', headers: { ...getAuthHeaders() } },
+      { method: 'GET' },
     )
     const data = await response.json()
     return data.blueprint || data
@@ -656,7 +667,7 @@ export async function fetchInterviewBlueprint(blueprintId: string): Promise<Inte
 export async function startInterviewFromBlueprint(
   blueprintId: string,
   idempotencyKey: string,
-  runtime?: { input_mode?: 'voice' | 'text' | 'voice_or_text'; camera_mode?: 'off' | 'optional' | 'required'; preflight_id?: string },
+  runtime?: { input_mode?: 'voice' | 'text' | 'voice_or_text'; camera_mode?: 'off' | 'optional'; preflight_id?: string },
 ) {
   try {
     const response = await fetchWithRetry(
@@ -666,7 +677,6 @@ export async function startInterviewFromBlueprint(
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': idempotencyKey,
-          ...getAuthHeaders(),
         },
         body: JSON.stringify({ blueprint_id: blueprintId, start_idempotency_key: idempotencyKey, ...runtime }),
       },
@@ -850,6 +860,9 @@ export interface ActiveImproveMission {
   prediction?: Record<string, any>
   validation_status?: string | null
   validated_by_interview_id?: string | null
+  source_interview_id?: string | null
+  source_analysis_id?: string | null
+  report_path?: string | null
   created_at?: string | null
   updated_at?: string | null
   completed_at?: string | null
@@ -994,14 +1007,23 @@ export interface LearningDashboard {
   improvement_history?: ImprovementHistory
   integrity_status: {
     status: string
+    mode?: "self_review" | string
     severe_count: number
     warning_count: number
+    signal_count?: number
     events: { event_type: string; severity: string; count: number; last_seen_at: string | null }[]
   }
   analysis_availability?: {
     completed_count: number
     missing_canonical_count: number
+    performance_ready?: boolean
+    performance_ready_count?: number
+    comparison_ready?: boolean
+    improve_available?: boolean
   }
+  performance_ready?: boolean
+  comparison_ready?: boolean
+  improve_available?: boolean
 }
 
 export async function fetchLearningDashboard(): Promise<LearningDashboard> {
@@ -1010,9 +1032,6 @@ export async function fetchLearningDashboard(): Promise<LearningDashboard> {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.LEARNING}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1041,7 +1060,6 @@ export async function submitExerciseAttempt(exerciseId: string, payload: {
         headers: {
           'Content-Type': 'application/json',
           ...(payload.idempotency_key ? { 'Idempotency-Key': payload.idempotency_key } : {}),
-          ...getAuthHeaders(),
         },
         body: JSON.stringify(payload),
       }
@@ -1070,7 +1088,6 @@ export async function createExerciseAttemptSession(exerciseId: string, payload: 
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': payload.idempotency_key,
-          ...getAuthHeaders(),
         },
         body: JSON.stringify(payload),
       }
@@ -1099,7 +1116,6 @@ export async function updateExerciseAttemptSession(exerciseId: string, attemptSe
         headers: {
           'Content-Type': 'application/json',
           'Idempotency-Key': payload.idempotency_key,
-          ...getAuthHeaders(),
         },
         body: JSON.stringify(payload),
       }
@@ -1135,7 +1151,6 @@ export async function runExerciseCode(exerciseId: string, payload: {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...getAuthHeaders(),
         },
         body: JSON.stringify(payload),
       }
@@ -1156,9 +1171,6 @@ export async function fetchRecentActivity(days: number = 30) {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.RECENT_ACTIVITY}?days=${days}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1227,9 +1239,6 @@ export async function fetchInterviewProfile(): Promise<InterviewProfileResponse>
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.INTERVIEW_PROFILE}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1250,7 +1259,6 @@ export async function updateInterviewProfile(profileType: InterviewProfileType):
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
-          ...getAuthHeaders(),
         },
         body: JSON.stringify({ profile_type: profileType }),
       }
@@ -1271,9 +1279,6 @@ export async function fetchJobProfiles(): Promise<JobProfile[]> {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.JOB_PROFILES}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1294,7 +1299,6 @@ export async function createJobProfile(payload: JobProfileInput): Promise<JobPro
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...getAuthHeaders(),
         },
         body: JSON.stringify(payload),
       }
@@ -1315,7 +1319,7 @@ export async function updateJobProfile(profileId: number, payload: Partial<JobPr
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.JOB_PROFILES}/${profileId}`,
       {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       },
     )
@@ -1332,7 +1336,7 @@ export async function deleteJobProfile(profileId: number): Promise<void> {
   try {
     await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.JOB_PROFILES}/${profileId}`,
-      { method: 'DELETE', headers: { ...getAuthHeaders() } },
+      { method: 'DELETE' },
     )
   } catch (error) {
     throw {
@@ -1346,7 +1350,7 @@ export async function copyInterviewJobProfile(interviewId: string): Promise<{ pr
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}/workspace/interviews/${encodeURIComponent(interviewId)}/copy-profile`,
-      { method: 'POST', headers: { ...getAuthHeaders() } },
+      { method: 'POST' },
     )
     return await response.json()
   } catch (error) {
@@ -1363,9 +1367,6 @@ export async function selectJobProfile(profileId: number): Promise<JobProfile> {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.JOB_PROFILES}/${profileId}/select`,
       {
         method: 'POST',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1395,7 +1396,6 @@ export async function startInterviewSession(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...getAuthHeaders(),
         },
         body: JSON.stringify({
           interview_mode: mode,
@@ -1430,10 +1430,6 @@ export async function endInterviewSession(interviewId: string, options: { keepal
       `${API_CONFIG.BASE_URL}/interview/${interviewId}/end`,
       {
         method: 'POST',
-        credentials: 'include',
-        headers: {
-          ...getAuthHeaders(),
-        },
         keepalive: options.keepalive,
       }
     )
@@ -1460,7 +1456,6 @@ export async function prepareTechnicalRounds(interviewId: string) {
         method: 'POST',
         headers: {
           'Idempotency-Key': `technical-prepare-${interviewId}`,
-          ...getAuthHeaders(),
         },
       }
     )
@@ -1479,15 +1474,36 @@ export async function prepareTechnicalRounds(interviewId: string) {
   }
 }
 
+export async function activateTechnicalRound(interviewId: string) {
+  try {
+    const response = await fetchWithRetry(
+      `${API_CONFIG.BASE_URL}/technical/sessions/${interviewId}/activate`,
+      {
+        method: 'POST',
+        headers: {
+          'Idempotency-Key': `technical-activate-${interviewId}`,
+        },
+      },
+    )
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}))
+      throw new Error(friendlyMessage(error.detail || error.message || 'Failed to activate technical round'))
+    }
+    return await response.json()
+  } catch (error) {
+    throw {
+      code: 'TECHNICAL_ACTIVATE_FAILED',
+      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to activate technical round',
+    } as ApiError
+  }
+}
+
 export async function cancelInterviewSession(interviewId: string) {
   try {
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.CANCEL}/${interviewId}`,
       {
         method: 'DELETE',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1509,10 +1525,6 @@ export async function abandonInterviewSession(
       `${API_CONFIG.BASE_URL}/interview/${interviewId}/abandon`,
       {
         method: 'POST',
-        credentials: 'include',
-        headers: {
-          ...getAuthHeaders(),
-        },
         keepalive: options.keepalive,
       },
     )
@@ -1535,9 +1547,6 @@ export async function fetchInterviewStatus(interviewId: string) {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.STATUS}/${interviewId}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1556,9 +1565,6 @@ export async function fetchInterviewReport(interviewId: string) {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.REPORT}/${interviewId}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1571,6 +1577,24 @@ export async function fetchInterviewReport(interviewId: string) {
   }
 }
 
+export async function downloadInterviewReportJson(interviewId: string): Promise<void> {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/interview/report/${interviewId}/export`,
+    {
+      method: 'GET',
+    },
+  )
+  const blob = await response.blob()
+  const objectUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = response.headers.get('Content-Disposition')?.match(/filename="?([^";]+)"?/)?.[1] || `prepmate-report-${interviewId}.json`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(objectUrl)
+}
+
 export interface InterviewAnalysisStatus {
   interview_id: string
   status: string
@@ -1580,6 +1604,7 @@ export interface InterviewAnalysisStatus {
   report_state?: "generating" | "retrying" | "ready" | "partial" | "failed" | "ungradable" | string
   analysis_status?: string
   attempt_status?: string
+  execution_pending?: boolean
   processing_sla_minutes?: number
   retry_in_progress?: boolean
   retryable?: boolean
@@ -1601,9 +1626,6 @@ export async function fetchInterviewAnalysisStatus(interviewId: string): Promise
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.ANALYSIS_STATUS}/${interviewId}/analysis-status`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -1622,9 +1644,6 @@ export async function retryInterviewAnalysis(interviewId: string): Promise<{ job
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.INTERVIEW.ANALYSIS_STATUS}/${interviewId}/analysis/retry`,
       {
         method: 'POST',
-        headers: {
-          ...getAuthHeaders(),
-        },
       },
     )
     return await response.json()
@@ -1725,14 +1744,41 @@ export interface PerformanceRoundHistoryItem {
   key_result?: string | null
   questions_completed?: number | null
   questions_total?: number | null
+  questions_skipped?: number | null
   problems_attempted?: number | null
   problems_total?: number | null
   problems_solved?: number | null
+  problems_partially_solved?: number | null
+  problems_not_submitted?: number | null
+  problems_not_attempted?: number | null
+  languages?: string[]
+  report_path?: string | null
+  evidence_ids?: string[]
+  summary?: string | null
+  takeaway?: string | null
+  strengths?: PerformanceRoundFinding[]
+  issues?: PerformanceRoundFinding[]
+  mistakes?: PerformanceRoundFinding[]
+}
+
+export interface PerformanceRoundFinding {
+    label?: string | null
+    source_label?: string | null
+    detail?: string | null
+    what_happened?: string | null
+    why_it_matters?: string | null
+    evidence_ids?: string[]
+    status?: string | null
+    score?: number | null
+    response_id?: string | null
+    round_id?: string | null
 }
 
 export interface PerformanceAnalytics {
   summary?: {
     total_rounds?: number
+    total_reports?: number
+    official_reports?: number
     average_score?: number | null
     latest_score?: number | null
     best_score?: number | null
@@ -1743,6 +1789,21 @@ export interface PerformanceAnalytics {
     problems_total?: number
     problems_solved?: number
     submission_rate?: number | null
+  }
+  report_findings?: {
+    summary?: {
+      total_reports?: number
+      official_reports?: number
+      reports_with_findings?: number
+      reports_with_issues?: number
+      reports_with_strengths?: number
+      issue_count?: number
+      strength_count?: number
+      recurring_issue_count?: number
+    }
+    takeaway?: string | null
+    issues?: Record<string, any>[]
+    strengths?: Record<string, any>[]
   }
   skills?: Record<string, any>[]
   topics?: Record<string, any>[]
@@ -1889,6 +1950,8 @@ export interface DynamicPerformancePayload {
   source_kind?: "canonical_v4" | "recorded_evidence" | "legacy_report" | "unavailable" | string
   included_in_trend?: boolean
   round_history?: PerformanceRoundHistoryItem[]
+  comparison_ready?: boolean
+  improve_available?: boolean
   analytics?: PerformanceAnalytics
 }
 
@@ -1901,6 +1964,8 @@ export interface PerformanceData {
     legacy: PerformanceTrendPoint[]
   }
   round_history?: PerformanceRoundHistoryItem[]
+  comparison_ready?: boolean
+  improve_available?: boolean
   availability?: {
     completed_count: number
     missing_canonical_count: number
@@ -1950,7 +2015,7 @@ export async function reconcilePerformance(cursor?: string | null): Promise<Perf
     const search = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""
     const response = await fetchWithRetry(
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.ANALYSIS.RECONCILE_PERFORMANCE}${search}`,
-      { method: 'POST', headers: { ...getAuthHeaders() } },
+      { method: 'POST' },
     )
     return await response.json()
   } catch (error) {
@@ -1967,9 +2032,6 @@ export async function fetchPerformance(): Promise<PerformanceData> {
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.PERFORMANCE}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -2027,9 +2089,6 @@ export async function fetchTechnicalRoundHistory(): Promise<{ rounds: TechnicalR
       `${API_CONFIG.BASE_URL}${API_ENDPOINTS.WORKSPACE.TECHNICAL_ROUNDS}`,
       {
         method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
       }
     )
 
@@ -2042,445 +2101,79 @@ export async function fetchTechnicalRoundHistory(): Promise<{ rounds: TechnicalR
   }
 }
 
-export async function createSupportSubmission(payload: {
-  kind: 'bug' | 'feedback'
-  title?: string
-  message: string
-  steps?: string
-  rating?: number
-  interview_id?: string
-  page_url?: string
-}) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}/workspace/support`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify(payload),
-      }
-    )
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'SUPPORT_CREATE_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to submit support request',
-    } as ApiError
-  }
+export interface LocalProviderSettings {
+  provider: string
+  model: string
+  endpoint: string
+  has_api_key: boolean
+  requires_api_key?: boolean
 }
 
-export async function fetchSupportSubmissions(statusFilter?: string) {
-  try {
-    const query = statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : ''
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}/workspace/support/submissions${query}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'SUPPORT_LIST_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load support submissions',
-    } as ApiError
-  }
+export async function fetchLocalSettings(): Promise<LocalProviderSettings> {
+  const response = await fetchWithRetry(`${API_CONFIG.BASE_URL}/local/settings`, { method: "GET" })
+  return await response.json()
 }
 
-export async function updateSupportSubmission(submissionId: number, payload: { status?: string; admin_notes?: string }) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}/workspace/support/submissions/${submissionId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify(payload),
-      }
-    )
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'SUPPORT_UPDATE_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to update support submission',
-    } as ApiError
-  }
+export async function fetchRedactedDiagnostics(): Promise<Record<string, unknown>> {
+  const response = await fetchWithRetry(`${API_CONFIG.BASE_URL}/local/diagnostics`, { method: "GET" })
+  return await response.json()
 }
 
-export async function fetchPaymentTransactions(limit: number = 20) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.TRANSACTIONS}?limit=${limit}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'PAYMENT_TRANSACTIONS_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load payment transactions',
-    } as ApiError
-  }
-}
-
-export async function fetchPaymentPlans() {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.PLANS}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'PAYMENT_PLANS_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load payment plans',
-    } as ApiError
-  }
-}
-
-export async function fetchPaymentSubscription() {
+export async function downloadUserDataExport(): Promise<void> {
   const response = await fetchWithRetry(
-    `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.GET_SUBSCRIPTION}`,
-    {
-      method: 'GET',
-      headers: { ...getAuthHeaders() },
-    },
+    `${API_CONFIG.BASE_URL}/profile/export-data`,
+    { method: 'GET' },
+  )
+  const payload = await response.blob()
+  const url = URL.createObjectURL(payload)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `prepmate-data-export-${new Date().toISOString().slice(0, 10)}.json`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
+export async function deleteSessionHistory(): Promise<{ interviews_deleted?: number; deleted_counts?: Record<string, number> }> {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/profile/session-history`,
+    { method: 'DELETE' },
   )
   return await response.json()
 }
 
-export async function fetchEntitlements() {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.ENTITLEMENTS}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'ENTITLEMENTS_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load entitlements',
-    } as ApiError
-  }
+export async function deleteResumeData(): Promise<{ message?: string }> {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/profile/resume`,
+    { method: 'DELETE' },
+  )
+  return await response.json()
 }
 
-export async function createPaymentSession(planType: string, provider: string = 'razorpay', paymentMethod: string = 'card', sessions?: number) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.CREATE_SUBSCRIPTION}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({
-          plan_type: planType,
-          provider: provider,
-          payment_method: paymentMethod,
-          sessions: sessions
-        }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(friendlyMessage(body.detail || body.message || 'Payment failed'))
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'PAYMENT_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to create payment session',
-    } as ApiError
-  }
+export async function deleteAllProviderKeys(): Promise<void> {
+  await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/local/settings/keys`,
+    { method: 'DELETE' },
+  )
 }
 
-export async function verifyRazorpayPayment(orderId: string, paymentId: string, signature: string) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PAYMENT.VERIFY_RAZORPAY}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({
-          razorpay_order_id: orderId,
-          razorpay_payment_id: paymentId,
-          razorpay_signature: signature,
-        }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Payment verification failed')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'VERIFICATION_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Payment verification failed',
-    } as ApiError
-  }
+export async function clearLocalCaches(): Promise<{ data_directory?: string; removed?: string[] }> {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/local/data/cache/clear`,
+    { method: 'POST' },
+  )
+  return await response.json()
 }
 
-export async function changePassword(currentPassword: string, newPassword: string) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.AUTH.CHANGE_PASSWORD}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to change password')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'CHANGE_PASSWORD_FAILED',
-      message: error instanceof Error ? error.message : 'Failed to change password',
-    } as ApiError
-  }
-}
-
-export async function deleteAccount(password?: string) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.AUTH.DELETE_ACCOUNT}`,
-      {
-        method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({ password: password || null }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to delete account')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'DELETE_ACCOUNT_FAILED',
-      message: error instanceof Error ? error.message : 'Failed to delete account',
-    } as ApiError
-  }
-}
-
-export async function updateAccountInfo(fullName?: string, email?: string) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.UPDATE_ACCOUNT}`,
-      {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({ full_name: fullName || null, email: email || null }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to update account')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'UPDATE_ACCOUNT_FAILED',
-      message: error instanceof Error ? error.message : 'Failed to update account info',
-    } as ApiError
-  }
-}
-
-export async function uploadAvatar(base64Data: string) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.AVATAR}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify({ avatar_data: base64Data }),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to upload avatar')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'AVATAR_UPLOAD_FAILED',
-      message: error instanceof Error ? error.message : 'Failed to upload avatar',
-    } as ApiError
-  }
-}
-
-export async function exportUserData() {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.EXPORT_DATA}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-
-    if (!response.ok) {
-      throw new Error('Failed to export data')
-    }
-
-    const data = await response.json()
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `interai-data-export-${new Date().toISOString().split('T')[0]}.json`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    URL.revokeObjectURL(url)
-
-    return data
-  } catch (error) {
-    throw {
-      code: 'EXPORT_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to export data',
-    } as ApiError
-  }
-}
-
-export async function deleteSessionHistory() {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.DELETE_SESSION_HISTORY}`,
-      {
-        method: 'DELETE',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to delete session history')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'DELETE_HISTORY_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to delete session history',
-    } as ApiError
-  }
-}
-
-export interface NotificationPrefs {
-  inactive_reminder_days: number | null
-  target_date: string | null
-  weekly_summary: boolean
-  streak_reminder: boolean
-}
-
-export async function getNotificationPrefs(): Promise<NotificationPrefs> {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.NOTIFICATION_PREFS}`,
-      {
-        method: 'GET',
-        headers: {
-          ...getAuthHeaders(),
-        },
-      }
-    )
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'GET_PREFS_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to load notification preferences',
-    } as ApiError
-  }
-}
-
-export async function updateNotificationPrefs(prefs: NotificationPrefs) {
-  try {
-    const response = await fetchWithRetry(
-      `${API_CONFIG.BASE_URL}${API_ENDPOINTS.PROFILE.NOTIFICATION_PREFS}`,
-      {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getAuthHeaders(),
-        },
-        body: JSON.stringify(prefs),
-      }
-    )
-
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}))
-      throw new Error(body.detail || 'Failed to save notification preferences')
-    }
-
-    return await response.json()
-  } catch (error) {
-    throw {
-      code: 'UPDATE_PREFS_FAILED',
-      message: error instanceof Error ? friendlyMessage(error.message) : 'Failed to save notification preferences',
-    } as ApiError
-  }
+export async function wipeAllLocalData(): Promise<{ data_directory?: string; removed?: string[]; database_recreated?: boolean }> {
+  const response = await fetchWithRetry(
+    `${API_CONFIG.BASE_URL}/local/data/wipe`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmation: 'WIPE' }),
+    },
+  )
+  return await response.json()
 }

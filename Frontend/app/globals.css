@@ -734,61 +734,6 @@ html.theme-transitioning .premium-background-construction-lines {
   animation: dot-reveal 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
-/* Landing toggle switch track */
-.landing-toggle-track {
-  position: relative;
-  width: 280px;
-  height: 48px;
-  border-radius: 9999px;
-  background: var(--secondary);
-  border: 1px solid var(--border);
-  cursor: pointer;
-  transition: all 400ms cubic-bezier(0.16, 1, 0.3, 1);
-  user-select: none;
-}
-
-.landing-toggle-knob {
-  position: absolute;
-  top: 3px;
-  width: calc(50% - 4px);
-  height: 42px;
-  border-radius: 9999px;
-  background: var(--primary);
-  transition: transform 400ms cubic-bezier(0.16, 1, 0.3, 1);
-  box-shadow: 0 2px 8px rgba(115, 86, 197, 0.15);
-}
-
-.landing-toggle-knob[data-active="right"] {
-  transform: translateX(calc(100% + 2px));
-}
-
-.landing-toggle-knob[data-active="left"] {
-  transform: translateX(2px);
-}
-
-.landing-toggle-label {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  width: 50%;
-  height: 100%;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  transition: color 300ms ease;
-}
-
-.landing-toggle-label[data-selected="true"] {
-  color: var(--primary-foreground);
-}
-
-.landing-toggle-label[data-selected="false"] {
-  color: var(--muted-foreground);
-}
-
 /* Terminal glow effect */
 .terminal-glow {
   box-shadow:
@@ -1034,155 +979,6 @@ html.theme-transitioning .premium-background-construction-lines {
 
 .sub-card:not(.p-0) {
   padding: 1rem;
-}
-
-.landing-screen-section {
-  display: block;
-  min-height: auto;
-}
-
-.landing-screen-section > div {
-  width: 100%;
-}
-
-.landing-chapter-gap {
-  margin-top: calc(249px - 7rem);
-}
-
-@media (max-width: 767px) {
-  .landing-chapter-gap {
-    margin-top: calc(249px - 6rem);
-  }
-}
-
-.landing-solid-card,
-.landing-solid-card:hover,
-.landing-solid-card:focus,
-.landing-solid-card:focus-visible,
-.landing-solid-card:active {
-  background: #ffffff !important;
-  background-color: #ffffff !important;
-  color: #000000 !important;
-  border-color: color-mix(in srgb, var(--border) 88%, #ffffff) !important;
-  outline: none !important;
-}
-
-.dark .landing-solid-card,
-.dark .landing-solid-card:hover,
-.dark .landing-solid-card:focus,
-.dark .landing-solid-card:focus-visible,
-.dark .landing-solid-card:active {
-  background: var(--card) !important;
-  background-color: var(--card) !important;
-  color: #ffffff !important;
-  border-color: rgba(243, 243, 245, 0.1) !important;
-  outline: none !important;
-}
-
-.billing-switch-thumb {
-  transition:
-    transform 520ms cubic-bezier(0.16, 1, 0.3, 1),
-    background-color 300ms ease,
-    box-shadow 300ms ease;
-}
-
-.pricing-plan-card {
-  --pricing-pointer-x: 50%;
-  --pricing-pointer-y: 35%;
-  isolation: isolate;
-  border-color: color-mix(in srgb, var(--border) 88%, transparent) !important;
-  background:
-    radial-gradient(420px circle at var(--pricing-pointer-x) var(--pricing-pointer-y), color-mix(in srgb, var(--primary) 8%, transparent), transparent 54%),
-    var(--card) !important;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.055);
-  transition:
-    border-color 420ms ease,
-    box-shadow 520ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.pricing-window-set {
-  perspective: 1700px;
-  perspective-origin: 50% 44%;
-}
-
-.pricing-plan-card::before {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  opacity: 0;
-  background:
-    radial-gradient(280px circle at var(--pricing-pointer-x) var(--pricing-pointer-y), color-mix(in srgb, var(--primary) 16%, transparent), transparent 62%);
-  transition: opacity 420ms ease;
-  pointer-events: none;
-}
-
-.pricing-plan-card[data-featured="true"] {
-  border-color: color-mix(in srgb, var(--primary) 38%, var(--border)) !important;
-  box-shadow: 0 20px 54px color-mix(in srgb, var(--primary) 13%, transparent);
-}
-
-.pricing-plan-card:hover {
-  border-color: color-mix(in srgb, var(--primary) 42%, var(--border)) !important;
-  box-shadow: 0 24px 64px color-mix(in srgb, var(--primary) 15%, transparent);
-}
-
-.pricing-plan-card:hover::before {
-  opacity: 1;
-}
-
-.pricing-feature {
-  transition:
-    color 280ms ease,
-    transform 420ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.pricing-plan-card:hover .pricing-feature {
-  color: var(--foreground);
-  transform: translateX(3px);
-}
-
-.pricing-plan-card:hover .pricing-feature:nth-child(2) { transition-delay: 45ms; }
-.pricing-plan-card:hover .pricing-feature:nth-child(3) { transition-delay: 90ms; }
-.pricing-plan-card:hover .pricing-feature:nth-child(4) { transition-delay: 135ms; }
-
-.pricing-feature-check {
-  transition:
-    background-color 300ms ease,
-    transform 500ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.pricing-plan-card:hover .pricing-feature-check {
-  background: var(--primary);
-  color: var(--primary-foreground);
-  transform: rotate(360deg);
-}
-
-.pricing-card-action svg {
-  transition: transform 420ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-.pricing-card-action:hover svg,
-.pricing-plan-card:hover .pricing-card-action svg {
-  transform: translateX(4px);
-}
-
-.dark .pricing-plan-card {
-  background:
-    radial-gradient(420px circle at var(--pricing-pointer-x) var(--pricing-pointer-y), color-mix(in srgb, var(--primary) 11%, transparent), transparent 54%),
-    var(--card) !important;
-  box-shadow: 0 22px 58px rgba(0, 0, 0, 0.22);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .billing-switch-thumb,
-  .pricing-plan-card,
-  .pricing-plan-card::before,
-  .pricing-feature,
-  .pricing-feature-check,
-  .pricing-card-action svg {
-    transition-duration: 1ms !important;
-  }
 }
 
 .dark .sub-card {
@@ -1524,8 +1320,8 @@ html.theme-transitioning .premium-background-construction-lines {
   box-shadow: 0 4px 16px color-mix(in srgb, var(--primary) 10%, transparent);
 }
 
-/* Integrity grade badge */
-.report-integrity-badge {
+/* Optional self-review signal styling */
+.report-self-review-badge {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
@@ -1536,49 +1332,49 @@ html.theme-transitioning .premium-background-construction-lines {
   letter-spacing: 0.01em;
 }
 
-.report-integrity-badge[data-grade="A"] {
+.report-self-review-badge[data-grade="A"] {
   color: var(--accent-teal);
   background: color-mix(in srgb, var(--accent-teal) 10%, var(--card));
   border: 1px solid color-mix(in srgb, var(--accent-teal) 25%, transparent);
 }
 
-.report-integrity-badge[data-grade="B"] {
+.report-self-review-badge[data-grade="B"] {
   color: var(--primary);
   background: color-mix(in srgb, var(--primary) 8%, var(--card));
   border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
 }
 
-.report-integrity-badge[data-grade="C"] {
+.report-self-review-badge[data-grade="C"] {
   color: var(--accent-amber);
   background: color-mix(in srgb, var(--accent-amber) 10%, var(--card));
   border: 1px solid color-mix(in srgb, var(--accent-amber) 25%, transparent);
 }
 
-.report-integrity-badge[data-grade="D"],
-.report-integrity-badge[data-grade="F"] {
+.report-self-review-badge[data-grade="D"],
+.report-self-review-badge[data-grade="F"] {
   color: var(--accent-rose);
   background: color-mix(in srgb, var(--accent-rose) 8%, var(--card));
   border: 1px solid color-mix(in srgb, var(--accent-rose) 20%, transparent);
 }
 
-/* Proctoring event callout — severity variants */
-.report-proctor-event {
+/* Optional self-review event callout */
+.report-self-review-event {
   border-radius: 0 0.75rem 0.75rem 0;
   padding: 1rem 1.25rem;
   transition: background 160ms ease;
 }
 
-.report-proctor-event[data-severity="critical"] {
+.report-self-review-event[data-severity="critical"] {
   border-left: 3px solid var(--accent-rose);
   background: color-mix(in srgb, var(--accent-rose) 5%, var(--card));
 }
 
-.report-proctor-event[data-severity="warning"] {
+.report-self-review-event[data-severity="warning"] {
   border-left: 3px solid var(--accent-amber);
   background: color-mix(in srgb, var(--accent-amber) 5%, var(--card));
 }
 
-.report-proctor-event[data-severity="info"] {
+.report-self-review-event[data-severity="info"] {
   border-left: 3px solid var(--primary);
   background: color-mix(in srgb, var(--primary) 4%, var(--card));
 }
@@ -1898,63 +1694,4 @@ html.theme-transitioning .premium-background-construction-lines {
 [data-sonner-toast].toast-premium [data-close-button] svg {
   width: 12px !important;
   height: 12px !important;
-}
-
-/* ──────────────────────────────────────────
-   Landing Page Step 2 Audio Wave Animation
-   ────────────────────────────────────────── */
-@keyframes landing-wave-active {
-  0% {
-    transform: scaleY(0.2);
-    opacity: 0.5;
-    filter: drop-shadow(0 0 1px rgba(115, 86, 197, 0.15));
-  }
-  25% {
-    transform: scaleY(1.4);
-    opacity: 1;
-    filter: drop-shadow(0 0 6px rgba(115, 86, 197, 0.7));
-    background-color: var(--primary);
-  }
-  50% {
-    transform: scaleY(0.4);
-    opacity: 0.7;
-    filter: drop-shadow(0 0 2px rgba(115, 86, 197, 0.3));
-  }
-  75% {
-    transform: scaleY(1.1);
-    opacity: 0.95;
-    filter: drop-shadow(0 0 5px rgba(115, 86, 197, 0.55));
-    background-color: var(--primary);
-  }
-  100% {
-    transform: scaleY(0.2);
-    opacity: 0.5;
-    filter: drop-shadow(0 0 1px rgba(115, 86, 197, 0.15));
-  }
-}
-
-@keyframes landing-wave-idle {
-  0%, 100% {
-    transform: scaleY(1);
-    opacity: 0.5;
-  }
-  50% {
-    transform: scaleY(0.6);
-    opacity: 0.4;
-  }
-}
-
-.landing-wave-bar {
-  transform-origin: bottom;
-  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1),
-              opacity 0.4s ease,
-              background-color 0.4s ease,
-              filter 0.4s ease;
-  animation: landing-wave-idle 2.8s ease-in-out infinite;
-}
-
-/* When the parent card (with group class) is hovered, trigger active wave animation */
-.group:hover .landing-wave-bar {
-  animation: landing-wave-active 0.7s ease-in-out infinite !important;
-  opacity: 1 !important;
 }

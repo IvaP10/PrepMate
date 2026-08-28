@@ -1,14 +1,16 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useParams, useRouter } from "next/navigation"
 import { AlertTriangle, ArrowLeft, RefreshCw } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { fetchInterviewAnalysisStatus, fetchInterviewReport, retryInterviewAnalysis, type InterviewAnalysisStatus } from "@/lib/api"
+import { downloadInterviewReportJson, fetchInterviewAnalysisStatus, fetchInterviewReport, retryInterviewAnalysis, type InterviewAnalysisStatus } from "@/lib/api"
+import { interviewQuestionResponse, interviewQuestionStatus, interviewReportAvailability } from "@/lib/interview-report-state"
 import { ReportShell } from "@/components/report/report-shell"
 import { ProblemDeepDive } from "@/components/report/problem-deep-dive"
 import { QuestionDeepDive } from "@/components/report/question-deep-dive"
+import { normalizeReportTranscript, ReportTranscript } from "@/components/report/report-transcript"
 
 type AnyRecord = Record<string, any>
 
@@ -40,7 +42,10 @@ interface InterviewReport {
   detailed_responses: AnyRecord[]
 }
 
-const activeInterviewStatuses = new Set(["in_progress", "uploading"])
+const REPORT_POLL_INTERVAL_MS = 5_000
+// Analysis is durable and may legitimately wait on the worker/provider. Keep
+// the report surface live for the advertised one-hour processing window.
+const REPORT_POLL_MAX_ATTEMPTS = 720
 
 function parseReport(report: InterviewReport | null): AnyRecord | null {
   if (!report?.report_v2) return null
@@ -110,7 +115,10 @@ export default function InterviewReportPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [retryingReport, setRetryingReport] = useState(false)
+  const [downloadingJson, setDownloadingJson] = useState(false)
   const [pendingElapsed, setPendingElapsed] = useState(0)
+  const analysisRequestInFlightRef = useRef(false)
+  const reportPollAttemptsRef = useRef(0)
 
   const loadReport = useCallback(async () => {
     if (!interviewId) return
@@ -125,7 +133,8 @@ export default function InterviewReportPage() {
   }, [interviewId])
 
   const refreshAnalysis = useCallback(async () => {
-    if (!interviewId) return
+    if (!interviewId || analysisRequestInFlightRef.current) return
+    analysisRequestInFlightRef.current = true
     try {
       setError(null)
       const status = await fetchInterviewAnalysisStatus(interviewId)
@@ -134,6 +143,7 @@ export default function InterviewReportPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load analysis status")
     } finally {
+      analysisRequestInFlightRef.current = false
       setIsLoading(false)
     }
   }, [interviewId, loadReport])
@@ -152,18 +162,68 @@ export default function InterviewReportPage() {
     }
   }, [interviewId, refreshAnalysis, retryingReport])
 
+  const downloadJson = useCallback(async () => {
+    if (!interviewId || downloadingJson) return
+    setDownloadingJson(true)
+    setError(null)
+    try {
+      await downloadInterviewReportJson(interviewId)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to download report JSON")
+    } finally {
+      setDownloadingJson(false)
+    }
+  }, [downloadingJson, interviewId])
+
   useEffect(() => { void refreshAnalysis() }, [refreshAnalysis])
 
   const statusValue = (analysisStatus?.status || report?.status || "").toLowerCase()
-  const interviewStillActive = activeInterviewStatuses.has(statusValue)
+  const reportAvailability = interviewReportAvailability(statusValue, analysisStatus?.attempt_status)
+  const interviewStillActive = reportAvailability === "active"
+  const interviewRecovering = reportAvailability === "recovering"
+  const interviewIncomplete = reportAvailability === "incomplete"
   const reportFailed = !report && analysisStatus?.report_state === "failed"
-  const reportPending = !report && !!analysisStatus && !analysisStatus.report_ready && !reportFailed && !interviewStillActive
+  const reportPending = !report && !!analysisStatus && !analysisStatus.report_ready && !reportFailed && reportAvailability === "available"
 
   useEffect(() => {
-    if (!reportPending) return
+    if (!reportPending) {
+      reportPollAttemptsRef.current = 0
+      return
+    }
     const timer = setInterval(() => setPendingElapsed((previous) => previous + 1), 1000)
     return () => clearInterval(timer)
   }, [reportPending])
+
+  useEffect(() => {
+    if (!reportPending) return
+
+    const poll = () => {
+      if (
+        document.visibilityState !== "visible"
+        || analysisRequestInFlightRef.current
+        || reportPollAttemptsRef.current >= REPORT_POLL_MAX_ATTEMPTS
+      ) return
+      reportPollAttemptsRef.current += 1
+      void refreshAnalysis()
+    }
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") poll()
+    }
+    const timer = window.setInterval(poll, REPORT_POLL_INTERVAL_MS)
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+    }
+  }, [refreshAnalysis, reportPending])
+
+  if (interviewRecovering) {
+    return <Unavailable title="Interview interrupted" detail="Reopen this interview before the recovery window expires. An official report is not generated while the attempt is recovering." onBack={() => router.push(`/interview/${interviewId}`)} />
+  }
+
+  if (interviewIncomplete) {
+    return <Unavailable title="Report unavailable" detail="This attempt ended incomplete, so no official report was generated. Your saved evidence remains available for recovery coaching." onBack={() => router.push("/?tab=interview")} />
+  }
 
   if (interviewStillActive) {
     return <Unavailable title="Report unavailable" detail="This interview is still active. Finish the round before opening its report." onBack={() => router.push("/?tab=interview")} />
@@ -171,16 +231,19 @@ export default function InterviewReportPage() {
 
   if (reportPending) {
     const progress = Math.max(0, Math.min(100, analysisStatus?.job?.progress || 0))
-    const stage = analysisStatus?.job?.current_stage?.replace(/_/g, " ") || "queued"
-    const processingMinutes = analysisStatus?.processing_sla_minutes || 15
+    const executionPending = Boolean(analysisStatus?.execution_pending)
+    const stage = executionPending
+      ? "grading final code"
+      : analysisStatus?.job?.current_stage?.replace(/_/g, " ") || "queued"
+    const processingMinutes = analysisStatus?.processing_sla_minutes || 60
     return (
       <div className="min-h-screen bg-background p-6 text-foreground md:p-10">
         <div className="mx-auto max-w-3xl space-y-6">
           <Button variant="outline" onClick={() => router.push("/?tab=interview")}><ArrowLeft className="mr-2 h-4 w-4" />Back to Interview</Button>
           <section className="rounded-lg border border-border bg-card p-6">
-            <p className="text-sm font-bold text-primary">Report being generated</p>
-            <h1 className="mt-2 text-2xl font-bold">The report is still being generated from the recorded round.</h1>
-            <p className="mt-2 text-sm leading-6 text-muted-foreground">Current stage: <span className="capitalize">{stage}</span>. This usually completes within {processingMinutes} minutes.</p>
+            <p className="text-sm font-bold text-primary">{executionPending ? "Final submission processing" : "Report being generated"}</p>
+            <h1 className="mt-2 text-2xl font-bold">{executionPending ? "Your final code is still being graded." : "The report is still being generated from the recorded round."}</h1>
+            <p className="mt-2 text-sm leading-6 text-muted-foreground">Current stage: <span className="capitalize">{stage}</span>. We will keep checking for up to {processingMinutes} minutes. You can safely leave and return; the recorded round and queued report remain saved.</p>
             <div className="mt-6 h-2 overflow-hidden rounded bg-border/60"><div className="h-full rounded bg-primary transition-all" style={{ width: `${progress}%` }} /></div>
             <div className="mt-2 flex justify-between text-xs text-muted-foreground"><span>{pendingElapsed}s elapsed</span><span>{progress}%</span></div>
             <Button className="mt-6" variant="outline" onClick={refreshAnalysis}><RefreshCw className="mr-2 h-4 w-4" />Refresh</Button>
@@ -211,7 +274,7 @@ export default function InterviewReportPage() {
   }
 
   if (error || !report) {
-    return <Unavailable title="Report unavailable" detail={error || "We could not load this interview report."} onBack={() => router.push("/?tab=interview")} onRetry={loadReport} />
+    return <Unavailable title="Report unavailable" detail={error || "We could not load this interview report."} onBack={() => router.push("/?tab=interview")} onRetry={refreshAnalysis} />
   }
 
   const reportV2 = parseReport(report)
@@ -225,7 +288,15 @@ export default function InterviewReportPage() {
     ? "custom"
     : report.job_target?.profile_type || reportV2?.profile_type || null
   const technicalProblems = arrayValue(reportV2?.technical?.problems || reportV2?.problems || reportV2?.test_matrix)
-  const questions = arrayValue(reportV2?.questions || reportV2?.per_turn_feedback || report.detailed_responses)
+  const reportSummary = typeof reportV2?.summary === "string" ? reportV2.summary.trim() : ""
+  const findings = arrayValue(reportV2?.findings)
+  const questions: AnyRecord[] = arrayValue(reportV2?.questions || reportV2?.per_turn_feedback || report.detailed_responses)
+    .filter((item) => !item.scoring_excluded && !["warmup", "introduction"].includes(String(item.question_type || "").toLowerCase()))
+    .map<AnyRecord>((item): AnyRecord => ({
+      ...item,
+      response: interviewQuestionResponse(item),
+      status: interviewQuestionStatus(item),
+    }))
   const overallScore = typeof reportV2?.overall_score === "number" ? reportV2.overall_score : report.overall_score
   const counts = reportV2?.counts || {}
   const allowedDuration = deriveAllowedDuration(report, reportV2)
@@ -233,6 +304,7 @@ export default function InterviewReportPage() {
   const analysis = roundAnalysis(reportV2, isTechnical)
   const breakdown = scoreBreakdown(reportV2)
   const timeline = arrayValue(reportV2?.timeline)
+  const transcriptTurns = normalizeReportTranscript(reportV2?.transcript, questions)
   const sectionId = (prefix: string, item: AnyRecord, index: number) => eventId(item, prefix, index)
 
   const stats = isTechnical
@@ -252,11 +324,14 @@ export default function InterviewReportPage() {
 
   const sections = [
     { id: "overall-result", title: "Overall Result" },
+    ...(reportSummary ? [{ id: "report-summary", title: "Summary" }] : []),
+    ...(findings.length ? [{ id: "evidence-findings", title: "Evidence-backed findings" }] : []),
     ...(breakdown.length && !isTechnical ? [{ id: "score-breakdown", title: "Breakdown" }] : []),
     ...(isTechnical ? technicalProblems.map((item, index) => ({ id: sectionId("problem", item, index), title: `Problem ${index + 1}` })) : questions.map((item, index) => ({ id: sectionId("question", item, index), title: `Question ${index + 1}` }))),
     ...(isTechnical && timeline.length ? [{ id: "time-activity", title: "Time / Activity" }] : []),
     ...(!isTechnical && timeline.length ? [{ id: "timeline", title: "Timeline" }] : []),
     ...(analysis.length ? [{ id: "round-analysis", title: "Round Analysis" }] : []),
+    ...(transcriptTurns.length ? [{ id: "transcript", title: "Transcript" }] : []),
   ]
 
   return (
@@ -276,7 +351,31 @@ export default function InterviewReportPage() {
         stats,
       }}
       sections={sections}
+      onDownloadJson={downloadJson}
+      downloadingJson={downloadingJson}
     >
+      {reportSummary && (
+        <section id="report-summary" data-report-section className="rounded-lg border border-border bg-card p-5">
+          <h2 className="text-base font-bold">Summary</h2>
+          <p className="mt-3 text-sm leading-6 text-muted-foreground">{reportSummary}</p>
+        </section>
+      )}
+
+      {findings.length > 0 && (
+        <section id="evidence-findings" data-report-section className="rounded-lg border border-border bg-card p-5">
+          <h2 className="text-base font-bold">Evidence-backed findings</h2>
+          <div className="mt-4 space-y-4">
+            {findings.map((finding, index) => (
+              <div key={finding.finding_key || finding.id || index} className="border-b border-border pb-4 last:border-b-0 last:pb-0">
+                <p className="text-sm font-bold">{finding.title || finding.label || finding.finding_key || "Finding"}</p>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">{finding.what_happened || finding.detail || finding.summary || "Recorded evidence from this round."}</p>
+                {finding.why_matters && <p className="mt-2 text-sm leading-6 text-muted-foreground">Why it matters: {finding.why_matters}</p>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {!isTechnical && breakdown.length > 0 && (
         <section id="score-breakdown" data-report-section className="scroll-mt-8 rounded-lg border border-border bg-card p-5">
           <h2 className="text-base font-bold">Score breakdown</h2>
@@ -331,7 +430,7 @@ export default function InterviewReportPage() {
             question={question.question}
             response={question.response}
             transcript={question.transcript}
-            score={question.score_10 ?? (typeof question.score === "number" ? question.score / 10 : 0)}
+            score={question.score_10 ?? (typeof question.score === "number" ? question.score / 10 : null)}
             status={question.status}
             timeUsedSeconds={question.time_used_seconds ?? question.time_taken}
             whatCandidateAnswered={question.what_candidate_answered}
@@ -367,12 +466,13 @@ export default function InterviewReportPage() {
               <div key={`${item.pattern || "pattern"}-${index}`} className="border-b border-border pb-4 last:border-b-0 last:pb-0">
                 <p className="text-sm font-bold">{item.pattern}</p>
                 <p className="mt-1 text-sm leading-6 text-muted-foreground">{item.detail}</p>
-                {!!item.evidence_ids?.length && <p className="mt-2 font-mono text-[11px] text-muted-foreground">Evidence: {item.evidence_ids.join(", ")}</p>}
               </div>
             ))}
           </div>
         </section>
       )}
+
+      <ReportTranscript turns={transcriptTurns} />
     </ReportShell>
   )
 }

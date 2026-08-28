@@ -11,8 +11,8 @@ from evaluation_engine import EVALUATION_VERSION
 from security_utils import encrypt_data
 
 
-TAXONOMY_VERSION = "interai-taxonomy-v1"
-RUBRIC_VERSION = "interai-rubric-v1"
+TAXONOMY_VERSION = "prepmate-taxonomy-v1"
+RUBRIC_VERSION = "prepmate-rubric-v1"
 
 
 def canonical_context_hash(payload: dict[str, Any]) -> str:
@@ -63,7 +63,7 @@ def create_attempt_context_snapshot(
             context_hash, resume_payload_encrypted, job_context_encrypted,
             blueprint_context_encrypted, evaluator_version, taxonomy_version,
             rubric_version, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
         (
             snapshot_id, interview_id, user_id, resume_id, job_profile_id,
@@ -74,11 +74,11 @@ def create_attempt_context_snapshot(
         ),
     )
     cursor.execute(
-        "UPDATE Interviews SET context_snapshot_id = %s WHERE interview_id = %s AND user_id = %s",
+        "UPDATE Interviews SET context_snapshot_id = ? WHERE interview_id = ? AND user_id = ?",
         (snapshot_id, interview_id, user_id),
     )
     cursor.execute(
-        "UPDATE ResumeVersions SET immutable_at = COALESCE(immutable_at, NOW()) WHERE resume_id = %s AND user_id = %s",
+        "UPDATE ResumeVersions SET immutable_at = COALESCE(immutable_at, CURRENT_TIMESTAMP) WHERE resume_id = ? AND user_id = ?",
         (resume_id, user_id),
     )
     return snapshot_id, context_hash

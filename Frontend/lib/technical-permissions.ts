@@ -30,7 +30,7 @@ type PermissionRuntime = {
   preflightDone: boolean
 }
 
-const runtimeKey = "__interaiTechnicalPermissionRuntime" as const
+const runtimeKey = "__prepmateTechnicalPermissionRuntime" as const
 const runtimeHost = globalThis as typeof globalThis & { [runtimeKey]?: PermissionRuntime }
 const runtime = runtimeHost[runtimeKey] ||= {
   displayStream: null,
@@ -112,7 +112,7 @@ function computeState(): TechnicalPermissionState {
       screenShareSurface: null,
       cameraReady: false,
       microphoneReady: false,
-      ready: false,
+      ready: true,
     }
   }
 
@@ -132,7 +132,10 @@ function computeState(): TechnicalPermissionState {
     screenShareSurface: runtime.displaySurface,
     cameraReady,
     microphoneReady,
-    ready: screenShareReady && cameraReady && microphoneReady,
+    // Technical answers are usable with typed input and no media capture.
+    // Camera, microphone, and screen sharing are optional coaching tools and
+    // become ready only when the user explicitly enables them.
+    ready: true,
   }
 }
 
@@ -230,21 +233,11 @@ export async function requestTechnicalScreenShare(): Promise<TechnicalPermission
     try {
       const stream = await requestMediaWithTimeout(
         navigator.mediaDevices.getDisplayMedia({
-          video: { displaySurface: "monitor" } as MediaTrackConstraints,
+          video: true,
           audio: false,
         }),
-        "Screen sharing timed out. Try again and choose Entire screen within one minute.",
+        "Screen coaching timed out. Try again within one minute.",
       )
-      const settings = stream.getVideoTracks()[0]?.getSettings?.() as MediaTrackSettings & { displaySurface?: string }
-      if (settings?.displaySurface && settings.displaySurface !== "monitor") {
-        stream.getTracks().forEach((track) => track.stop())
-        emitPermissionState()
-        return {
-          ok: false,
-          reason: "screen-share",
-          message: "Share your entire screen, not a browser tab or app window, to continue.",
-        }
-      }
       runtime.permissionsReleased = false
       holdDisplayStream(stream)
     } catch (error) {
@@ -254,7 +247,7 @@ export async function requestTechnicalScreenShare(): Promise<TechnicalPermission
         reason: "screen-share",
         message: error instanceof Error && /timed out/i.test(error.message)
           ? error.message
-          : "Share your full screen to continue. Choose “Entire screen” when prompted.",
+          : "Screen coaching was not enabled. You can continue without it.",
       }
     }
   }
@@ -312,7 +305,7 @@ export async function requestTechnicalCamera(): Promise<TechnicalPermissionResul
         reason: "camera",
         message: error instanceof Error && /timed out/i.test(error.message)
           ? error.message
-          : "Camera access is required. Your video is monitored for integrity during the round.",
+          : "Camera coaching is unavailable. Continue without it or try again.",
       }
     }
   }
@@ -392,13 +385,9 @@ export async function requestTechnicalMedia(): Promise<TechnicalPermissionResult
 }
 
 export async function requestTechnicalPermissions(): Promise<TechnicalPermissionResult> {
-  const fullscreen = requestTechnicalFullscreen()
-  const fullscreenResult = await fullscreen
-  if (!fullscreenResult.ok) return fullscreenResult
-  const screen = await requestTechnicalScreenShare()
-  if (!screen.ok) return screen
-  const media = await requestTechnicalMedia()
-  if (!media.ok) return media
+  // A typed technical round never requests media or fullscreen implicitly.
+  // Individual coaching controls call the specific permission function only
+  // after the user chooses that feature.
   return { ok: true, state: computeState() }
 }
 

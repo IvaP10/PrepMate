@@ -27,10 +27,17 @@ def test_performance_reconciliation_requeues_missing_canonical_analyses():
         "enqueue_analysis",
         enqueue,
     ):
-        result = asyncio.run(analysis.reconcile_performance(current_user={"user_id": "user-1"}))
+        result = asyncio.run(
+            analysis.reconcile_performance(
+                current_user={"user_id": "analysis-reconciliation-test-user"}
+            )
+        )
 
     assert result["queued_count"] == 2
-    assert result["processing_sla_minutes"] == 15
+    assert result["processing_sla_minutes"] == 60
     assert all(call.kwargs["force_canonical_rebuild"] is True for call in enqueue.await_args_list)
-    assert "analysis_pending" in execute.await_args.args[0]
-    assert "analysis_running" in execute.await_args.args[0]
+    selection_sql = execute.await_args.args[0]
+    assert "analysis_pending" in selection_sql
+    assert "analysis_running" in selection_sql
+    assert "FROM ReportArtifacts artifact" in selection_sql
+    assert "FROM ReportSideEffectOutbox side_effect" in selection_sql

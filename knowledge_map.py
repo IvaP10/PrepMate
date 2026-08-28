@@ -10,7 +10,7 @@
 # ENDPOINTS: none (called from interview.py + websocket_manager flow controller)
 # DEPENDS ON: config, llm_router, prompt_security, security_utils
 # CONSUMED BY: interview.py, websocket_manager.InterviewFlowController
-# DATA TABLES: none today (cache is in-process; Phase 4 → Redis L1 + Postgres L2)
+# DATA TABLES: none (the cache is intentionally in-process for one local user)
 # NOTE (Phase 4): the long inline prompt block here moves to
 #   prompt_templates.knowledge_map(...) and the cache becomes content-hashed.
 # ============================================================================
@@ -24,12 +24,12 @@ from typing import Any, Dict, List, Optional
 from interview_blueprint import compile_interview_blueprint, validate_blueprint
 from llm_router import complete_json_async, complete_text_async
 from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
-from redis_client import get_redis
 from security_utils import redact_text, redact_pii_text
 
 logger = logging.getLogger("knowledge_map")
 
-_CACHE_TTL_SECONDS = 600  # 10 minutes
+_KNOWLEDGE_CACHE: dict[str, dict] = {}
+_KNOWLEDGE_CACHE_LIMIT = 128
 
 
 def _skill_names(raw_skills: Any, limit: int = 20) -> List[str]:
@@ -61,25 +61,14 @@ def _skill_names(raw_skills: Any, limit: int = 20) -> List[str]:
 
 
 def _cache_get(cache_key: str):
-    """Read from Redis. Returns a deep copy via JSON deserialization (fixes F8.2)."""
-    redis = get_redis()
-    if not redis:
-        return None
-    raw = redis.get(f"km:{cache_key}")
-    if raw:
-        return json.loads(raw)
-    return None
+    cached = _KNOWLEDGE_CACHE.get(cache_key)
+    return json.loads(json.dumps(cached, default=str)) if cached else None
 
 
 def _cache_set(cache_key: str, knowledge_map: dict):
-    """Write to Redis with TTL. No manual eviction needed."""
-    redis = get_redis()
-    if not redis:
-        return
-    try:
-        redis.setex(f"km:{cache_key}", _CACHE_TTL_SECONDS, json.dumps(knowledge_map, default=str))
-    except Exception:
-        logger.warning("Failed to cache knowledge map in Redis")
+    if len(_KNOWLEDGE_CACHE) >= _KNOWLEDGE_CACHE_LIMIT:
+        _KNOWLEDGE_CACHE.pop(next(iter(_KNOWLEDGE_CACHE)))
+    _KNOWLEDGE_CACHE[cache_key] = json.loads(json.dumps(knowledge_map, default=str))
 
 async def build_knowledge_map(
     resume_data: Dict,
@@ -584,6 +573,7 @@ async def generate_contextual_followup(
     profile_type: str = "mid_tier",
     job_title: str = "",
     resume_context: str = "",
+    job_context: Any = None,
     followup_action: str = "",
     question_id: Optional[str] = None,
     parent_question_id: Optional[str] = None,
@@ -622,8 +612,19 @@ async def generate_contextual_followup(
 
     history_text = data_block("recent_conversation", history_text)
     response_truncated = data_block("candidate_response", candidate_response, 600)
+    resume_block = data_block(
+        "candidate_resume_context",
+        resume_context or "Not provided",
+        1200,
+    )
+    serialized_job_context = (
+        json.dumps(job_context, ensure_ascii=False, default=str)
+        if isinstance(job_context, dict)
+        else str(job_context or "Not provided")
+    )
+    job_block = data_block("role_job_context", serialized_job_context, 900)
 
-    prompt = f"""You are a technical interviewer conducting a live interview. Topic: {battleground_label}
+    prompt = f"""You are an experienced interviewer conducting a live interview. Topic: {battleground_label}
 Original question: {main_question}
 
 Recent conversation:
@@ -631,6 +632,12 @@ Recent conversation:
 
 The candidate's latest response scored {performance_score}/100:
 {response_truncated}
+
+Frozen candidate resume context:
+{resume_block}
+
+Frozen role and job context:
+{job_block}
 
 {difficulty_instruction}
 
@@ -657,8 +664,9 @@ Return only the follow-up question as plain text."""
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert technical interviewer. Generate adaptive follow-up questions that are ALWAYS "
-                        "based on what the candidate actually said. Never ask generic or pre-planned questions. "
+                        "You are an expert interviewer. Generate one adaptive project, behavioral, or technical follow-up "
+                        "that matches the active topic and is ALWAYS based on what the candidate actually said. "
+                        "Never ask a generic or pre-planned question. "
                         f"{SYSTEM_DATA_BOUNDARY}"
                     )
                 },
@@ -766,15 +774,6 @@ def _fallback_knowledge_map(
     }
 
 def clear_cache():
-    """Flush all knowledge map cache entries from Redis."""
-    redis = get_redis()
-    if redis:
-        # Use SCAN to find and delete all km:* keys
-        cursor = 0
-        while True:
-            cursor, keys = redis.scan(cursor, match="km:*", count=100)
-            if keys:
-                redis.delete(*keys)
-            if cursor == 0:
-                break
+    """Flush the bounded in-process knowledge-map cache."""
+    _KNOWLEDGE_CACHE.clear()
     logger.info("Knowledge map cache cleared")

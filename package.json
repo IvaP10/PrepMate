@@ -1,0 +1,27 @@
+{
+  "name": "prepmate",
+  "version": "0.1.0-alpha.1",
+  "description": "Local-first interview practice desktop application",
+  "license": "Apache-2.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix desktop",
+    "test": "python3 -m pytest -q && npm test --prefix Frontend",
+    "typecheck": "npm run typecheck --prefix Frontend",
+    "source:guard": "python3 scripts/source_guard.py",
+    "release:check": "python3 scripts/source_guard.py && python3 scripts/sqlite_query_audit.py --strict && python3 scripts/release_checks.py",
+    "audit": "python3 -m pip_audit -r requirements.lock.txt --strict && python3 -m pip_audit -r requirements-ocr.lock.txt --no-deps --strict && npm audit --audit-level=high && npm audit --prefix Frontend --audit-level=high && npm audit --prefix desktop --audit-level=high",
+    "build:frontend": "npm run build --prefix Frontend",
+    "build:backend": "python3 -m PyInstaller --noconfirm desktop/prepmate.spec",
+    "package": "npm run build:frontend && npm run build:backend && npm run package --prefix desktop",
+    "package:mac": "npm run build:frontend && npm run build:backend && npm run package:mac --prefix desktop",
+    "release:macos": "python3 scripts/release_checks.py --distribution --signing macos && npm run package:mac"
+  },
+  "engines": {
+    "node": ">=22",
+    "python": ">=3.12,<3.14"
+  },
+  "devDependencies": {
+    "@cyclonedx/cyclonedx-npm": "6.0.1"
+  }
+}

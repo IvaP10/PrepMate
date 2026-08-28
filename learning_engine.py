@@ -1,7 +1,7 @@
 # ============================================================================
 # MODULE: learning_engine.py
 # PURPOSE: Skill evidence ingestion + exercise generation + attempt grading +
-#          anti-cheat/malpractice ingestion + learning snapshot for dashboard.
+#          optional self-review signal ingestion + learning snapshot for dashboard.
 # STRUCTURE:
 #   - STRICT/SEVERE event type sets + PASS_SCORE constant (lines 29-32)
 #                                          << Phase 3: move thresholds to app_config
@@ -15,9 +15,9 @@
 # DEPENDS ON: database, llm_router, prompt_security
 # CONSUMED BY: interview.py, workspace_api.py, technical_mode.py
 # DATA TABLES: LearnerSkillStates, SkillEvidenceEvents, ProjectKnowledgeGaps,
-#              GeneratedExercises, ExerciseAttempts, MalpracticeEvents,
+#              GeneratedExercises, ExerciseAttempts, self-review signal storage,
 #              TechnicalRunEvents, TechnicalMistakeClusters
-#              (Phase 2: MalpracticeEvents -> InterviewEvents)
+#              (Phase 2: self-review signals -> InterviewEvents)
 #              (Phase 4: exercise prompts move to prompt_templates.py + llm_cache)
 # ============================================================================
 
@@ -45,11 +45,10 @@ from improve_scoring import (
 from llm_router import complete_json_async
 from mission_priority import calculate_mission_priority
 from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
-from security_utils import decrypt_data, encrypt_data
+from security_utils import decrypt_data, decrypt_json_field, encrypt_data, stable_hash
 
 
 logger = logging.getLogger("learning_engine")
-SEVERE_EVENT_TYPES = {"tab_switch", "fullscreen_exit", "paste", "paste_blocked"}
 PASS_SCORE = 75
 EVIDENCE_EVALUATOR_VERSION = "learning-evidence-v1"
 
@@ -321,8 +320,8 @@ def _mission_title(skill_key: str, evidence_text: str) -> str:
     text = f"{skill_key} {evidence_text}".lower()
     if str(skill_key or "").startswith("communication:"):
         return f"Give a Direct Answer About {_label_from_key(skill_key)}, Then Add Evidence"
-    if "interai" in text:
-        return "Explain InterAI with Architecture, Decisions, and Results"
+    if "interai" in text or "prepmate" in text:
+        return "Explain PrepMate with Architecture, Decisions, and Results"
     if "technical" in text or "code" in text:
         return "Plan and Test the Solution Before Coding"
     if "resume" in text:
@@ -895,7 +894,7 @@ async def _upsert_skill_state(user_id: str, skill_key: str, category: str, evide
         """
         SELECT mastery_score, confidence_score, evidence_count
         FROM LearnerSkillStates
-        WHERE user_id = %s AND skill_key = %s
+        WHERE user_id = ? AND skill_key = ?
         """,
         (user_id, skill_key),
         fetchone=True,
@@ -911,14 +910,14 @@ async def _upsert_skill_state(user_id: str, skill_key: str, category: str, evide
         await async_execute(
             """
             UPDATE LearnerSkillStates
-            SET skill_category = %s,
-                mastery_score = %s,
-                confidence_score = %s,
+            SET skill_category = ?,
+                mastery_score = ?,
+                confidence_score = ?,
                 evidence_count = evidence_count + 1,
-                last_evidence_at = NOW(),
-                next_review_at = %s,
-                updated_at = NOW()
-            WHERE user_id = %s AND skill_key = %s
+                last_evidence_at = CURRENT_TIMESTAMP,
+                next_review_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND skill_key = ?
             """,
             (category, mastery, confidence, next_review_at, user_id, skill_key),
         )
@@ -933,7 +932,7 @@ async def _upsert_skill_state(user_id: str, skill_key: str, category: str, evide
                 user_id, skill_key, skill_category, mastery_score, confidence_score,
                 evidence_count, last_evidence_at, next_review_at
             )
-            VALUES (%s, %s, %s, %s, %s, 1, NOW(), %s)
+            VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?)
             """,
             (user_id, skill_key, category, mastery, confidence, next_review_at),
         )
@@ -1022,7 +1021,7 @@ async def _insert_skill_evidence(
                     score_delta, evidence, source_type, source_id,
                     evaluator_version, evidence_hash
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (user_id, skill_key, source_type, source_id, evaluator_version)
                 DO NOTHING
                 RETURNING evidence_id
@@ -1059,7 +1058,7 @@ async def _insert_skill_evidence(
                     confidence_score, evidence_count, last_evidence_at,
                     next_review_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, 18, 1, NOW(), %s, NOW())
+                VALUES (?, ?, ?, ?, 18, 1, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT (user_id, skill_key) DO UPDATE SET
                     skill_category = EXCLUDED.skill_category,
                     mastery_score = ROUND(
@@ -1069,15 +1068,15 @@ async def _insert_skill_evidence(
                             CASE WHEN LearnerSkillStates.evidence_count < 4 THEN 0.32 ELSE 0.22 END,
                         1
                     ),
-                    confidence_score = LEAST(
+                    confidence_score = MIN(
                         100,
                         LearnerSkillStates.confidence_score
                             + CASE WHEN LearnerSkillStates.evidence_count < 4 THEN 10 ELSE 4 END
                     ),
                     evidence_count = LearnerSkillStates.evidence_count + 1,
-                    last_evidence_at = NOW(),
+                    last_evidence_at = CURRENT_TIMESTAMP,
                     next_review_at = EXCLUDED.next_review_at,
-                    updated_at = NOW()
+                    updated_at = CURRENT_TIMESTAMP
                 RETURNING mastery_score, confidence_score, evidence_count, next_review_at
                 """,
                 (user_id, skill_key, category, normalized_score, next_review_at),
@@ -1134,7 +1133,7 @@ async def _upsert_project_gap(
         """
         SELECT gap_id, evidence
         FROM ProjectKnowledgeGaps
-        WHERE user_id = %s AND project_key = %s AND gap_key = %s AND status = 'open'
+        WHERE user_id = ? AND project_key = ? AND gap_key = ? AND status = 'open'
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -1151,8 +1150,8 @@ async def _upsert_project_gap(
         await async_execute(
             """
             UPDATE ProjectKnowledgeGaps
-            SET gap_summary = %s, evidence = %s, next_check_at = %s, updated_at = NOW()
-            WHERE gap_id = %s
+            SET gap_summary = ?, evidence = ?, next_check_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE gap_id = ?
             """,
             (gap_summary, json.dumps(updated), datetime.now(timezone.utc) + timedelta(days=1), row[0]),
         )
@@ -1162,7 +1161,7 @@ async def _upsert_project_gap(
         INSERT INTO ProjectKnowledgeGaps (
             user_id, project_key, gap_key, gap_summary, evidence, next_check_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
@@ -1188,9 +1187,9 @@ async def _queue_exercise(
         """
         SELECT exercise_id
         FROM GeneratedExercises
-        WHERE user_id = %s
-          AND skill_key = %s
-          AND exercise_type = %s
+        WHERE user_id = ?
+          AND skill_key = ?
+          AND exercise_type = ?
           AND status IN ('queued', 'in_progress')
         ORDER BY created_at DESC
         LIMIT 1
@@ -1208,7 +1207,7 @@ async def _queue_exercise(
             exercise_id, user_id, interview_id, skill_key, exercise_type,
             prompt, rubric, source_evidence, status
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued')
         """,
         (
             exercise_id,
@@ -1240,7 +1239,7 @@ def _insert_mission_event_sync(
         INSERT INTO ImprovementMissionEvents (
             user_id, mission_id, roadmap_node_id, exercise_id, attempt_id, event_type, payload
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (user_id, mission_id, roadmap_node_id, exercise_id, attempt_id, event_type, _safe_json(payload)),
     )
@@ -1277,8 +1276,8 @@ def _create_improve_exercise_sync(
             roadmap_node_id, activity_type, variation_group, is_checkpoint,
             activity_metadata
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             exercise_id,
@@ -1319,20 +1318,20 @@ def _ensure_active_improvement_mission(
     if mode == "technical":
         mode_guard = """
           AND weakness_type = 'technical_failure'
-          AND COALESCE(weakness_key, '') LIKE 'technical:%%'
+          AND COALESCE(weakness_key, '') LIKE 'technical:%'
         """
     else:
         mode_guard = """
           AND COALESCE(weakness_type, '') <> 'technical_failure'
-          AND COALESCE(weakness_key, '') NOT LIKE 'technical:%%'
-          AND COALESCE(weakness_key, '') NOT LIKE 'algorithm:%%'
-          AND COALESCE(weakness_key, '') NOT LIKE 'debugging:%%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'technical:%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'algorithm:%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'debugging:%'
         """
     cursor.execute(
         f"""
-        SELECT mission_id
+        SELECT mission_id, source_interview_id, source_analysis_id
         FROM ImprovementMissions
-        WHERE user_id = %s AND mode = %s AND status = 'active'
+        WHERE user_id = ? AND mode = ? AND status = 'active'
         {mode_guard}
         ORDER BY created_at DESC
         LIMIT 1
@@ -1341,15 +1340,61 @@ def _ensure_active_improvement_mission(
     )
     existing = cursor.fetchone()
     if existing:
-        return existing[0]
+        # Legacy and fixture-created missions may predate report provenance.
+        # If the user has not started that pathway, replace it so the visible
+        # Improve plan is actually grounded in the newly published report.
+        # Started pathways remain stable and are reassessed by later reports.
+        replace_unstarted_report_source = bool(source_analysis_id) and (
+            not existing[2]
+            or (
+                bool(source_interview_id)
+                and str(existing[1] or "") == str(source_interview_id)
+                and str(existing[2] or "") != str(source_analysis_id)
+            )
+        )
+        if replace_unstarted_report_source:
+            cursor.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM ImprovementRoadmapNodes
+                    WHERE mission_id = ?
+                      AND activity_type <> 'baseline'
+                      AND (
+                          result_status NOT IN ('not_attempted', 'draft')
+                          OR attempt_status NOT IN ('draft', 'not_started')
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM ImprovementAttemptSessions
+                    WHERE mission_id = ?
+                      AND status IN ('active', 'in_progress')
+                )
+                """,
+                (existing[0], existing[0]),
+            )
+            started = bool((cursor.fetchone() or [False])[0])
+            if not started:
+                cursor.execute(
+                    """
+                    UPDATE ImprovementMissions
+                    SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ? AND status = 'active'
+                    """,
+                    (existing[0],),
+                )
+                existing = None
+        if existing:
+            return existing[0]
 
     cursor.execute(
         """
         UPDATE ImprovementMissions
         SET status = 'superseded',
-            updated_at = NOW()
-        WHERE user_id = %s
-          AND mode = %s
+            updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+          AND mode = ?
           AND status = 'active'
         """,
         (user_id, mode),
@@ -1367,7 +1412,7 @@ def _ensure_active_improvement_mission(
     primary_gap = skill_gaps[0] if skill_gaps else {}
     technical = technical_mistakes[0] if technical_mistakes else {}
     project_gap = project_homework[0] if project_homework else {}
-    skill_key = str(primary_gap.get("skill_key") or technical.get("skill_key") or technical.get("mistake_key") or project_gap.get("gap_key") or "project:interai:defense")
+    skill_key = str(primary_gap.get("skill_key") or technical.get("skill_key") or technical.get("mistake_key") or project_gap.get("gap_key") or "project:prepmate:defense")
     skill_label = str(primary_gap.get("label") or technical.get("topic_label") or _label_from_key(skill_key))
     category = str(primary_gap.get("category") or ("technical" if mode == "technical" else _skill_category(skill_key)))
     baseline_score = _clip(float(primary_gap.get("mastery_score") or (38 if mode == "technical" else 54)))
@@ -1413,7 +1458,7 @@ def _ensure_active_improvement_mission(
             baseline_readiness, current_readiness, target_readiness, progress_percent,
             validation_status
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, 'active')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active')
         """,
         (
             mission_id,
@@ -1448,7 +1493,7 @@ def _ensure_active_improvement_mission(
             baseline_score, latest_score, target_score, role_weight, mastery_status,
             evidence_summary, criteria_json
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1, 'practising', %s, %s)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'practising', ?, ?)
         """,
         (
             mission_skill_id,
@@ -1500,8 +1545,8 @@ def _ensure_active_improvement_mission(
                 attempt_status, result_status, mastery_status, estimated_minutes,
                 expected_result, evidence_json, completed_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    CASE WHEN %s THEN NOW() ELSE NULL END)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
             """,
             (
                 roadmap_node_id,
@@ -1532,9 +1577,70 @@ def _ensure_active_improvement_mission(
     )
     logger.info(
         "improve_mission_generated",
-        extra={"user_id": user_id, "mission_id": mission_id, "priority_score": priority["priority_score"]},
+        extra={
+            "user_ref": stable_hash(user_id, "user"),
+            "mission_ref": stable_hash(mission_id, "mission"),
+            "priority_score": priority["priority_score"],
+        },
     )
     return mission_id
+
+
+def _has_current_performance_analysis(
+    cursor: Any,
+    user_id: str,
+    *,
+    mode: Optional[str] = None,
+    interview_id: Optional[str] = None,
+    analysis_id: Optional[str] = None,
+) -> bool:
+    """Keep Improve downstream of one grounded canonical report.
+
+    A single sufficient report is enough to start the ordered exercise
+    pathway.  Comparison readiness is a separate Performance concern and is
+    only reached after repeated comparable evidence exists.
+    """
+    clauses = [
+        "analysis.user_id = ?",
+        "analysis.schema_version = 'session-performance-v4'",
+        "analysis.status = 'ready'",
+        "analysis.is_current = TRUE",
+        "analysis.evidence_status = 'sufficient'",
+        "analysis.overall_score IS NOT NULL",
+        "analysis.analysis_json_encrypted IS NOT NULL",
+        "analysis.evidence_index_encrypted IS NOT NULL",
+        """EXISTS (
+            SELECT 1
+            FROM ReportArtifacts artifact
+            WHERE artifact.analysis_id = analysis.analysis_id
+              AND artifact.interview_id = analysis.interview_id
+              AND artifact.user_id = analysis.user_id
+              AND artifact.audience = 'candidate'
+              AND artifact.status IN ('completed', 'partial')
+              AND artifact.payload_encrypted IS NOT NULL
+        )""",
+    ]
+    params: List[Any] = [user_id]
+    if mode:
+        clauses.append("analysis.mode = ?")
+        params.append(mode)
+    if interview_id:
+        clauses.append("analysis.interview_id = ?")
+        params.append(interview_id)
+    if analysis_id:
+        clauses.append("analysis.analysis_id = ?")
+        params.append(analysis_id)
+    cursor.execute(
+        f"""
+        SELECT EXISTS (
+            SELECT 1
+            FROM SessionPerformanceAnalyses analysis
+            WHERE {' AND '.join(clauses)}
+        )
+        """,
+        tuple(params),
+    )
+    return bool((cursor.fetchone() or [False])[0])
 
 
 def _ensure_mission_from_weakness_sync(
@@ -1546,6 +1652,15 @@ def _ensure_mission_from_weakness_sync(
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
+        if not _has_current_performance_analysis(
+            cursor,
+            user_id,
+            mode="technical" if mode == "technical" else "mock",
+            interview_id=interview_id,
+            analysis_id=analysis_id,
+        ):
+            connection.commit()
+            return None
         technical_mode = mode == "technical"
         cursor.execute(
             """
@@ -1553,10 +1668,10 @@ def _ensure_mission_from_weakness_sync(
                    observation_count, baseline_score, latest_score, confidence,
                    root_cause_hypothesis, root_cause_confidence, evidence_summary
             FROM WeaknessStates
-            WHERE user_id = %s AND lifecycle_state <> 'resolved'
+            WHERE user_id = ? AND lifecycle_state <> 'resolved'
               AND (
-                  (%s = TRUE AND skill_key LIKE 'technical:%%')
-                  OR (%s = FALSE AND skill_key NOT LIKE 'technical:%%')
+                  (? = TRUE AND skill_key LIKE 'technical:%')
+                  OR (? = FALSE AND skill_key NOT LIKE 'technical:%')
               )
             ORDER BY
                 CASE lifecycle_state
@@ -1574,8 +1689,8 @@ def _ensure_mission_from_weakness_sync(
             return None
         summary = _json_load(row[9], {})
         evidence_text = str(
-            row[7]
-            or (summary.get("summary") if isinstance(summary, dict) else "")
+            (summary.get("summary") if isinstance(summary, dict) else "")
+            or row[7]
             or f"Evidence shows a {row[2]} weakness in {_label_from_key(row[1])}."
         )
         if technical_mode:
@@ -1678,13 +1793,22 @@ def _ensure_mission_from_technical_report_sync(
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
+        if not _has_current_performance_analysis(
+            cursor,
+            user_id,
+            mode="technical",
+            interview_id=interview_id,
+            analysis_id=analysis_id,
+        ):
+            connection.commit()
+            return None
         cursor.execute(
             """
             SELECT mission_id, source_analysis_id
             FROM ImprovementMissions
-            WHERE user_id = %s AND mode = 'technical' AND status = 'active'
+            WHERE user_id = ? AND mode = 'technical' AND status = 'active'
               AND weakness_type = 'technical_failure'
-              AND COALESCE(weakness_key, '') LIKE 'technical:%%'
+              AND COALESCE(weakness_key, '') LIKE 'technical:%'
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -1700,7 +1824,7 @@ def _ensure_mission_from_technical_report_sync(
                 SELECT EXISTS (
                     SELECT 1
                     FROM ImprovementRoadmapNodes
-                    WHERE mission_id = %s
+                    WHERE mission_id = ?
                       AND activity_type <> 'baseline'
                       AND (
                           result_status NOT IN ('not_attempted', 'draft')
@@ -1710,7 +1834,7 @@ def _ensure_mission_from_technical_report_sync(
                 OR EXISTS (
                     SELECT 1
                     FROM ImprovementAttemptSessions
-                    WHERE mission_id = %s
+                    WHERE mission_id = ?
                       AND status IN ('active', 'in_progress')
                 )
                 """,
@@ -1723,8 +1847,8 @@ def _ensure_mission_from_technical_report_sync(
             cursor.execute(
                 """
                 UPDATE ImprovementMissions
-                SET status = 'superseded', updated_at = NOW()
-                WHERE mission_id = %s AND status = 'active'
+                SET status = 'superseded', updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND status = 'active'
                 """,
                 (existing[0],),
             )
@@ -1770,30 +1894,39 @@ def _ensure_mission_from_response_assessment_sync(
 ) -> Optional[str]:
     """Create a coaching mission from real partial-attempt evidence.
 
-    A voluntarily ended round is not official readiness evidence, but its
-    persisted response assessments are still useful for sentence repair and
-    open-mic practice. This keeps Improve useful without grading the session.
+    A voluntarily ended round is not enough to unlock coaching by itself. Its
+    assessments may seed a mission only after the canonical Performance
+    projection for the same interview is ready.
     """
     connection = get_db_connection()
     cursor = connection.cursor()
     try:
+        if not _has_current_performance_analysis(
+            cursor,
+            user_id,
+            mode="mock",
+            interview_id=interview_id,
+        ):
+            connection.commit()
+            return None
         cursor.execute(
             """
-            SELECT ra.assessment_id, ra.assessment_json,
+            SELECT ra.assessment_id, ra.assessment_json_encrypted,
+                   ra.assessment_json,
                    iq.question_text, iq.topic_label, iq.question_type,
                    ir.answer_text_encrypted, ir.user_response
             FROM ResponseAssessments ra
             JOIN InterviewResponses ir ON ir.response_id = ra.response_id
             JOIN InterviewQuestions iq ON iq.question_id = ir.question_id
             JOIN Interviews i ON i.interview_id = ir.interview_id
-            WHERE ra.interview_id = %s AND i.user_id = %s
+            WHERE ra.interview_id = ? AND i.user_id = ?
             ORDER BY ra.created_at
             """,
             (interview_id, user_id),
         )
         candidates: List[Dict[str, Any]] = []
         for row in cursor.fetchall() or []:
-            assessment = _json_load(row[1], {})
+            assessment = decrypt_json_field(row[1], row[2], {})
             flags = assessment.get("flags") if isinstance(assessment.get("flags"), list) else []
             provisional = assessment.get("provisional_score")
             try:
@@ -1805,9 +1938,9 @@ def _ensure_mission_from_response_assessment_sync(
             candidates.append({
                 "assessment_id": str(row[0]),
                 "assessment": assessment,
-                "question": str(row[2] or ""),
-                "topic": str(row[3] or "Interview answer"),
-                "question_type": str(row[4] or "main"),
+                "question": str(row[3] or ""),
+                "topic": str(row[4] or "Interview answer"),
+                "question_type": str(row[5] or "main"),
                 "provisional_score": provisional_score,
                 "flags": [str(flag) for flag in flags],
             })
@@ -1900,16 +2033,15 @@ def _validate_mission_with_analysis_sync(
               ON source.analysis_id = mission.source_analysis_id
              AND source.user_id = mission.user_id
             JOIN SessionPerformanceAnalyses current_analysis
-              ON current_analysis.analysis_id = %s
-             AND current_analysis.interview_id = %s
+              ON current_analysis.analysis_id = ?
+             AND current_analysis.interview_id = ?
              AND current_analysis.user_id = mission.user_id
              AND current_analysis.mode = mission.mode
-            WHERE mission.user_id = %s AND mission.mode = %s AND mission.status = 'active'
+            WHERE mission.user_id = ? AND mission.mode = ? AND mission.status = 'active'
               AND mission.validation_status IN ('validation_pending', 'needs_reinforcement')
-              AND mission.source_interview_id IS DISTINCT FROM %s
+              AND mission.source_interview_id IS NOT ?
             ORDER BY mission.priority_score DESC, mission.updated_at DESC
             LIMIT 1
-            FOR UPDATE OF mission
             """,
             (
                 analysis_id, interview_id, user_id,
@@ -1986,7 +2118,7 @@ def _validate_mission_with_analysis_sync(
                 validation_id, mission_id, user_id, analysis_id, interview_id,
                 evidence_type, passed, score, confidence, evidence_json,
                 source_key, evidence_hash
-            ) VALUES (%s, %s, %s, %s, %s, 'later_interview', %s, %s, %s, %s, %s, %s)
+            ) VALUES (?, ?, ?, ?, ?, 'later_interview', ?, ?, ?, ?, ?, ?)
             ON CONFLICT (mission_id, source_key, evidence_hash) DO NOTHING
             """,
             (
@@ -1998,7 +2130,7 @@ def _validate_mission_with_analysis_sync(
             """
             SELECT EXISTS (
                 SELECT 1 FROM MissionValidationEvidence
-                WHERE mission_id = %s AND evidence_type = 'held_out_variation' AND passed = TRUE
+                WHERE mission_id = ? AND evidence_type = 'held_out_variation' AND passed = TRUE
             )
             """,
             (mission_id,),
@@ -2010,19 +2142,19 @@ def _validate_mission_with_analysis_sync(
                 """
                 UPDATE ImprovementMissions
                 SET status = 'completed', validation_status = 'verified',
-                    validated_by_interview_id = %s, later_interview_id = %s,
-                    validation_analysis_id = %s, progress_percent = 100,
-                    completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
-                WHERE mission_id = %s AND user_id = %s
+                    validated_by_interview_id = ?, later_interview_id = ?,
+                    validation_analysis_id = ?, progress_percent = 100,
+                    completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND user_id = ?
                 """,
                 (interview_id, interview_id, analysis_id, mission_id, user_id),
             )
             cursor.execute(
                 """
                 UPDATE WeaknessStates
-                SET lifecycle_state = 'resolved', resolved_at = COALESCE(resolved_at, NOW()),
-                    latest_score = %s, confidence = GREATEST(confidence, %s), updated_at = NOW()
-                WHERE user_id = %s AND skill_key = %s
+                SET lifecycle_state = 'resolved', resolved_at = COALESCE(resolved_at, CURRENT_TIMESTAMP),
+                    latest_score = ?, confidence = MAX(confidence, ?), updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND skill_key = ?
                 """,
                 (score, confidence, user_id, weakness_key),
             )
@@ -2030,10 +2162,10 @@ def _validate_mission_with_analysis_sync(
                 """
                 UPDATE ImprovementMissionSkills
                 SET mastery_status = 'verified',
-                    verified_at = COALESCE(verified_at, NOW()),
+                    verified_at = COALESCE(verified_at, CURRENT_TIMESTAMP),
                     needs_reinforcement_at = NULL,
-                    updated_at = NOW()
-                WHERE mission_id = %s AND user_id = %s AND skill_key = %s
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND user_id = ? AND skill_key = ?
                 """,
                 (mission_id, user_id, weakness_key),
             )
@@ -2041,8 +2173,8 @@ def _validate_mission_with_analysis_sync(
             cursor.execute(
                 """
                 UPDATE ImprovementMissions
-                SET validation_status = 'needs_reinforcement', updated_at = NOW()
-                WHERE mission_id = %s AND user_id = %s
+                SET validation_status = 'needs_reinforcement', updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND user_id = ?
                 """,
                 (mission_id, user_id),
             )
@@ -2050,10 +2182,10 @@ def _validate_mission_with_analysis_sync(
                 """
                 UPDATE ImprovementMissionSkills
                 SET mastery_status = 'needs_reinforcement',
-                    needs_reinforcement_at = NOW(),
+                    needs_reinforcement_at = CURRENT_TIMESTAMP,
                     verified_at = NULL,
-                    updated_at = NOW()
-                WHERE mission_id = %s AND user_id = %s AND skill_key = %s
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE mission_id = ? AND user_id = ? AND skill_key = ?
                 """,
                 (mission_id, user_id, weakness_key),
             )
@@ -2061,7 +2193,7 @@ def _validate_mission_with_analysis_sync(
                 """
                 SELECT mission_skill_id
                 FROM ImprovementMissionSkills
-                WHERE mission_id = %s AND user_id = %s AND skill_key = %s
+                WHERE mission_id = ? AND user_id = ? AND skill_key = ?
                 LIMIT 1
                 """,
                 (mission_id, user_id, weakness_key),
@@ -2344,6 +2476,22 @@ async def classify_code_mistake(
             temperature=0.1,
             max_tokens=500,
             provider_policy="local_required",
+            json_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "mistake_type": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "mistake_key": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 500},
+                    "repair_action": {"type": "string", "minLength": 1, "maxLength": 500},
+                },
+                "required": [
+                    "mistake_type",
+                    "mistake_key",
+                    "summary",
+                    "repair_action",
+                ],
+            },
             metadata={"round_type": round_type, "language": language},
         )
         mistake_type = _slug(str(payload.get("mistake_type") or "execution_failure"), "execution-failure")
@@ -2388,7 +2536,7 @@ async def _upsert_mistake_cluster(
         """
         SELECT cluster_id, examples, occurrence_count
         FROM TechnicalMistakeClusters
-        WHERE user_id = %s AND mistake_key = %s
+        WHERE user_id = ? AND mistake_key = ?
         """,
         (user_id, diagnosis["mistake_key"]),
         fetchone=True,
@@ -2401,12 +2549,12 @@ async def _upsert_mistake_cluster(
         await async_execute(
             """
             UPDATE TechnicalMistakeClusters
-            SET round_id = %s,
-                mistake_type = %s,
-                examples = %s,
+            SET round_id = ?,
+                mistake_type = ?,
+                examples = ?,
                 occurrence_count = occurrence_count + 1,
-                last_seen_at = NOW()
-            WHERE cluster_id = %s
+                last_seen_at = CURRENT_TIMESTAMP
+            WHERE cluster_id = ?
             """,
             (round_id, diagnosis["mistake_type"], json.dumps(examples), row[0]),
         )
@@ -2416,7 +2564,7 @@ async def _upsert_mistake_cluster(
         INSERT INTO TechnicalMistakeClusters (
             user_id, round_id, mistake_type, mistake_key, examples
         )
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (?, ?, ?, ?, ?)
         """,
         (user_id, round_id, diagnosis["mistake_type"], diagnosis["mistake_key"], json.dumps([example])),
     )
@@ -2880,7 +3028,7 @@ def _sync_skill_state_update(cursor: Any, user_id: str, skill_key: str, category
         """
         SELECT mastery_score, confidence_score, evidence_count
         FROM LearnerSkillStates
-        WHERE user_id = %s AND skill_key = %s
+        WHERE user_id = ? AND skill_key = ?
         """,
         (user_id, skill_key),
     )
@@ -2896,14 +3044,14 @@ def _sync_skill_state_update(cursor: Any, user_id: str, skill_key: str, category
         cursor.execute(
             """
             UPDATE LearnerSkillStates
-            SET skill_category = %s,
-                mastery_score = %s,
-                confidence_score = %s,
+            SET skill_category = ?,
+                mastery_score = ?,
+                confidence_score = ?,
                 evidence_count = evidence_count + 1,
-                last_evidence_at = NOW(),
-                next_review_at = %s,
-                updated_at = NOW()
-            WHERE user_id = %s AND skill_key = %s
+                last_evidence_at = CURRENT_TIMESTAMP,
+                next_review_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND skill_key = ?
             """,
             (category, mastery, confidence, next_review_at, user_id, skill_key),
         )
@@ -2918,7 +3066,7 @@ def _sync_skill_state_update(cursor: Any, user_id: str, skill_key: str, category
                 user_id, skill_key, skill_category, mastery_score, confidence_score,
                 evidence_count, last_evidence_at, next_review_at
             )
-            VALUES (%s, %s, %s, %s, %s, 1, NOW(), %s)
+            VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?)
             """,
             (user_id, skill_key, category, mastery, confidence, next_review_at),
         )
@@ -2941,7 +3089,7 @@ def _recalculate_mission_sync(cursor: Any, user_id: str, mission_id: str) -> Dic
         LEFT JOIN ExerciseAttempts ea
           ON ea.mission_skill_id = ims.mission_skill_id
          AND ea.user_id = ims.user_id
-        WHERE ims.user_id = %s AND ims.mission_id = %s
+        WHERE ims.user_id = ? AND ims.mission_id = ?
         ORDER BY ea.created_at ASC NULLS LAST
         """,
         (user_id, mission_id),
@@ -2996,12 +3144,12 @@ def _recalculate_mission_sync(cursor: Any, user_id: str, mission_id: str) -> Dic
         cursor.execute(
             """
             UPDATE ImprovementMissionSkills
-            SET latest_score = %s,
-                mastery_status = %s,
-                updated_at = NOW(),
-                verified_at = CASE WHEN %s = 'verified' THEN COALESCE(verified_at, NOW()) ELSE NULL END,
-                needs_reinforcement_at = CASE WHEN %s = 'needs_reinforcement' THEN NOW() ELSE needs_reinforcement_at END
-            WHERE mission_skill_id = %s AND user_id = %s
+            SET latest_score = ?,
+                mastery_status = ?,
+                updated_at = CURRENT_TIMESTAMP,
+                verified_at = CASE WHEN ? = 'verified' THEN COALESCE(verified_at, CURRENT_TIMESTAMP) ELSE NULL END,
+                needs_reinforcement_at = CASE WHEN ? = 'needs_reinforcement' THEN CURRENT_TIMESTAMP ELSE needs_reinforcement_at END
+            WHERE mission_skill_id = ? AND user_id = ?
             """,
             (latest, mastery, mastery, mastery, item["mission_skill_id"], user_id),
         )
@@ -3013,7 +3161,7 @@ def _recalculate_mission_sync(cursor: Any, user_id: str, mission_id: str) -> Dic
         """
         SELECT roadmap_node_id, result_status, mastery_status, recovery_of_node_id
         FROM ImprovementRoadmapNodes
-        WHERE user_id = %s AND mission_id = %s
+        WHERE user_id = ? AND mission_id = ?
         ORDER BY order_index
         """,
         (user_id, mission_id),
@@ -3051,12 +3199,12 @@ def _recalculate_mission_sync(cursor: Any, user_id: str, mission_id: str) -> Dic
     cursor.execute(
         """
         UPDATE ImprovementMissions
-        SET current_readiness = %s,
-            progress_percent = %s,
-            status = %s,
-            validation_status = %s,
-            updated_at = NOW()
-        WHERE mission_id = %s AND user_id = %s
+        SET current_readiness = ?,
+            progress_percent = ?,
+            status = ?,
+            validation_status = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE mission_id = ? AND user_id = ?
         """,
         (readiness, progress, mission_status, validation_status, mission_id, user_id),
     )
@@ -3098,7 +3246,7 @@ def _insert_recovery_node_sync(
         """
         SELECT roadmap_node_id
         FROM ImprovementRoadmapNodes
-        WHERE user_id = %s AND mission_id = %s AND recovery_of_node_id = %s
+        WHERE user_id = ? AND mission_id = ? AND recovery_of_node_id = ?
           AND result_status IN ('not_attempted', 'partial_pass', 'failed')
         LIMIT 1
         """,
@@ -3110,8 +3258,7 @@ def _insert_recovery_node_sync(
         """
         SELECT order_index
         FROM ImprovementRoadmapNodes
-        WHERE roadmap_node_id = %s AND user_id = %s AND mission_id = %s
-        FOR UPDATE
+        WHERE roadmap_node_id = ? AND user_id = ? AND mission_id = ?
         """,
         (source_node_id, user_id, mission_id),
     )
@@ -3122,8 +3269,8 @@ def _insert_recovery_node_sync(
     cursor.execute(
         """
         UPDATE ImprovementRoadmapNodes
-        SET order_index = order_index + 1, updated_at = NOW()
-        WHERE user_id = %s AND mission_id = %s AND order_index >= %s
+        SET order_index = order_index + 1, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND mission_id = ? AND order_index >= ?
         """,
         (user_id, mission_id, order_index),
     )
@@ -3163,9 +3310,9 @@ def _insert_recovery_node_sync(
             availability_status, attempt_status, result_status, mastery_status,
             estimated_minutes, expected_result, evidence_json
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'Write the Requirement, Your Decision, and the Expected Result Before Retrying', %s,
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'Write the Requirement, Your Decision, and the Expected Result Before Retrying', ?,
                 'rewrite_answer', 'current', 'draft', 'not_attempted',
-                'needs_reinforcement', 2, %s, %s)
+                'needs_reinforcement', 2, ?, ?)
         """,
         (
             roadmap_node_id,
@@ -3216,13 +3363,12 @@ async def _persist_mission_attempt_transaction(
                 FROM GeneratedExercises ge
                 JOIN ImprovementRoadmapNodes node ON node.roadmap_node_id = ge.roadmap_node_id
                 JOIN ImprovementMissions mission ON mission.mission_id = ge.mission_id
-                WHERE ge.exercise_id = %s
-                  AND ge.user_id = %s
-                  AND ge.mission_id = %s
-                  AND node.user_id = %s
-                  AND mission.user_id = %s
-                  AND node.roadmap_node_id = %s
-                FOR UPDATE OF node, mission
+                WHERE ge.exercise_id = ?
+                  AND ge.user_id = ?
+                  AND ge.mission_id = ?
+                  AND node.user_id = ?
+                  AND mission.user_id = ?
+                  AND node.roadmap_node_id = ?
                 """,
                 (exercise_id, user_id, mission_id, user_id, user_id, roadmap_node_id),
             )
@@ -3236,10 +3382,10 @@ async def _persist_mission_attempt_transaction(
             cursor.execute(
                 """
                 SELECT attempt_id, exercise_id, score, mastery_passed, feedback,
-                       COALESCE(feedback->>'result_status', ''),
+                       COALESCE(json_extract(feedback, '$.result_status'), ''),
                        condition_results, passed_conditions, failed_conditions, score_components
                 FROM ExerciseAttempts
-                WHERE user_id = %s AND exercise_id = %s AND idempotency_key = %s
+                WHERE user_id = ? AND exercise_id = ? AND idempotency_key = ?
                 LIMIT 1
                 """,
                 (user_id, exercise_id, idempotency_key),
@@ -3260,15 +3406,14 @@ async def _persist_mission_attempt_transaction(
                 """
                 SELECT attempt_session_id
                 FROM ImprovementAttemptSessions
-                WHERE attempt_session_id = %s
-                  AND user_id = %s
-                  AND mission_id = %s
-                  AND roadmap_node_id = %s
-                  AND exercise_id = %s
-                  AND idempotency_key = %s
+                WHERE attempt_session_id = ?
+                  AND user_id = ?
+                  AND mission_id = ?
+                  AND roadmap_node_id = ?
+                  AND exercise_id = ?
+                  AND idempotency_key = ?
                   AND status IN ('draft', 'in_progress', 'save_failed')
-                  AND (expires_at IS NULL OR expires_at > NOW())
-                FOR UPDATE
+                  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
                 """,
                 (
                     attempt_session_id, user_id, mission_id, roadmap_node_id,
@@ -3296,7 +3441,7 @@ async def _persist_mission_attempt_transaction(
                     is_checkpoint, condition_results, passed_conditions, failed_conditions,
                     score_components
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     attempt_id,
@@ -3332,10 +3477,10 @@ async def _persist_mission_attempt_transaction(
             cursor.execute(
                 """
                 UPDATE GeneratedExercises
-                SET status = %s,
-                    completed_at = CASE WHEN %s THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
-                    updated_at = NOW()
-                WHERE exercise_id = %s AND user_id = %s
+                SET status = ?,
+                    completed_at = CASE WHEN ? THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE exercise_id = ? AND user_id = ?
                 """,
                 ("completed" if result["mastery_passed"] else "in_progress", result["mastery_passed"], exercise_id, user_id),
             )
@@ -3343,15 +3488,15 @@ async def _persist_mission_attempt_transaction(
                 """
                 UPDATE ImprovementRoadmapNodes
                 SET attempt_status = 'submitted',
-                    result_status = %s,
-                    mastery_status = %s,
+                    result_status = ?,
+                    mastery_status = ?,
                     availability_status = CASE
-                        WHEN %s IN ('passed', 'strong_pass') THEN 'completed'
+                        WHEN ? IN ('passed', 'strong_pass') THEN 'completed'
                         ELSE availability_status
                     END,
-                    completed_at = CASE WHEN %s THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
-                    updated_at = NOW()
-                WHERE roadmap_node_id = %s AND user_id = %s
+                    completed_at = CASE WHEN ? THEN COALESCE(completed_at, CURRENT_TIMESTAMP) ELSE completed_at END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE roadmap_node_id = ? AND user_id = ?
                 """,
                 (
                     result_status, node_mastery, result_status,
@@ -3376,7 +3521,7 @@ async def _persist_mission_attempt_transaction(
                         validation_id, mission_id, user_id, roadmap_node_id,
                         evidence_type, passed, score, confidence, evidence_json,
                         source_key, evidence_hash
-                    ) VALUES (%s, %s, %s, %s, 'held_out_variation', %s, %s, %s, %s, %s, %s)
+                    ) VALUES (?, ?, ?, ?, 'held_out_variation', ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (mission_id, source_key, evidence_hash) DO NOTHING
                     """,
                     (
@@ -3388,10 +3533,10 @@ async def _persist_mission_attempt_transaction(
                 cursor.execute(
                     """
                     UPDATE ImprovementMissions
-                    SET validation_status = %s,
-                        held_out_checkpoint_id = CASE WHEN %s THEN %s ELSE held_out_checkpoint_id END,
-                        updated_at = NOW()
-                    WHERE mission_id = %s AND user_id = %s
+                    SET validation_status = ?,
+                        held_out_checkpoint_id = CASE WHEN ? THEN ? ELSE held_out_checkpoint_id END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE mission_id = ? AND user_id = ?
                     """,
                     (
                         "validation_pending" if result["mastery_passed"] else "needs_reinforcement",
@@ -3403,10 +3548,10 @@ async def _persist_mission_attempt_transaction(
                     """
                     UPDATE ImprovementAttemptSessions
                     SET status = 'submitted', deadline_at = NULL,
-                        remaining_seconds = NULL, updated_at = NOW()
-                    WHERE attempt_session_id = %s AND user_id = %s
-                      AND mission_id = %s AND roadmap_node_id = %s
-                      AND exercise_id = %s AND idempotency_key = %s
+                        remaining_seconds = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE attempt_session_id = ? AND user_id = ?
+                      AND mission_id = ? AND roadmap_node_id = ?
+                      AND exercise_id = ? AND idempotency_key = ?
                     """,
                     (
                         attempt_session_id, user_id, mission_id, roadmap_node_id,
@@ -3422,9 +3567,9 @@ async def _persist_mission_attempt_transaction(
                         UPDATE ImprovementRoadmapNodes
                         SET availability_status = 'current',
                             attempt_status = 'draft',
-                            updated_at = NOW()
-                        WHERE roadmap_node_id = %s AND user_id = %s
-                          AND mission_id = %s
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE roadmap_node_id = ? AND user_id = ?
+                          AND mission_id = ?
                         """,
                         (recovery_of_node_id, user_id, mission_id),
                     )
@@ -3443,7 +3588,7 @@ async def _persist_mission_attempt_transaction(
                         """
                         SELECT roadmap_node_id
                         FROM ImprovementRoadmapNodes
-                        WHERE user_id = %s AND mission_id = %s
+                        WHERE user_id = ? AND mission_id = ?
                           AND availability_status = 'locked'
                         ORDER BY order_index
                         LIMIT 1
@@ -3455,8 +3600,8 @@ async def _persist_mission_attempt_transaction(
                         cursor.execute(
                             """
                             UPDATE ImprovementRoadmapNodes
-                            SET availability_status = 'current', updated_at = NOW()
-                            WHERE roadmap_node_id = %s AND user_id = %s
+                            SET availability_status = 'current', updated_at = CURRENT_TIMESTAMP
+                            WHERE roadmap_node_id = ? AND user_id = ?
                             """,
                             (next_row[0], user_id),
                         )
@@ -3474,8 +3619,8 @@ async def _persist_mission_attempt_transaction(
                 cursor.execute(
                     """
                     UPDATE ImprovementRoadmapNodes
-                    SET availability_status = 'blocked', updated_at = NOW()
-                    WHERE roadmap_node_id = %s AND user_id = %s
+                    SET availability_status = 'blocked', updated_at = CURRENT_TIMESTAMP
+                    WHERE roadmap_node_id = ? AND user_id = ?
                     """,
                     (roadmap_node_id, user_id),
                 )
@@ -3521,10 +3666,10 @@ async def _persist_mission_attempt_transaction(
             logger.info(
                 "improve_attempt_saved",
                 extra={
-                    "user_id": user_id,
-                    "mission_id": mission_id,
-                    "exercise_id": exercise_id,
-                    "attempt_id": attempt_id,
+                    "user_ref": stable_hash(user_id, "user"),
+                    "mission_ref": stable_hash(mission_id, "mission"),
+                    "exercise_ref": stable_hash(exercise_id, "exercise"),
+                    "attempt_ref": stable_hash(attempt_id, "attempt"),
                     "result_status": result_status,
                 },
             )
@@ -3552,7 +3697,11 @@ async def _persist_mission_attempt_transaction(
             conn.rollback()
             logger.exception(
                 "improve_attempt_save_failed",
-                extra={"user_id": user_id, "mission_id": mission_id, "exercise_id": exercise_id},
+                extra={
+                    "user_ref": stable_hash(user_id, "user"),
+                    "mission_ref": stable_hash(mission_id, "mission"),
+                    "exercise_ref": stable_hash(exercise_id, "exercise"),
+                },
             )
             raise
         finally:
@@ -3573,7 +3722,7 @@ async def submit_exercise_attempt(
         SELECT exercise_id, skill_key, exercise_type, prompt, rubric, status,
                mission_id, mission_skill_id, roadmap_node_id, activity_type, is_checkpoint
         FROM GeneratedExercises
-        WHERE exercise_id = %s AND user_id = %s
+        WHERE exercise_id = ? AND user_id = ?
         """,
         (exercise_id, user_id),
         fetchone=True,
@@ -3599,20 +3748,6 @@ async def submit_exercise_attempt(
     answer = _attempt_text_from_payload(submitted_answer or "", payload)
     if not answer.strip():
         raise ValueError("Attempt must include real submitted work")
-    previous_rows = await async_execute(
-        """
-        SELECT ea.score, ea.feedback, ea.created_at
-        FROM ExerciseAttempts ea
-        JOIN GeneratedExercises ge ON ge.exercise_id = ea.exercise_id
-        WHERE ea.user_id = %s
-          AND COALESCE(ge.skill_key, ge.exercise_type) = %s
-        ORDER BY ea.created_at DESC
-        LIMIT 5
-        """,
-        (user_id, skill_key),
-        fetchall=True,
-    )
-    previous_scores = [float(row[0] or 0) for row in previous_rows or []]
     if mission_id and mission_skill_id and roadmap_node_id:
         result = _deterministic_activity_result(prompt, rubric, answer, payload, str(activity_type))
         return await _persist_mission_attempt_transaction(
@@ -3629,115 +3764,11 @@ async def submit_exercise_attempt(
             activity_type=str(activity_type),
             is_checkpoint=is_checkpoint,
         )
-
-    try:
-        model_payload = await complete_json_async(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Evaluate an interview-prep exercise attempt. Return valid JSON with score, mastery_passed, "
-                        "and feedback. feedback must include: summary, strengths, improvements, specific_feedback, "
-                        "mistake {type, quote, diagnosis}, why_bad, better_structure, improved_answer, next_drills, "
-                        "retry_instruction, and progress_signal. The improved_answer must use only facts present "
-                        "in the provided exercise or attempt. If a required fact is missing, state that it is missing; "
-                        "do not invent facts or fill placeholder values. "
-                        f"{SYSTEM_DATA_BOUNDARY}"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Rubric:\n{data_block('rubric', json.dumps(rubric, ensure_ascii=False))}\n\n"
-                        f"Exercise:\n{data_block('exercise', json.dumps(prompt, ensure_ascii=False))}\n\n"
-                        f"Previous scores for this skill:\n{data_block('previous_scores', json.dumps(previous_scores, ensure_ascii=False))}\n\n"
-                        f"Attempt:\n{data_block('attempt', answer, 4000)}"
-                    ),
-                },
-            ],
-            event_type="exercise_attempt_evaluation",
-            temperature=0.15,
-            max_tokens=1300,
-            provider_policy="local_required",
-            metadata={"exercise_type": row[2]},
-        )
-        score = _normalize_score(model_payload.get("score", 0))
-        raw_feedback = model_payload.get("feedback") if isinstance(model_payload.get("feedback"), dict) else {}
-        raw_feedback["score"] = score
-        structured_feedback = _normalize_structured_feedback(
-            raw_feedback,
-            prompt=prompt,
-            answer=answer,
-            payload=payload,
-            exercise_type=row[2],
-            skill_key=skill_key,
-            previous_scores=previous_scores,
-        )
-        pass_score = _safe_float(rubric.get("pass_score"), PASS_SCORE)
-        result = {
-            "score": score,
-            "mastery_passed": bool(model_payload.get("mastery_passed", score >= pass_score)),
-            "feedback": structured_feedback,
-        }
-    except Exception:
-        result = _score_text_attempt(
-            prompt,
-            answer,
-            payload,
-            exercise_type=row[2],
-            skill_key=skill_key,
-            previous_scores=previous_scores,
-        )
-
-    attempt_id = str(uuid.uuid4())
-    await async_execute(
-        """
-        INSERT INTO ExerciseAttempts (
-            attempt_id, exercise_id, user_id, submitted_answer, submitted_payload,
-            submitted_answer_encrypted, submitted_payload_encrypted,
-            score, feedback, mastery_passed
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            attempt_id,
-            exercise_id,
-            user_id,
-            "[encrypted answer]" if answer else "",
-            _sensitive_json_marker(payload),
-            _encrypted_text_bytes(_bounded(answer, 8000)),
-            _encrypted_json_bytes(payload),
-            result["score"],
-            json.dumps(result["feedback"]),
-            result["mastery_passed"],
-        ),
-    )
-    await async_execute(
-        """
-        UPDATE GeneratedExercises
-        SET status = %s,
-            completed_at = CASE WHEN %s THEN NOW() ELSE completed_at END,
-            updated_at = NOW()
-        WHERE exercise_id = %s AND user_id = %s
-        """,
-        ("completed" if result["mastery_passed"] else "in_progress", result["mastery_passed"], exercise_id, user_id),
-    )
-    mastery = await _upsert_skill_state(user_id, skill_key, _skill_category(skill_key), float(result["score"]))
-
-    return {
-        "attempt_id": attempt_id,
-        "exercise_id": exercise_id,
-        "score": result["score"],
-        "passed": result["mastery_passed"],
-        "mastery_passed": result["mastery_passed"],
-        "specific_feedback": result["feedback"].get("specific_feedback"),
-        "feedback": result["feedback"],
-        "next_drills": result["feedback"].get("next_drills", []),
-        "progress_signal": result["feedback"].get("progress_signal"),
-        "next_review_at": mastery["next_review_at"],
-        "next_review_time": mastery["next_review_at"],
-        "updated_mastery": mastery,
-    }
+    # The live Improve surface exposes only mission-bound exercises with an
+    # owned attempt session. Legacy unbound rows have no atomic/idempotent
+    # mastery transaction, so accepting them would permit duplicate or
+    # fabricated score changes. Keep them unavailable instead of guessing.
+    raise ValueError("Exercise does not match an active improvement mission")
 
 
 def _public_checkpoint_material(
@@ -3825,19 +3856,21 @@ def _completed_fixes(attempt_rows: List[Any]) -> List[Dict[str, Any]]:
 
 
 def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    mode_filter = "AND mode = %s" if mode else ""
+    if not _has_current_performance_analysis(cursor, user_id, mode=mode):
+        return None
+    mode_filter = "AND mode = ?" if mode else ""
     type_filter = ""
     if mode == "technical":
         type_filter = """
           AND weakness_type = 'technical_failure'
-          AND COALESCE(weakness_key, '') LIKE 'technical:%%'
+          AND COALESCE(weakness_key, '') LIKE 'technical:%'
         """
     elif mode == "mock":
         type_filter = """
           AND COALESCE(weakness_type, '') <> 'technical_failure'
-          AND COALESCE(weakness_key, '') NOT LIKE 'technical:%%'
-          AND COALESCE(weakness_key, '') NOT LIKE 'algorithm:%%'
-          AND COALESCE(weakness_key, '') NOT LIKE 'debugging:%%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'technical:%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'algorithm:%'
+          AND COALESCE(weakness_key, '') NOT LIKE 'debugging:%'
         """
     params: tuple[Any, ...] = (user_id, mode) if mode else (user_id,)
     cursor.execute(
@@ -3846,9 +3879,10 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
                priority_score, priority_factors, baseline_readiness, current_readiness,
                target_readiness, progress_percent, status, created_at, updated_at,
                completed_at, mode, weakness_key, weakness_type, prediction_json,
-               validation_status, validated_by_interview_id
+               validation_status, validated_by_interview_id,
+               source_interview_id, source_analysis_id
         FROM ImprovementMissions
-        WHERE user_id = %s {mode_filter} {type_filter} AND status = 'active'
+        WHERE user_id = ? {mode_filter} {type_filter} AND status = 'active'
         ORDER BY created_at DESC
         LIMIT 1
         """,
@@ -3864,7 +3898,7 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
                latest_score, target_score, role_weight, mastery_status,
                evidence_summary, criteria_json, verified_at, needs_reinforcement_at
         FROM ImprovementMissionSkills
-        WHERE user_id = %s AND mission_id = %s
+        WHERE user_id = ? AND mission_id = ?
         ORDER BY created_at
         """,
         (user_id, mission_id),
@@ -3897,7 +3931,7 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
                node.completed_at, ge.prompt, ge.rubric, ge.status
         FROM ImprovementRoadmapNodes node
         LEFT JOIN GeneratedExercises ge ON ge.exercise_id = node.exercise_id
-        WHERE node.user_id = %s AND node.mission_id = %s
+        WHERE node.user_id = ? AND node.mission_id = ?
         ORDER BY node.order_index
         """,
         (user_id, mission_id),
@@ -3941,8 +3975,8 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
                deadline_at, remaining_seconds,
                updated_at, expires_at
         FROM ImprovementAttemptSessions
-        WHERE user_id = %s AND mission_id = %s AND status IN ('draft', 'in_progress', 'save_failed')
-          AND (expires_at IS NULL OR expires_at > NOW())
+        WHERE user_id = ? AND mission_id = ? AND status IN ('draft', 'in_progress', 'save_failed')
+          AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
           AND EXISTS (
               SELECT 1
               FROM ImprovementRoadmapNodes node
@@ -3996,6 +4030,13 @@ def _active_mission_payload(cursor: Any, user_id: str, mode: Optional[str] = Non
         "prediction": _json_load(mission[18], {}) if len(mission) > 18 else {},
         "validation_status": mission[19] if len(mission) > 19 else None,
         "validated_by_interview_id": mission[20] if len(mission) > 20 else None,
+        "source_interview_id": mission[21] if len(mission) > 21 else None,
+        "source_analysis_id": mission[22] if len(mission) > 22 else None,
+        "report_path": (
+            f"/interview/{mission[21]}/report"
+            if len(mission) > 21 and mission[21]
+            else None
+        ),
         "skills": skills,
         "roadmap": roadmap,
         "active_attempt_session": active_session,
@@ -4032,7 +4073,7 @@ def _improvement_history_payload(cursor: Any, user_id: str) -> Dict[str, Any]:
         LEFT JOIN ExerciseAttempts ea
           ON ea.user_id = ims.user_id
          AND ea.mission_skill_id = ims.mission_skill_id
-        WHERE ims.user_id = %s
+        WHERE ims.user_id = ?
           AND im.status IN ('active', 'completed')
         GROUP BY ims.skill_key, ims.label, im.mode, im.weakness_key, im.weakness_type,
                  ims.baseline_score, ims.latest_score,
@@ -4070,7 +4111,7 @@ def _improvement_history_payload(cursor: Any, user_id: str) -> Dict[str, Any]:
                    MIN(ea.score), MAX(ea.score), COUNT(ea.attempt_id), MAX(ea.created_at)
             FROM ExerciseAttempts ea
             JOIN GeneratedExercises ge ON ge.exercise_id = ea.exercise_id
-            WHERE ea.user_id = %s
+            WHERE ea.user_id = ?
             GROUP BY COALESCE(ge.skill_key, ge.exercise_type)
             ORDER BY MAX(ea.created_at) DESC
             LIMIT 12
@@ -4103,7 +4144,7 @@ def _improvement_history_payload(cursor: Any, user_id: str) -> Dict[str, Any]:
                baseline_readiness, current_readiness,
                target_readiness, progress_percent, status, completed_at
         FROM ImprovementMissions
-        WHERE user_id = %s AND status = 'completed'
+        WHERE user_id = ? AND status = 'completed'
         ORDER BY completed_at DESC NULLS LAST, updated_at DESC
         LIMIT 8
         """,
@@ -4135,7 +4176,7 @@ def _improvement_history_payload(cursor: Any, user_id: str) -> Dict[str, Any]:
         LEFT JOIN GeneratedExercises ge
           ON ge.exercise_id = ea.exercise_id
          AND ge.user_id = ea.user_id
-        WHERE ea.user_id = %s
+        WHERE ea.user_id = ?
         ORDER BY ea.created_at DESC
         LIMIT 20
         """,
@@ -4172,7 +4213,7 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
         SELECT skill_key, skill_category, mastery_score, confidence_score,
                evidence_count, last_evidence_at, next_review_at
         FROM LearnerSkillStates
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY mastery_score ASC, next_review_at ASC NULLS FIRST
         LIMIT 12
         """,
@@ -4199,7 +4240,7 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
         SELECT cluster_id, round_id, mistake_type, mistake_key, examples,
                occurrence_count, last_seen_at
         FROM TechnicalMistakeClusters
-        WHERE user_id = %s
+        WHERE user_id = ?
         ORDER BY occurrence_count DESC, last_seen_at DESC
         LIMIT 8
         """,
@@ -4278,7 +4319,7 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
         SELECT gap_id, project_key, gap_key, gap_summary, evidence,
                status, next_check_at, updated_at
         FROM ProjectKnowledgeGaps
-        WHERE user_id = %s AND status = 'open'
+        WHERE user_id = ? AND status = 'open'
         ORDER BY next_check_at ASC NULLS FIRST, updated_at DESC
         LIMIT 8
         """,
@@ -4312,7 +4353,7 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
                mission_id, mission_skill_id, roadmap_node_id, activity_type,
                variation_group, is_checkpoint, activity_metadata
         FROM GeneratedExercises
-        WHERE user_id = %s
+        WHERE user_id = ?
           AND status IN ('queued', 'in_progress')
           AND mission_id IS NOT NULL
           AND EXISTS (
@@ -4337,7 +4378,7 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
                ea.mastery_passed, ea.created_at
         FROM ExerciseAttempts ea
         JOIN GeneratedExercises ge ON ge.exercise_id = ea.exercise_id
-        WHERE ea.user_id = %s
+        WHERE ea.user_id = ?
         ORDER BY ea.created_at DESC
         LIMIT 60
         """,
@@ -4404,27 +4445,28 @@ def build_learning_snapshot(cursor, user_id: str) -> Dict[str, Any]:
 
     cursor.execute(
         """
-        SELECT event_type, severity, COUNT(*), MAX(created_at)
-        FROM MalpracticeEvents
-        WHERE user_id = %s
-        GROUP BY event_type, severity
+        SELECT event_type, COUNT(*), MAX(created_at)
+        FROM SelfReviewEvents
+        WHERE user_id = ?
+        GROUP BY event_type
         ORDER BY MAX(created_at) DESC
         """,
         (user_id,),
     )
     integrity_rows = cursor.fetchall()
-    severe_count = sum(int(row[2] or 0) for row in integrity_rows if row[1] == "severe" or row[0] in SEVERE_EVENT_TYPES)
-    warning_count = sum(int(row[2] or 0) for row in integrity_rows if row[1] != "severe" and row[0] not in SEVERE_EVENT_TYPES)
+    signal_count = sum(int(row[1] or 0) for row in integrity_rows)
     integrity_status = {
-        "status": "flagged" if severe_count else "watched" if warning_count else "clean",
-        "severe_count": severe_count,
-        "warning_count": warning_count,
+        "status": "self_review",
+        "mode": "self_review",
+        "severe_count": 0,
+        "warning_count": 0,
+        "signal_count": signal_count,
         "events": [
             {
                 "event_type": row[0],
-                "severity": row[1],
-                "count": int(row[2] or 0),
-                "last_seen_at": row[3].isoformat() if row[3] else None,
+                "severity": "info",
+                "count": int(row[1] or 0),
+                "last_seen_at": row[2].isoformat() if row[2] else None,
             }
             for row in integrity_rows[:8]
         ],

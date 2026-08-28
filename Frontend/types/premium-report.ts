@@ -7,7 +7,7 @@
 export interface PremiumAnalysis {
   track: "technical" | "behavioral"
   executive_summary: string
-  session_integrity_verdict: IntegrityVerdict
+  self_review_verdict: SelfReviewVerdict
   unknown_unknowns: UnknownUnknown[]
 
   // Track A — Technical Round
@@ -19,7 +19,7 @@ export interface PremiumAnalysis {
   // Track B — Mock Interview
   content_accuracy?: AnalysisSection
   vocal_delivery?: VocalDeliverySection
-  proctoring_audit?: ProctoringAuditSection
+  self_review_signals?: SelfReviewSignalsSection
 }
 
 export type Severity = "critical" | "warning" | "info"
@@ -53,24 +53,20 @@ export interface VocalMetrics {
   clarity_proxy: number | null
 }
 
-export interface ProctoringAuditSection extends AnalysisSection {
-  integrity_grade: string
-  risk_score: number
-  risk_level: string
+export interface SelfReviewSignalsSection extends AnalysisSection {
+  mode: "self_review"
 }
 
-export interface ProctoringDetail extends AnalysisDetail {
+export interface SelfReviewSignalDetail extends AnalysisDetail {
   event_type: string
   count?: number
   event_severity: Severity | string
 }
 
-export interface IntegrityVerdict {
-  grade: string
+export interface SelfReviewVerdict {
   label: string
-  risk_score: number
-  high_severity_event_count: number
-  total_event_count: number
+  signal_count: number
+  mode?: "self_review"
 }
 
 export interface UnknownUnknown {

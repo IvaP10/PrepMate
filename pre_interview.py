@@ -1,25 +1,25 @@
 # ============================================================================
 # MODULE: pre_interview.py
-# PURPOSE: Resume upload + parse + AI enrichment, profile confirm/edit/reset.
+# PURPOSE: Local resume upload, validation, parsing, profile confirmation,
+#          resume version management, and reset controls.
 #          Owns /api/pre-interview routes (router carries its own prefix).
-# STRUCTURE:
-#   - Background profile-enrichment worker (lines 49-55)
-#   - Resume parsing + retry helpers
-#   - Route handlers (lines 364-700)
 # ENDPOINTS (prefix /api/pre-interview):
-#   - POST   /upload-resume    -> parse PDF/DOCX + enrich (line 364)
-#   - POST   /confirm-profile  -> persist edited profile_json (435)
-#   - GET    /form             -> current profile + resume snapshot (504)
-#   - POST   /submit-form      -> save form-completed profile (531)
-#   - GET    /profile-status   -> {profile_completed, resume_uploaded} (577)
-#   - DELETE /reset-profile    -> wipe profile_json/resume (616)
-# DEPENDS ON: auth, database, resume_parser, profile_enrichment, llm_router,
-#             prompt_security, security_utils, config
-# CONSUMED BY: app.py, Frontend/lib/api.ts (uploadResume, submitResume, getResume)
-# DATA TABLES: UserInfo (resume_json/profile_json), ResumeUploadLogs (audit log)
+#   - POST   /upload-resume         -> validate and enqueue PDF/DOCX parsing
+#   - GET    /resume-jobs/{job_id}  -> inspect local parsing state
+#   - GET    /resumes               -> list local resume versions
+#   - DELETE /resumes/{resume_id}   -> delete an unused resume source
+#   - POST   /confirm-profile       -> persist the edited local profile
+#   - GET    /form                  -> current profile and resume snapshot
+#   - POST   /submit-form           -> save the completed setup form
+#   - GET    /profile-status        -> local setup readiness
+#   - DELETE /reset-profile         -> delete resume/profile setup sources
+# DEPENDS ON: config, database, local_runtime, resume_parser, security_utils
+# DATA TABLES: UserInfo, ResumeVersions, ResumeProcessingJobs,
+#              ResumeUploadLogs, AttemptContextSnapshots, InterviewBlueprints
 # ============================================================================
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, status, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, Iterable, Literal, Optional
 import json
@@ -27,16 +27,13 @@ import os
 import logging
 import re
 import asyncio
-import tempfile
-import time
 import hashlib
 import uuid
 
-from auth import get_current_user
+from local_runtime import local_user
 from database import get_db, transaction
-from resume_parser import parse_resume_structured
+from resume_parser import validate_resume_bytes
 
-from profile_enrichment import enrich_profile_for_user
 from config import settings
 from llm_router import complete_json_async
 from prompt_security import SYSTEM_DATA_BOUNDARY, data_block
@@ -275,26 +272,143 @@ def _resume_version_payload(row: Any) -> dict[str, Any]:
 
 def _load_resume_version(cursor: Any, user_id: str, resume_id: str) -> Optional[dict[str, Any]]:
     cursor.execute(
-        RESUME_VERSION_SELECT + " WHERE user_id = %s AND resume_id = %s",
+        RESUME_VERSION_SELECT + " WHERE user_id = ? AND resume_id = ?",
         (user_id, resume_id),
     )
     row = cursor.fetchone()
     return _resume_version_payload(row) if row else None
 
-_enrichment_tasks = set()
 RESUME_UPLOAD_AI_TIMEOUT_SECONDS = 20.0
-RESUME_PARSE_TIMEOUT_SECONDS = 15.0
 
-async def _run_profile_enrichment(user_id: str, profile: dict[str, Any]) -> None:
-    try:
-        await enrich_profile_for_user(user_id, profile)
-    except Exception:
-        logger.error("Profile enrichment failed for %s", stable_hash(user_id, "user"))
+def _persist_parsed_resume(
+    *,
+    user_id: str,
+    email: Optional[str],
+    resume_json: dict[str, Any],
+    resume_text: str,
+    content_hash: str,
+    source_filename: str,
+    parser_version: str,
+    facts_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist a worker-produced parse using the existing ResumeVersions contract."""
+    profile_completed = bool(resume_json.get("name") and resume_json.get("skills"))
+    confirmation_status = _confirmation_status(facts_payload)
+    taxonomy = _resume_taxonomy(resume_json)
+    active_profile = resume_json
+    resume_version: Optional[dict[str, Any]] = None
+    version_created = False
+    with get_db() as conn:
+        cur = conn.cursor()
+        try:
+            with transaction(conn):
+                if email and not active_profile.get("email"):
+                    active_profile["email"] = email
+                cur.execute(
+                    "SELECT 1 FROM UserInfo WHERE user_id = ?",
+                    (user_id,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        """
+                        INSERT INTO UserInfo (
+                            user_id, full_name, resume_json, profile_json,
+                            profile_completed, resume_uploaded_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            user_id,
+                            active_profile.get("name"),
+                            json.dumps(encrypt_json(active_profile)),
+                            json.dumps(encrypt_json(active_profile)),
+                            profile_completed,
+                        ),
+                    )
 
-def schedule_profile_enrichment(user_id: str, profile: dict[str, Any]) -> None:
-    task = asyncio.create_task(_run_profile_enrichment(user_id, profile))
-    _enrichment_tasks.add(task)
-    task.add_done_callback(_enrichment_tasks.discard)
+                cur.execute(
+                    RESUME_VERSION_SELECT
+                    + " WHERE user_id = ? AND content_hash = ? ORDER BY version_number DESC LIMIT 1",
+                    (user_id, content_hash),
+                )
+                duplicate_row = cur.fetchone()
+                cur.execute(
+                    "UPDATE ResumeVersions SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND is_active = TRUE",
+                    (user_id,),
+                )
+                if duplicate_row:
+                    resume_id = duplicate_row[0]
+                    duplicate_payload = _resume_version_payload(duplicate_row)
+                    active_profile = duplicate_payload["resume_payload"]
+                    profile_completed = bool(active_profile.get("name") and active_profile.get("skills"))
+                    cur.execute(
+                        "UPDATE ResumeVersions SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE resume_id = ? AND user_id = ?",
+                        (resume_id, user_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT COALESCE(MAX(version_number), 0) + 1 FROM ResumeVersions WHERE user_id = ?",
+                        (user_id,),
+                    )
+                    version_number = int((cur.fetchone() or [1])[0] or 1)
+                    resume_id = str(uuid.uuid4())
+                    cur.execute(
+                        """
+                        INSERT INTO ResumeVersions (
+                            resume_id, user_id, version_number, resume_text_encrypted,
+                            resume_payload_encrypted, facts_encrypted, derived_taxonomy,
+                            is_active, confirmation_status, resume_json, content_hash,
+                            parser_version, source_filename, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, TRUE, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """,
+                        (
+                            resume_id,
+                            user_id,
+                            version_number,
+                            encrypt_data(resume_text).encode("utf-8"),
+                            _encrypted_json_blob(active_profile),
+                            _encrypted_json_blob(facts_payload),
+                            json.dumps(taxonomy),
+                            confirmation_status,
+                            json.dumps(encrypt_json(active_profile)),
+                            content_hash,
+                            parser_version,
+                            os.path.basename(source_filename)[:255],
+                        ),
+                    )
+                    version_created = True
+
+                cur.execute(
+                    """
+                    UPDATE UserInfo
+                    SET resume_json = ?, profile_json = ?, active_resume_id = ?,
+                        profile_completed = ?,
+                        full_name = COALESCE(NULLIF(full_name, ''), ?),
+                        resume_uploaded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                    """,
+                    (
+                        json.dumps(encrypt_json(active_profile)),
+                        json.dumps(encrypt_json(active_profile)),
+                        resume_id,
+                        profile_completed,
+                        active_profile.get("name"),
+                        user_id,
+                    ),
+                )
+                cur.execute(
+                    "INSERT INTO ResumeUploadLogs (user_id, uploaded_at) VALUES (?, CURRENT_TIMESTAMP)",
+                    (user_id,),
+                )
+                resume_version = _load_resume_version(cur, user_id, resume_id)
+        finally:
+            cur.close()
+    return {
+        "active_profile": active_profile,
+        "profile_completed": profile_completed,
+        "resume": resume_version,
+        "version_created": version_created,
+    }
+
 
 def extract_contact_info(text: str) -> dict[str, Any]:
     email_match = EMAIL_PATTERN.search(text)
@@ -1075,8 +1189,9 @@ EXTRACTION_SCHEMA = {
 }
 
 
-async def extract_with_ai_upload(resume_text: str) -> dict[str, Any]:
+async def extract_with_ai_upload(resume_text: str, *, user_id: str) -> dict[str, Any]:
     trimmed = resume_text[:MAX_RESUME_TEXT_LENGTH]
+    resume_cache_key = f"resume-parse:{hashlib.sha256(trimmed.encode('utf-8')).hexdigest()}"
     prompt = RESUME_UPLOAD_EXTRACTION_PROMPT.format(
         form_schema=RESUME_FORM_JSON_SPEC,
         resume_text=data_block("resume_text", trimmed),
@@ -1098,9 +1213,11 @@ async def extract_with_ai_upload(resume_text: str) -> dict[str, Any]:
             event_type="resume_parse_fast",
             temperature=0.0,
             max_tokens=4096,
+            user_id=user_id,
             json_schema=EXTRACTION_SCHEMA,
             provider_policy="openai_required",
-            metadata={"reason": "resume_upload"},
+            metadata={"reason": "resume_upload", "idempotency_key": resume_cache_key},
+            cache_key=resume_cache_key,
         ),
         timeout=RESUME_UPLOAD_AI_TIMEOUT_SECONDS,
     )
@@ -1121,7 +1238,7 @@ async def extract_with_ai_upload(resume_text: str) -> dict[str, Any]:
 async def upload_resume(
     request: Request,
     file: UploadFile = File(...),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any] | None:
     request_id = str(getattr(request.state, "request_id", "") or "unknown")
     if not file.filename:
@@ -1131,265 +1248,112 @@ async def upload_resume(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid file type. Allowed: PDF, DOCX")
 
-    content = await file.read()
+    content_buffer = bytearray()
+    while True:
+        chunk = await file.read(min(1024 * 1024, RESUME_MAX_FILE_BYTES + 1 - len(content_buffer)))
+        if not chunk:
+            break
+        content_buffer.extend(chunk)
+        if len(content_buffer) > RESUME_MAX_FILE_BYTES:
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                f"Resume file too large. Maximum: {settings.RESUME_MAX_FILE_SIZE_MB} MB",
+            )
+    content = bytes(content_buffer)
     if not content:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Resume file is empty")
-    if len(content) > RESUME_MAX_FILE_BYTES:
-        raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            f"Resume file too large. Maximum: {settings.RESUME_MAX_FILE_SIZE_MB} MB",
-        )
+    try:
+        validate_resume_bytes(content, ext)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from None
 
-    temp_path = None
+    content_hash = hashlib.sha256(content).hexdigest()
+    # The common accidental retry should not spend parser/OCR/OpenAI capacity.
+    # Only an already-active exact version can return early; inactive versions
+    # still flow through the transaction below so activation semantics remain
+    # unchanged.
+    with get_db() as duplicate_conn:
+        duplicate_cur = duplicate_conn.cursor()
+        try:
+            duplicate_cur.execute(
+                RESUME_VERSION_SELECT
+                + " WHERE user_id = ? AND content_hash = ? AND is_active = TRUE "
+                  "ORDER BY version_number DESC LIMIT 1",
+                (current_user["user_id"], content_hash),
+            )
+            duplicate_row = duplicate_cur.fetchone()
+            if duplicate_row:
+                resume_version = _resume_version_payload(duplicate_row)
+                active_profile = resume_version["resume_payload"]
+                return {
+                    "success": True,
+                    "message": "This resume is already saved and active.",
+                    "extracted_profile": active_profile,
+                    "profile_completed": bool(active_profile.get("name") and active_profile.get("skills")),
+                    "parse_ms": 0,
+                    "resume": resume_version,
+                    "version_created": False,
+                }
+        finally:
+            duplicate_cur.close()
+
+    from resume_processing import ResumeProcessingQueueFull, enqueue_resume_parse_job
 
     try:
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as out_file:
-            temp_path = out_file.name
-            out_file.write(content)
-
-        loop = asyncio.get_running_loop()
-        started = time.perf_counter()
-        try:
-            logger.info("resume_upload_stage request_id=%s stage=parse_started", request_id)
-            parsed_resume = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
-                    lambda: parse_resume_structured(temp_path, fast=False),
-                ),
-                timeout=RESUME_PARSE_TIMEOUT_SECONDS,
-            )
-            resume_text = parsed_resume.get("text", "")
-            logger.info(
-                "resume_upload_stage request_id=%s stage=parse_completed latency_ms=%s",
-                request_id,
-                round((time.perf_counter() - started) * 1000, 2),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("resume_upload_stage request_id=%s stage=parse_timeout", request_id)
-            raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, "Resume parsing timed out. Try a text-based PDF or DOCX.")
-        except Exception:
-            logger.exception("resume_upload_stage request_id=%s stage=parse_failed", request_id)
-            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to read resume. Ensure it's a valid PDF or DOCX.")
-
-        if not resume_text or len(resume_text.strip()) < 40:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                "Could not extract enough text from this resume. Try a text-based PDF or DOCX.",
-            )
-
-        contact = extract_contact_info(resume_text)
-        social = extract_social_links(resume_text)
-
-        redacted_text = remove_pii(resume_text)
-        if len(redacted_text) > MAX_RESUME_TEXT_LENGTH:
-            redacted_text = redacted_text[:MAX_RESUME_TEXT_LENGTH]
-
-        fallback_json = extract_resume_with_rules(resume_text, contact, social, parsed_resume)
-        resume_json = fallback_json
-        try:
-            logger.info("resume_upload_stage request_id=%s stage=ai_enrichment_started", request_id)
-            ai_json = await extract_with_ai_upload(redacted_text)
-            resume_json = _merge_resume_profiles(ai_json, fallback_json)
-            logger.info("resume_upload_stage request_id=%s stage=ai_enrichment_completed", request_id)
-        except asyncio.TimeoutError:
-            logger.warning("resume_upload_stage request_id=%s stage=ai_timeout fallback=rules", request_id)
-        except Exception as exc:
-            logger.warning(
-                "resume_upload_stage request_id=%s stage=ai_failed error=%s fallback=rules",
-                request_id,
-                type(exc).__name__,
-            )
-
-        if not resume_json.get("target_role") and fallback_json.get("target_role"):
-            resume_json["target_role"] = fallback_json["target_role"]
-
-        resume_json["email"] = contact["email"] or current_user.get("email")
-        resume_json["phone"] = contact["phone"]
-        resume_json["linkedin"] = social["linkedin"]
-        resume_json["github"] = social["github"]
-        resume_json["portfolio"] = social["portfolio"]
-        resume_json["links"] = {
-            "linkedin": social["linkedin"],
-            "github": social["github"],
-            "portfolio": social["portfolio"],
-            "all": parsed_resume.get("links", []),
-        }
-        resume_json["profile_sources"] = list(dict.fromkeys(
-            (resume_json.get("profile_sources") or []) + [parsed_resume.get("parser", "resume_parser")]
-        ))
-        resume_json = validate_resume_json(resume_json)
-        resume_json["links"] = {
-            "linkedin": social["linkedin"],
-            "github": social["github"],
-            "portfolio": social["portfolio"],
-            "all": parsed_resume.get("links", []),
-        }
-
-        profile_completed = bool(resume_json.get("name") and resume_json.get("skills"))
-        parser_version = str(parsed_resume.get("parser") or "resume_parser")[:40]
-        content_hash = hashlib.sha256(content).hexdigest()
-        facts_payload = _resume_fact_payload(
-            resume_json,
-            source_text=resume_text,
-            parser_version=parser_version,
+        job_id = enqueue_resume_parse_job(
+            user_id=str(current_user["user_id"]),
+            content=content,
+            content_hash=content_hash,
+            source_filename=file.filename,
+            source_extension=ext,
         )
-        confirmation_status = _confirmation_status(facts_payload)
-        taxonomy = _resume_taxonomy(resume_json)
-        active_profile = resume_json
-        resume_version: Optional[dict[str, Any]] = None
-        version_created = False
-        with get_db() as conn:
-            cur = conn.cursor()
-            try:
-                with transaction(conn):
-                    cur.execute(
-                        "SELECT 1 FROM UserInfo WHERE user_id = %s FOR UPDATE",
-                        (current_user["user_id"],),
-                    )
-                    user_exists = cur.fetchone() is not None
-                    if not user_exists:
-                        cur.execute(
-                            """
-                            INSERT INTO UserInfo (
-                                user_id, full_name, resume_json, profile_json,
-                                profile_completed, resume_uploaded_at, updated_at
-                            )
-                            VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
-                            """,
-                            (
-                                current_user["user_id"],
-                                resume_json.get("name"),
-                                json.dumps(encrypt_json(resume_json)),
-                                json.dumps(encrypt_json(resume_json)),
-                                profile_completed,
-                            ),
-                        )
-
-                    cur.execute(
-                        RESUME_VERSION_SELECT
-                        + " WHERE user_id = %s AND content_hash = %s ORDER BY version_number DESC LIMIT 1",
-                        (current_user["user_id"], content_hash),
-                    )
-                    duplicate_row = cur.fetchone()
-                    cur.execute(
-                        "UPDATE ResumeVersions SET is_active = FALSE, updated_at = NOW() WHERE user_id = %s AND is_active = TRUE",
-                        (current_user["user_id"],),
-                    )
-                    if duplicate_row:
-                        resume_id = duplicate_row[0]
-                        duplicate_payload = _resume_version_payload(duplicate_row)
-                        active_profile = duplicate_payload["resume_payload"]
-                        profile_completed = bool(active_profile.get("name") and active_profile.get("skills"))
-                        cur.execute(
-                            "UPDATE ResumeVersions SET is_active = TRUE, updated_at = NOW() WHERE resume_id = %s AND user_id = %s",
-                            (resume_id, current_user["user_id"]),
-                        )
-                    else:
-                        cur.execute(
-                            "SELECT COALESCE(MAX(version_number), 0) + 1 FROM ResumeVersions WHERE user_id = %s",
-                            (current_user["user_id"],),
-                        )
-                        version_number = int((cur.fetchone() or [1])[0] or 1)
-                        resume_id = str(uuid.uuid4())
-                        cur.execute(
-                            """
-                            INSERT INTO ResumeVersions (
-                                resume_id, user_id, version_number, resume_text_encrypted,
-                                resume_payload_encrypted,
-                                facts_encrypted, derived_taxonomy, is_active,
-                                confirmation_status, resume_json, content_hash,
-                                parser_version, source_filename, created_at, updated_at
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, NOW(), NOW())
-                            """,
-                            (
-                                resume_id,
-                                current_user["user_id"],
-                                version_number,
-                                encrypt_data(resume_text).encode("utf-8"),
-                                _encrypted_json_blob(resume_json),
-                                _encrypted_json_blob(facts_payload),
-                                json.dumps(taxonomy),
-                                confirmation_status,
-                                json.dumps(encrypt_json(resume_json)),
-                                content_hash,
-                                parser_version,
-                                os.path.basename(file.filename)[:255],
-                            ),
-                        )
-                        version_created = True
-
-                    cur.execute(
-                        """
-                        UPDATE UserInfo
-                        SET resume_json = %s,
-                            profile_json = %s,
-                            active_resume_id = %s,
-                            profile_completed = %s,
-                            full_name = COALESCE(NULLIF(full_name, ''), %s),
-                            resume_uploaded_at = NOW(),
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                        """,
-                        (
-                            json.dumps(encrypt_json(active_profile)),
-                            json.dumps(encrypt_json(active_profile)),
-                            resume_id,
-                            profile_completed,
-                            active_profile.get("name"),
-                            current_user["user_id"],
-                        ),
-                    )
-                    cur.execute(
-                        "INSERT INTO ResumeUploadLogs (user_id, uploaded_at) VALUES (%s, NOW())",
-                        (current_user["user_id"],),
-                    )
-                    resume_version = _load_resume_version(cur, current_user["user_id"], resume_id)
-            finally:
-                cur.close()
-
-        if profile_completed:
-            schedule_profile_enrichment(current_user["user_id"], active_profile)
-        logger.info(
-            "resume_upload_stage request_id=%s stage=stored total_latency_ms=%s",
-            request_id,
-            round((time.perf_counter() - started) * 1000, 2),
-        )
-
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        logger.info("Resume upload processed in %sms (parser=%s)", elapsed_ms, parsed_resume.get("parser"))
-
-        return {
+    except ResumeProcessingQueueFull:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Resume processing is temporarily busy. Please retry shortly.",
+            headers={"Retry-After": "15"},
+        ) from None
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
             "success": True,
-            "message": "Resume parsed and saved. Please review your details.",
-            "extracted_profile": active_profile,
-            "profile_completed": profile_completed,
-            "parse_ms": elapsed_ms,
-            "resume": resume_version,
-            "version_created": version_created,
-        }
+            "status": "queued",
+            "job_id": job_id,
+            "content_hash": content_hash,
+            "message": "Resume upload received. Your profile is being prepared.",
+        },
+    )
 
-    except HTTPException:
-        raise
-    except Exception:
-        logger.error("Unexpected error during resume upload")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "An error occurred while processing your resume")
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+@router.get("/resume-jobs/{job_id}")
+async def get_resume_processing_job(
+    job_id: str,
+    current_user: dict[str, Any] = Depends(local_user),
+) -> dict[str, Any]:
+    from resume_processing import get_resume_job
+
+    job = await asyncio.to_thread(
+        get_resume_job,
+        user_id=str(current_user["user_id"]),
+        job_id=job_id,
+    )
+    if not job:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume processing job not found")
+    result = job.pop("result", None)
+    if isinstance(result, dict):
+        return {**result, "job": job, "status": "completed"}
+    return {"success": True, "status": job["status"], "job": job}
 
 
 @router.get("/resumes")
 async def list_resume_versions(
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any]:
     with get_db() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
                 RESUME_VERSION_SELECT
-                + " WHERE user_id = %s ORDER BY version_number DESC, created_at DESC",
+                + " WHERE user_id = ? ORDER BY version_number DESC, created_at DESC",
                 (current_user["user_id"],),
             )
             resumes = [_resume_version_payload(row) for row in cur.fetchall()]
@@ -1402,29 +1366,51 @@ async def list_resume_versions(
 @router.delete("/resumes/{resume_id}")
 async def delete_resume_version(
     resume_id: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any]:
     with get_db() as conn:
         cur = conn.cursor()
         try:
             with transaction(conn):
+                cur.execute("BEGIN IMMEDIATE")
                 cur.execute(
                     """
-                    SELECT version.resume_id
+                    SELECT version.resume_id, version.is_active
                     FROM ResumeVersions version
-                    WHERE version.user_id = %s AND version.resume_id = %s
-                    FOR UPDATE
+                    WHERE version.user_id = ? AND version.resume_id = ?
                     """,
                     (current_user["user_id"], resume_id),
                 )
                 row = cur.fetchone()
                 if not row:
                     raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume version not found")
-                cur.execute(
-                    "DELETE FROM ResumeVersions WHERE user_id = %s AND resume_id = %s",
-                    (current_user["user_id"], resume_id),
+                from user_profile import delete_resume_sources
+
+                deleted_counts = delete_resume_sources(
+                    cur,
+                    user_id=current_user["user_id"],
+                    resume_id=resume_id,
                 )
-            return {"success": True, "message": "Resume version deleted"}
+                if bool(row[1]):
+                    cur.execute(
+                        """
+                        UPDATE UserInfo
+                        SET full_name = 'Local user',
+                            resume_json = NULL,
+                            profile_json = NULL,
+                            active_resume_id = NULL,
+                            profile_completed = FALSE,
+                            resume_uploaded_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
+                        """,
+                        (current_user["user_id"],),
+                    )
+            return {
+                "success": True,
+                "message": "Resume version deleted",
+                "deleted_counts": deleted_counts,
+            }
         finally:
             cur.close()
 
@@ -1433,7 +1419,7 @@ async def delete_resume_version(
 async def review_resume_facts(
     resume_id: str,
     request: ResumeFactsPatch,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any]:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1441,7 +1427,7 @@ async def review_resume_facts(
             with transaction(conn):
                 cur.execute(
                     RESUME_VERSION_SELECT
-                    + " WHERE user_id = %s AND resume_id = %s FOR UPDATE",
+                    + " WHERE user_id = ? AND resume_id = ?",
                     (current_user["user_id"], resume_id),
                 )
                 row = cur.fetchone()
@@ -1498,9 +1484,9 @@ async def review_resume_facts(
                 taxonomy = _resume_taxonomy(materialized)
                 cur.execute(
                     """
-                    SELECT EXISTS(SELECT 1 FROM Interviews WHERE resume_id = %s)
-                        OR EXISTS(SELECT 1 FROM InterviewBlueprints WHERE resume_id = %s AND status = 'consumed')
-                        OR EXISTS(SELECT 1 FROM AttemptContextSnapshots WHERE resume_id = %s)
+                    SELECT EXISTS(SELECT 1 FROM Interviews WHERE resume_id = ?)
+                        OR EXISTS(SELECT 1 FROM InterviewBlueprints WHERE resume_id = ? AND status = 'consumed')
+                        OR EXISTS(SELECT 1 FROM AttemptContextSnapshots WHERE resume_id = ?)
                     """,
                     (resume_id, resume_id, resume_id),
                 )
@@ -1508,7 +1494,7 @@ async def review_resume_facts(
                 result_resume_id = resume_id
                 if referenced:
                     result_resume_id = str(uuid.uuid4())
-                    cur.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM ResumeVersions WHERE user_id = %s", (current_user["user_id"],))
+                    cur.execute("SELECT COALESCE(MAX(version_number), 0) + 1 FROM ResumeVersions WHERE user_id = ?", (current_user["user_id"],))
                     next_version = int((cur.fetchone() or [1])[0] or 1)
                     child_hash = hashlib.sha256(
                         f"{row[7]}:{json.dumps(facts_payload, sort_keys=True, default=str)}".encode("utf-8")
@@ -1522,10 +1508,10 @@ async def review_resume_facts(
                             is_active, confirmation_status, encryption_status,
                             created_at, updated_at, parent_resume_id
                         )
-                        SELECT %s, user_id, %s, resume_text_encrypted, resume_json, %s,
-                               parser_version, source_filename, resume_payload_encrypted, %s,
-                               %s, FALSE, %s, encryption_status, NOW(), NOW(), resume_id
-                        FROM ResumeVersions WHERE resume_id = %s AND user_id = %s
+                        SELECT ?, user_id, ?, resume_text_encrypted, resume_json, ?,
+                               parser_version, source_filename, resume_payload_encrypted, ?,
+                               ?, FALSE, ?, encryption_status, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, resume_id
+                        FROM ResumeVersions WHERE resume_id = ? AND user_id = ?
                         """,
                         (
                             result_resume_id, next_version, child_hash,
@@ -1534,16 +1520,16 @@ async def review_resume_facts(
                         ),
                     )
                     cur.execute(
-                        "UPDATE ResumeVersions SET superseded_at = COALESCE(superseded_at, NOW()) WHERE resume_id = %s",
+                        "UPDATE ResumeVersions SET superseded_at = COALESCE(superseded_at, CURRENT_TIMESTAMP) WHERE resume_id = ?",
                         (resume_id,),
                     )
                 else:
                     cur.execute(
                         """
                         UPDATE ResumeVersions
-                        SET facts_encrypted = %s, derived_taxonomy = %s,
-                            confirmation_status = %s, updated_at = NOW()
-                        WHERE resume_id = %s AND user_id = %s
+                        SET facts_encrypted = ?, derived_taxonomy = ?,
+                            confirmation_status = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE resume_id = ? AND user_id = ?
                         """,
                         (
                             _encrypted_json_blob(facts_payload), json.dumps(taxonomy),
@@ -1555,12 +1541,12 @@ async def review_resume_facts(
                     cur.execute(
                         """
                         UPDATE UserInfo
-                        SET resume_json = %s,
-                            profile_json = %s,
-                            profile_completed = %s,
-                            full_name = COALESCE(NULLIF(%s, ''), full_name),
-                            updated_at = NOW()
-                        WHERE user_id = %s
+                        SET resume_json = ?,
+                            profile_json = ?,
+                            profile_completed = ?,
+                            full_name = COALESCE(NULLIF(?, ''), full_name),
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
                         """,
                         (
                             json.dumps(encrypt_json(materialized)),
@@ -1584,7 +1570,7 @@ async def review_resume_facts(
 @router.patch("/resumes/{resume_id}/activate")
 async def activate_resume_version(
     resume_id: str,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any]:
     with get_db() as conn:
         cur = conn.cursor()
@@ -1592,7 +1578,7 @@ async def activate_resume_version(
             with transaction(conn):
                 cur.execute(
                     RESUME_VERSION_SELECT
-                    + " WHERE user_id = %s AND resume_id = %s FOR UPDATE",
+                    + " WHERE user_id = ? AND resume_id = ?",
                     (current_user["user_id"], resume_id),
                 )
                 row = cur.fetchone()
@@ -1607,24 +1593,24 @@ async def activate_resume_version(
                 profile = resume["resume_payload"]
                 profile_completed = bool(profile.get("name") and profile.get("skills"))
                 cur.execute(
-                    "UPDATE ResumeVersions SET is_active = FALSE, updated_at = NOW() WHERE user_id = %s AND is_active = TRUE",
+                    "UPDATE ResumeVersions SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND is_active = TRUE",
                     (current_user["user_id"],),
                 )
                 cur.execute(
-                    "UPDATE ResumeVersions SET is_active = TRUE, updated_at = NOW() WHERE user_id = %s AND resume_id = %s",
+                    "UPDATE ResumeVersions SET is_active = TRUE, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND resume_id = ?",
                     (current_user["user_id"], resume_id),
                 )
                 cur.execute(
                     """
                     UPDATE UserInfo
-                    SET resume_json = %s,
-                        profile_json = %s,
-                        active_resume_id = %s,
-                        profile_completed = %s,
-                        full_name = COALESCE(NULLIF(%s, ''), full_name),
-                        resume_uploaded_at = COALESCE(resume_uploaded_at, NOW()),
-                        updated_at = NOW()
-                    WHERE user_id = %s
+                    SET resume_json = ?,
+                        profile_json = ?,
+                        active_resume_id = ?,
+                        profile_completed = ?,
+                        full_name = COALESCE(NULLIF(?, ''), full_name),
+                        resume_uploaded_at = COALESCE(resume_uploaded_at, CURRENT_TIMESTAMP),
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
                     """,
                     (
                         json.dumps(encrypt_json(profile)),
@@ -1643,7 +1629,7 @@ async def activate_resume_version(
 @router.post("/confirm-profile")
 async def confirm_profile(
     request: Request,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any] | None:
     body = await request.json()
 
@@ -1669,7 +1655,7 @@ async def confirm_profile(
         cur = conn.cursor()
         try:
             if job_id:
-                cur.execute("SELECT job_id FROM Jobs WHERE job_id = %s", (job_id,))
+                cur.execute("SELECT job_id FROM Jobs WHERE job_id = ?", (job_id,))
                 if not cur.fetchone():
                     raise HTTPException(status.HTTP_404_NOT_FOUND, "Job not found")
 
@@ -1677,20 +1663,20 @@ async def confirm_profile(
                 cur.execute(
                     """
                     UPDATE UserInfo
-                    SET job_id = %s,
-                        resume_json = %s,
-                        profile_json = %s,
+                    SET job_id = ?,
+                        resume_json = ?,
+                        profile_json = ?,
                         profile_completed = TRUE,
-                        resume_uploaded_at = NOW(),
-                        updated_at = NOW()
-                    WHERE user_id = %s
+                        resume_uploaded_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
                     """,
                     (job_id, json.dumps(encrypt_json(validated)), json.dumps(encrypt_json(validated)), current_user["user_id"]),
                 )
 
                 cur.execute(
                     RESUME_VERSION_SELECT
-                    + " WHERE user_id = %s AND is_active = TRUE ORDER BY version_number DESC LIMIT 1 FOR UPDATE",
+                    + " WHERE user_id = ? AND is_active = TRUE ORDER BY version_number DESC LIMIT 1",
                     (current_user["user_id"],),
                 )
                 active_version_row = cur.fetchone()
@@ -1723,11 +1709,11 @@ async def confirm_profile(
                     cur.execute(
                         """
                         UPDATE ResumeVersions
-                        SET facts_encrypted = %s,
-                            derived_taxonomy = %s,
+                        SET facts_encrypted = ?,
+                            derived_taxonomy = ?,
                             confirmation_status = 'confirmed',
-                            updated_at = NOW()
-                        WHERE resume_id = %s AND user_id = %s
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE resume_id = ? AND user_id = ?
                         """,
                         (
                             _encrypted_json_blob(updated_facts),
@@ -1738,13 +1724,11 @@ async def confirm_profile(
                     )
 
                 cur.execute(
-                    "INSERT INTO ResumeUploadLogs (user_id, uploaded_at) VALUES (%s, NOW())",
+                    "INSERT INTO ResumeUploadLogs (user_id, uploaded_at) VALUES (?, CURRENT_TIMESTAMP)",
                     (current_user["user_id"],),
                 )
 
             logger.info("Profile confirmed for %s", stable_hash(current_user["user_id"], "user"))
-            schedule_profile_enrichment(current_user["user_id"], validated)
-
             return {
                 "success": True,
                 "message": "Profile saved! You can now start your interview.",
@@ -1759,27 +1743,34 @@ async def confirm_profile(
             cur.close()
 
 @router.get("/form")
-async def get_form(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any] | None:
+async def get_form(current_user: dict[str, Any] = Depends(local_user)) -> dict[str, Any] | None:
     with get_db() as conn:
         cur = conn.cursor()
         try:
             cur.execute(
                 """
                 SELECT COALESCE(profile_json, resume_json), job_id
-                FROM UserInfo WHERE user_id = %s
+                FROM UserInfo WHERE user_id = ?
                 """,
                 (current_user["user_id"],),
             )
             row = cur.fetchone()
 
             if not row or not row[0]:
-                raise HTTPException(status.HTTP_404_NOT_FOUND, "Resume not found. Please upload your resume first.")
+                # An empty workspace is a normal first-launch state, not an
+                # exceptional API failure. The renderer uses this response to
+                # show the upload flow without logging a noisy 404.
+                return {
+                    "success": True,
+                    "form_data": None,
+                    "job_info": None,
+                }
 
             validated = validate_resume_json(decrypt_json(row[0]))
 
             job_info = None
             if row[1]:
-                cur.execute("SELECT job_id, title, description FROM Jobs WHERE job_id = %s", (row[1],))
+                cur.execute("SELECT job_id, title, description FROM Jobs WHERE job_id = ?", (row[1],))
                 job_row = cur.fetchone()
                 if job_row:
                     job_info = {"job_id": job_row[0], "title": job_row[1], "description": job_row[2]}
@@ -1788,7 +1779,7 @@ async def get_form(current_user: dict[str, Any] = Depends(get_current_user)) -> 
                     """
                     SELECT profile_id, role, job_description_encrypted
                     FROM JobProfiles
-                    WHERE user_id = %s AND is_selected = TRUE
+                    WHERE user_id = ? AND is_selected = TRUE
                     ORDER BY updated_at DESC, created_at DESC
                     LIMIT 1
                     """,
@@ -1810,7 +1801,7 @@ async def get_form(current_user: dict[str, Any] = Depends(get_current_user)) -> 
 @router.post("/submit-form")
 async def submit_form(
     request: Request,
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(local_user),
 ) -> dict[str, Any] | None:
     form_data = await request.json()
 
@@ -1836,13 +1827,12 @@ async def submit_form(
                 cur.execute(
                     """
                     UPDATE UserInfo
-                    SET profile_json = %s, profile_completed = TRUE, updated_at = NOW()
-                    WHERE user_id = %s
+                    SET profile_json = ?, profile_completed = TRUE, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
                     """,
                     (json.dumps(encrypt_json(form_data)), current_user["user_id"]),
                 )
 
-            schedule_profile_enrichment(current_user["user_id"], form_data)
             return {"success": True, "status": "complete", "message": "Profile saved! You can now start your interview."}
 
         except HTTPException:
@@ -1854,7 +1844,7 @@ async def submit_form(
             cur.close()
 
 @router.get("/profile-status")
-async def get_profile_status(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any] | None:
+async def get_profile_status(current_user: dict[str, Any] = Depends(local_user)) -> dict[str, Any] | None:
     with get_db() as conn:
         cur = conn.cursor()
         try:
@@ -1870,7 +1860,7 @@ async def get_profile_status(current_user: dict[str, Any] = Depends(get_current_
                            WHERE user_id = UserInfo.user_id AND is_selected = TRUE
                        ) AS has_selected_job_profile
                 FROM UserInfo
-                WHERE user_id = %s
+                WHERE user_id = ?
                 """,
                 (current_user["user_id"],),
             )
@@ -1903,7 +1893,7 @@ async def get_profile_status(current_user: dict[str, Any] = Depends(get_current_
             cur.close()
 
 @router.delete("/reset-profile")
-async def reset_profile(current_user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any] | None:
+async def reset_profile(current_user: dict[str, Any] = Depends(local_user)) -> dict[str, Any] | None:
     with get_db() as conn:
         cur = conn.cursor()
         try:
@@ -1915,12 +1905,12 @@ async def reset_profile(current_user: dict[str, Any] = Depends(get_current_user)
                         active_resume_id = NULL,
                         profile_completed = FALSE, job_id = NULL,
                         resume_uploaded_at = NULL
-                    WHERE user_id = %s
+                    WHERE user_id = ?
                     """,
                     (current_user["user_id"],),
                 )
                 cur.execute(
-                    "UPDATE ResumeVersions SET is_active = FALSE, updated_at = NOW() WHERE user_id = %s AND is_active = TRUE",
+                    "UPDATE ResumeVersions SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND is_active = TRUE",
                     (current_user["user_id"],),
                 )
 

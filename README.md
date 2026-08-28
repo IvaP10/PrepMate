@@ -1,99 +1,143 @@
-# InterAI
+# PrepMate Desktop
 
-InterAI is an evidence-based interview practice application. A FastAPI API, Next.js frontend, PostgreSQL database, Redis cache, and separate durable worker power four connected areas:
+PrepMate is a local-first desktop interview coach for interview practice,
+technical rounds, evidence-backed reports, Performance history, and Improve
+coaching. The source repository is private; the customer application is
+distributed as signed macOS installers through an owner-approved binary
+release channel.
 
-- Interview Round: a single continuous, screen-shared voice interview with a required microphone and an optional camera.
-- Technical Round: a separate proctored, typed coding/debugging/concept/system-design flow whose code runs in a private gVisor sandbox.
-- Performance: canonical, version-comparable analysis only; missing evidence stays unknown.
-- Improve: interactive missions, timed activities, saved drafts, held-out checkpoints, and later-interview validation.
+There are no PrepMate accounts, subscriptions, payments, hosted databases,
+analytics, or PrepMate application servers.
 
-Both Interview and Technical flows offer four distinct profiles: Top Tier, Mid Tier, Startup, and Custom. Every session starts from an internal, immutable, versioned blueprint tied to a resume version and job target; exact questions and internal scoring plans are never exposed before the attempt.
+## Download
 
-## Local development
+Install the current signed and notarized release from the approved distribution
+channel. Choose the Apple Silicon build for an M-series Mac or the Intel build
+for an Intel Mac. Each release includes release notes, SHA-256 checksums, SBOMs,
+and the required license and attribution notices.
 
-Requirements: Python 3.12+, Node.js 20+, PostgreSQL 16, and Redis 7. Copy `key.env.example` to `key.env`, use non-placeholder secrets, and keep `ENVIRONMENT=development` for local HTTP.
+The source repository and customer downloads are separate. No source code,
+source archive, or GitHub Release is required to download or use PrepMate.
 
-```bash
-python3 -m pip install -r requirements.txt
-cd Frontend && npm ci && cd ..
-python3 -m alembic upgrade head
+On first launch, open **Settings**, select a provider and model, enter its API
+key when required, and save. Settings probes the candidate configuration before
+committing it. A loopback OpenAI-compatible endpoint may be keyless. API keys
+and the local field-encryption key are stored in the operating-system keychain
+and are never returned to the renderer.
+
+## Capabilities
+
+| Capability | Status |
+| --- | --- |
+| Typed behavioral interviews, reports, Performance, Improve | Available with a configured text provider |
+| Voice answers | Available only when the selected provider supports transcription |
+| Selectable PDF and DOCX resume import | Available in the core install |
+| Scanned-PDF OCR | Optional heavyweight source-install pack |
+| Interviewer speech | Not included; questions remain readable text |
+| Technical questions without execution | Available |
+| Sandboxed code execution | Available on macOS when Seatbelt and the selected language runtime are detected |
+| macOS installer | Signed/notarized Apple Silicon and Intel DMG/ZIP release assets |
+| Windows installer | Not released until secure execution and native packaging are verified |
+| Linux installer | Not released in this distribution |
+
+Camera and screen sharing are optional coaching controls and are never required
+for a score or report. The app has no automatic updater; users return to the
+approved distribution channel to install a newer version.
+
+## Local-first architecture
+
+```text
+PrepMate desktop -> loopback API -> encrypted SQLite fields
+                              -> OS keychain -> selected AI provider
 ```
 
-In development, the API starts the durable analysis and technical worker
-process by default, so run two processes in separate terminals:
+Before provider setup, the app makes only loopback requests to its own local
+services. After setup, prompts and the minimum context needed for an AI feature
+go directly to the provider selected in Settings.
+
+The API and renderer bind only to loopback. Both require random per-launch
+desktop tokens, so the renderer is not a standalone website and ordinary
+browser access is rejected. Sensitive database fields use AES-GCM with
+a separate key held in the OS keychain. Technical submissions execute only
+through a supported macOS Seatbelt sandbox and fail closed when it is
+unavailable.
+
+## Local data
+
+The SQLite database, preferences, resumes, job descriptions, saved roles,
+interview history, reports, Performance evidence, and Improve data live under
+Electron's application-data directory:
+
+- macOS: `~/Library/Application Support/PrepMate`
+
+When the backend is run directly from the private source checkout, set
+`PREPMATE_DATA_DIR` only when a different local directory is required. The old
+`INTERAI_DATA_DIR` variable remains accepted for private migration scripts.
+
+## Development
+
+Source development requires Python 3.12 or 3.13 and Node.js 22+:
 
 ```bash
-uvicorn app:app --reload --host 0.0.0.0 --port 8000
+python3 -m pip install -r requirements.lock.txt
+npm ci --prefix Frontend
+npm ci --prefix desktop
+```
+
+Launch the complete desktop application from either the repository root or the
+renderer directory:
+
+```bash
+npm run dev
+# or
 cd Frontend && npm run dev
 ```
 
-Set `DEVELOPMENT_AUTO_WORKER=false` when you want to run `python3 worker.py`
-as a separate local process. Production always uses the separate worker service.
-The API commits analysis and code-execution jobs; durable workers claim them.
-Production code never runs untrusted submissions on the API host.
+The command starts the private loopback API and renderer, then opens PrepMate in
+Electron. Do not open the loopback renderer in a browser; it deliberately
+rejects non-Electron requests.
 
-## Option A Docker deployment
+## Desktop packaging
 
-Docker Compose supplies PostgreSQL, Redis, the migration job, API, worker, Next.js, Caddy TLS proxy, a network-private Prometheus collector with alert rules, and authenticated encrypted PostgreSQL backups. `/metrics` is intentionally absent from Caddy's public routes and the bundled collector scrapes it only across the private `app` network. Leave `METRICS_BEARER_TOKEN` empty for this bundled topology; a replacement collector must send that bearer token when one is configured. Production requires a separate private sandbox executor; the public application stack never mounts a Docker socket. Execution hosts install and register gVisor's `runsc` runtime and run the executor-only Compose file documented in [`infra/sandbox/README.md`](infra/sandbox/README.md).
-
-```bash
-cp key.env.example key.env
-# Fill all production values, including HTTPS origins/URLs, secure cookies,
-# PISTON_API_URL for the private executor, and BACKUP_ENCRYPTION_KEY.
-docker compose --env-file key.env config --quiet
-docker compose --env-file key.env up --build -d
-curl -fsS https://YOUR_DOMAIN/live
-curl -fsS https://YOUR_DOMAIN/ready
-```
-
-`/live` proves only that the API process is alive. `/ready` is the deployment gate: database connectivity and exact Alembic head, Redis, OpenAI configuration, isolated sandbox runtimes, fresh analysis/technical worker heartbeats, and stuck-job checks must all pass. The API container health check uses `/ready`, so the frontend and proxy are not declared ready over a degraded pipeline.
-
-Run Compose with `--env-file key.env`; this keeps PostgreSQL credentials and required private-service/backup settings used for interpolation aligned with the API, worker, migration, and backup services.
-
-After readiness passes, run the dependency-free latency gate against each intended deployment route. Protected routes accept `--cookie` (or `--bearer` where bearer auth is enabled) for a dedicated disposable test account:
+The Electron wrapper, PyInstaller backend, and macOS installer targets are in
+`desktop/`. From the private repository root:
 
 ```bash
-python3 scripts/load_smoke.py --path /live --requests 200 --concurrency 20 --p95-ms 500
-python3 scripts/load_smoke.py --path /api/dashboard/home --cookie "interai_session=$LOAD_TEST_SESSION" --requests 100 --concurrency 10 --p95-ms 1000
+# Apple Silicon DMG/ZIP
+npm run package:mac
+
+# Intel DMG/ZIP on an Intel macOS build host
+PREPMATE_MAC_ARCH=x64 npm run package:mac
 ```
 
-## Evidence and scoring contract
+The local output is written to `desktop/release/`. Unsigned local builds are
+for development only. The public release workflow uses Apple Developer ID
+signing, notarization, stapling, checksum generation, SBOM generation, and
+clean-machine verification before uploading assets to the official download
+storage.
 
-- Raw answers, transcripts, resume/JD content, reports, and source code use encrypted-at-rest columns.
-- Responses are immutable; assessments are append-only and versioned.
-- The application owns state transitions, follow-ups, weighted rubrics, code correctness, mission progress, and entitlements.
-- OpenAI is limited to transcription, structured semantic evidence, optional wording, and narrative. Structured calls use strict schemas and `store=false`.
-- A required dimension without evidence is `null`. Empty or short answers are insufficient evidence, never an authoritative zero.
-- Coding correctness comes only from visible and encrypted hidden tests run in the private gVisor sandbox.
-- Performance reads `SessionPerformanceAnalyses`; it does not recompute a competing score from legacy rows.
-- Passing an Improve exercise does not resolve a weakness. A held-out variation plus later comparable interview evidence is required.
-- Client-supplied Improve scores, bonuses, condition results, and mastery decisions are ignored.
+See [RELEASING.md](RELEASING.md) and [PUBLIC_RELEASE_BLOCKERS.md](PUBLIC_RELEASE_BLOCKERS.md)
+for the private-repository release process and binary publication gates.
 
-Raw audio/video retention defaults to disabled (`RAW_VIDEO_RETENTION_HOURS=0`, `AUDIO_RETENTION_DAYS=0`). The app persists transcripts, real timing, and approved browser-derived signals instead.
+## Privacy and network boundary
 
-## Validation
+PrepMate does not send application data to a PrepMate-operated server. When an
+AI feature is used, the selected provider may receive resume-derived context,
+job descriptions, interview questions and answers, transcript excerpts,
+technical reasoning, and report or coaching inputs. Review the selected
+provider's retention terms before sending sensitive material.
 
-```bash
-git fetch --prune
-python3 scripts/release_source_guard.py
-python3 -m pytest -q
-python3 -m alembic upgrade head
-python3 -m compileall -q .
-cd Frontend && npm run lint -- --incremental false && npm run build
-```
+Camera coaching is processed in the renderer and does not download a vision
+model or upload camera frames. The app does not download speech or vision
+models and does not include interviewer text-to-speech.
 
-The source guard intentionally fails when deployment files are untracked, the
-worktree is dirty, or the local commit is not the pushed upstream commit. For a
-release, also pass `scripts/openai_canary.py`, prove an empty-database migration
-and an existing-database upgrade, worker lease/restart recovery, duplicate
-answer/finalization behavior, sandbox hidden-test secrecy and adversarial
-resource-limit probes, export/delete coverage, authenticated browser flows
-across all four areas, and the latency gates in the implementation plan.
+Read [PRIVACY.md](PRIVACY.md) for deletion, export, keychain, provider, and
+local code-execution details.
 
-## Operational notes
+## License and notices
 
-- Use `python3 -m alembic upgrade head`; do not apply `schema.sql` or individual SQL migrations in production.
-- AES-256-GCM authenticated backups are written to the `postgres_backups` volume and retained for seven days. A backup is not accepted until the isolated restore drill in [`infra/OPERATIONS_RUNBOOK.md`](infra/OPERATIONS_RUNBOOK.md) passes.
-- Run the public desktop/mobile browser gate with `cd Frontend && npm run test:e2e`. The authenticated release suite fails closed unless a disposable account and exact seeded lifecycle IDs are supplied to `npm run test:e2e:release`.
-- Keep Caddy’s application domain, `APP_BASE_URL`, `API_BASE_URL`, `ALLOWED_ORIGINS`, cookie domain, and `COOKIE_SECURE=true` aligned in production.
-- Public execution endpoints, local subprocesses, and host-runtime fallbacks are rejected as production dependencies.
+PrepMate remains licensed under the [Apache License 2.0](LICENSE). Binary
+downloads include `LICENSE`, `NOTICE`, and
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The source repository is
+private, but the Apache-2.0 license and applicable attribution obligations
+remain in force for distributed binaries.

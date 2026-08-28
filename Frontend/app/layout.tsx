@@ -3,8 +3,8 @@ import Script from 'next/script'
 import { Toaster } from 'sonner'
 import './globals.css'
 export const metadata: Metadata = {
-  title: 'InterAI',
-  description: 'Ace your next interview with personalized AI coaching powered by your resume.',
+  title: 'PrepMate',
+  description: 'Practice interviews with private, local-first coaching powered by your chosen AI provider.',
   icons: {
     icon: [
       {
