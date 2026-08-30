@@ -75,7 +75,7 @@ idna==3.19
     #   anyio
     #   httpx
     #   requests
-imagesize==2.0.0
+imagesize==2.0.1
     # via paddlex
 jaraco-classes==3.4.0
     # via keyring
