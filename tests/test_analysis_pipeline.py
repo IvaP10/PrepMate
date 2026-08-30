@@ -91,12 +91,7 @@ class AnalysisPipelinePureTests(unittest.TestCase):
             "technical_analysis",
             "self_review_summary",
             "deterministic_report",
-            "semantic_enhancement",
             "report_validation",
-            "performance_projection",
-            "weakness_update",
-            "improve_update",
-            "complete",
         ))
         self.assertEqual(
             analysis_pipeline.ANALYSIS_EXECUTION_STAGES,

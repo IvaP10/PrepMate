@@ -68,7 +68,6 @@ from persona_generator import generate_persona
 from interview_capabilities import is_technical_interview_type, normalize_technical_profile
 from knowledge_map import (
     build_knowledge_map,
-    get_next_battleground,
     mark_turn_used,
     is_interview_complete,
     should_transition,
@@ -88,6 +87,13 @@ from security_utils import redact_text, stable_hash, collect_profile_identifiers
 from security_utils import decrypt_data, decrypt_json_field, encrypt_data
 from interview_blueprint import compile_interview_blueprint, validate_blueprint, weakness_label
 from evaluation_engine import EVALUATION_VERSION, evaluate_answer
+from interview_evidence import (
+    choose_adaptive_next_action,
+    ensure_interview_evidence_state,
+    record_adaptive_action,
+    select_next_battleground,
+    update_interview_evidence_state,
+)
 from learning_engine import ensure_mission_from_response_assessment
 from attempt_context import create_attempt_context_snapshot
 from ws_contract import (
@@ -1566,6 +1572,24 @@ def _assessment_hash(response_id: str, question_spec: Dict[str, Any], answer_has
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _normalize_behavioral_answer(
+    answer: Any,
+    *,
+    input_mode: str = "voice",
+    timing: Optional[Dict[str, Any]] = None,
+) -> tuple[str, str, Dict[str, Any]]:
+    """Normalize typed text and transcribed voice into one answer contract."""
+
+    normalized_mode = "voice" if str(input_mode or "").strip().lower() in {"voice", "audio", "transcript"} else "text"
+    normalized_answer = re.sub(r"\s+", " ", str(answer or "")).strip()
+    normalized_timing = dict(timing) if isinstance(timing, dict) else {}
+    if normalized_mode == "text":
+        response_seconds = normalized_timing.get("response_seconds")
+        if isinstance(response_seconds, (int, float)) and response_seconds >= 0:
+            normalized_timing["response_latency_seconds"] = response_seconds
+    return normalized_answer, normalized_mode, normalized_timing
+
+
 def _persist_raw_answer(
     *,
     response_id: str,
@@ -1678,7 +1702,13 @@ def _expected_point_contract(question_spec: Dict[str, Any], question_id: str) ->
     result: List[Dict[str, str]] = []
     for index, point in enumerate(question_spec.get("expected_points") or [], start=1):
         if isinstance(point, dict):
-            point_id = str(point.get("point_id") or point.get("id") or "").strip()
+            point_id = str(
+                point.get("point_id")
+                or point.get("expected_point_id")
+                or point.get("id")
+                or point.get("key")
+                or ""
+            ).strip()
             label = str(point.get("label") or point.get("text") or point_id).strip()
         else:
             point_id = ""
@@ -2525,6 +2555,8 @@ async def websocket_video_interview(websocket: WebSocket):
         session_activated_at: Optional[datetime] = None
         session_deadline_at: Optional[datetime] = None
         quality_failure_streak = 0
+        evidence_state: Dict[str, Any] = {}
+        prior_evaluations: List[Dict[str, Any]] = []
 
         msg_timestamps: deque[float] = deque()
         server_frame_counter: int = 0
@@ -3069,9 +3101,17 @@ async def websocket_video_interview(websocket: WebSocket):
             nonlocal current_parent_question_id
             nonlocal warmup_pending
             nonlocal quality_failure_streak
+            nonlocal evidence_state
+            nonlocal prior_evaluations
 
             try:
-                cleaned_response = (response_text or "").strip()
+                cleaned_response, normalized_input_mode, normalized_timing = _normalize_behavioral_answer(
+                    response_text,
+                    input_mode=input_mode,
+                    timing=timing,
+                )
+                input_mode = normalized_input_mode
+                timing = normalized_timing
                 if not cleaned_response:
                     await send_ws_message({
                         "type": "error",
@@ -3110,6 +3150,10 @@ async def websocket_video_interview(websocket: WebSocket):
                 timing_payload = dict(timing or {})
                 timing_payload.setdefault("response_latency_seconds", round(max(0.0, time_taken), 3))
                 measured_response_seconds = timing_payload.get("voiced_duration_seconds")
+                if not isinstance(measured_response_seconds, (int, float)) or measured_response_seconds <= 0:
+                    measured_response_seconds = timing_payload.get("response_seconds")
+                if not isinstance(measured_response_seconds, (int, float)) or measured_response_seconds <= 0:
+                    measured_response_seconds = timing_payload.get("response_latency_seconds")
                 if not isinstance(measured_response_seconds, (int, float)) or measured_response_seconds <= 0:
                     measured_response_seconds = time_taken
 
@@ -3201,6 +3245,15 @@ async def websocket_video_interview(websocket: WebSocket):
                     **(question_spec.get("rubric") or {}),
                     "expected_points": point_contract,
                 }
+                # Passing prior evidence enriches the evaluator's one normal
+                # semantic request for substantive answers, but must not turn
+                # an otherwise deterministic short-answer turn into a new
+                # provider call.
+                semantic_prior = (
+                    prior_evaluations[-5:]
+                    if len(re.findall(r"\b[\w']+\b", cleaned_response)) >= 12
+                    else []
+                )
                 context = {
                     "interview_type": (
                         ws_settings.get("interview_type")
@@ -3210,6 +3263,12 @@ async def websocket_video_interview(websocket: WebSocket):
                     "question_type": question_spec.get("kind") or question_kind,
                     "taxonomy_keys": question_spec.get("taxonomy_keys") or [],
                     "source_anchors": question_spec.get("source_anchors") or [],
+                    "expected_point_ids": [
+                        str(point.get("point_id"))
+                        for point in point_contract
+                        if point.get("point_id")
+                    ],
+                    "profile_type": ws_settings.get("profile_type"),
                     "semantic_analysis_enabled": True,
                 }
                 try:
@@ -3220,7 +3279,7 @@ async def websocket_video_interview(websocket: WebSocket):
                             rubric,
                             context,
                             measured_response_seconds,
-                            [],
+                            semantic_prior,
                             user_id=user_id,
                             interview_id=interview_id,
                             response_id=response_id,
@@ -3234,7 +3293,7 @@ async def websocket_video_interview(websocket: WebSocket):
                         rubric,
                         {**context, "semantic_analysis_enabled": False},
                         measured_response_seconds,
-                        [],
+                        semantic_prior,
                         user_id=user_id,
                         interview_id=interview_id,
                         response_id=response_id,
@@ -3250,6 +3309,20 @@ async def websocket_video_interview(websocket: WebSocket):
                     question_spec=question_spec,
                     question_id=question_id,
                 )
+                if not warmup_pending:
+                    evidence_state = update_interview_evidence_state(
+                        evidence_state,
+                        question_spec,
+                        evaluation,
+                        question_id=question_id,
+                    )
+                    # The semantic evaluator can use the already-produced
+                    # bounded assessments on its next single pass (for
+                    # contradiction context). This is not an extra model
+                    # call and does not store answer text in the runtime
+                    # evidence state.
+                    prior_evaluations.append(evaluation)
+                    del prior_evaluations[:-5]
 
                 if warmup_pending:
                     # The introduction helps the interviewer orient follow-up
@@ -3297,12 +3370,50 @@ async def websocket_video_interview(websocket: WebSocket):
                     elif len(recent_scores) == 2 and all(score < 50 for score in recent_scores):
                         active_bg["estimated_difficulty"] = "diagnostic"
 
-                requested_action = str((evaluation.get("follow_up") or {}).get("action") or "advance")
+                followup_policy = evaluation.get("follow_up") if isinstance(evaluation.get("follow_up"), dict) else {}
                 followups_used = int(active_bg.get("policy_followups_used") or 0)
+                maximum_followups = min(2, max(0, int(active_bg.get("max_followups") or 2)))
+                remaining_interview_seconds = max(
+                    0,
+                    configured_duration_seconds("max_minutes", 60) - interview_elapsed_seconds(),
+                )
+                adaptive_decision = choose_adaptive_next_action(
+                    evaluation=evaluation,
+                    evidence_state=evidence_state,
+                    active_section_id=active_bg.get("section_id") or active_bg.get("id"),
+                    profile_type=str(ws_settings.get("profile_type") or "mid_tier"),
+                    followups_used=followups_used,
+                    maximum_followups=maximum_followups,
+                    remaining_seconds=remaining_interview_seconds,
+                )
+                requested_action = str(adaptive_decision.get("action") or "advance")
+                adaptive_gap_labels = []
+                active_state = (evidence_state.get("sections") or {}).get(
+                    str(active_bg.get("section_id") or active_bg.get("id"))
+                )
+                if isinstance(active_state, dict):
+                    missing_ids = set(adaptive_decision.get("missing_point_ids") or [])
+                    adaptive_gap_labels = [
+                        str(point.get("label") or "").strip()
+                        for point in active_state.get("expected_points") or []
+                        if isinstance(point, dict)
+                        and str(point.get("point_id") or "") in missing_ids
+                        and str(point.get("label") or "").strip()
+                    ][:3]
+                evaluation["follow_up"] = {
+                    **followup_policy,
+                    "action": requested_action,
+                    "reason": adaptive_decision.get("reason") or followup_policy.get("reason"),
+                    "adaptive": {
+                        "evidence_state_used": bool(adaptive_decision.get("evidence_state_used")),
+                        "baseline_action": adaptive_decision.get("baseline_action"),
+                        "missing_point_ids": adaptive_decision.get("missing_point_ids") or [],
+                    },
+                }
                 should_follow = (
                     not warmup_pending
                     and requested_action != "advance"
-                    and followups_used < 2
+                    and followups_used < maximum_followups
                     and not reached_maximum_duration()
                 )
 
@@ -3319,7 +3430,12 @@ async def websocket_video_interview(websocket: WebSocket):
                     decision_reason = quality_reason
                 elif warmup_pending:
                     warmup_pending = False
-                    next_bg = current_battleground or get_next_battleground(knowledge_map)
+                    next_bg = current_battleground or select_next_battleground(
+                        knowledge_map,
+                        evidence_state,
+                        profile_type=str(ws_settings.get("profile_type") or "mid_tier"),
+                        remaining_seconds=remaining_interview_seconds,
+                    )
                     decision_action = "advance"
                     decision_reason = "warmup_complete"
                 elif should_follow:
@@ -3331,21 +3447,39 @@ async def websocket_video_interview(websocket: WebSocket):
                         int(active_bg.get("current_turns") or 0),
                         int(active_bg.get("max_turns") or 1),
                     )
-                    next_bg = get_next_battleground(knowledge_map)
+                    next_bg = select_next_battleground(
+                        knowledge_map,
+                        evidence_state,
+                        current_section_id=active_bg.get("section_id") or active_bg.get("id"),
+                        profile_type=str(ws_settings.get("profile_type") or "mid_tier"),
+                        remaining_seconds=remaining_interview_seconds,
+                    )
                     decision_action = "advance"
                     decision_reason = (
-                        "followup_budget_exhausted" if followups_used >= 2
+                        "followup_budget_exhausted" if followups_used >= maximum_followups
                         else "topic_time_exhausted" if reached_maximum_duration()
                         else str((evaluation.get("follow_up") or {}).get("reason") or "coverage_met")
                     )
 
                 minimum_duration_depth = False
-                if next_bg is None and not quality_end and below_minimum_duration() and not reached_maximum_duration():
+                if (
+                    next_bg is None
+                    and not quality_end
+                    and below_minimum_duration()
+                    and not reached_maximum_duration()
+                    and followups_used < maximum_followups
+                ):
                     next_bg = active_bg
                     should_follow = True
                     minimum_duration_depth = True
                     decision_action = "deepen"
                     decision_reason = "minimum_duration_evidence_depth"
+
+                evidence_state = record_adaptive_action(
+                    evidence_state,
+                    active_bg.get("section_id") or active_bg.get("id"),
+                    decision_action,
+                )
 
                 if next_bg and not reached_maximum_duration():
                     next_question_id = str(uuid.uuid4())
@@ -3384,6 +3518,11 @@ async def websocket_video_interview(websocket: WebSocket):
                                     f"{ws_settings.get('followup_instruction', '')} "
                                     "Continue naturally with one new, evidence-based question from the candidate's answer. "
                                     "Do not repeat the previous wording and do not coach the answer."
+                                    + (
+                                        f" Deterministic evidence still needed: {', '.join(adaptive_gap_labels)}. "
+                                        "Target that gap without mentioning the rubric."
+                                        if adaptive_gap_labels else ""
+                                    )
                                 ).strip(),
                                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                                 job_title=ws_settings.get("job_title", ""),
@@ -3408,6 +3547,11 @@ async def websocket_video_interview(websocket: WebSocket):
                                     f"The deterministic follow-up action is {decision_action}. "
                                     "Ask one new question that stays on this topic and refers to a concrete detail from the candidate's answer. "
                                     "Do not switch topics, repeat the previous question, or give coaching."
+                                    + (
+                                        f" Deterministic evidence still needed: {', '.join(adaptive_gap_labels)}. "
+                                        "Target that gap without mentioning the rubric."
+                                        if adaptive_gap_labels else ""
+                                    )
                                 ).strip(),
                                 profile_type=ws_settings.get("profile_type", "mid_tier"),
                                 job_title=ws_settings.get("job_title", ""),
@@ -3426,6 +3570,7 @@ async def websocket_video_interview(websocket: WebSocket):
                             "action": decision_action,
                             "policy_version": EVALUATION_VERSION,
                             "answered_question_id": question_id,
+                            "missing_expected_point_ids": adaptive_decision.get("missing_point_ids") or [],
                         }
                     else:
                         next_question_type = "main"
@@ -3478,7 +3623,7 @@ async def websocket_video_interview(websocket: WebSocket):
                     "action": decision_action,
                     "reason": decision_reason,
                     "followups_used": int(active_bg.get("policy_followups_used") or 0),
-                    "maximum_followups": 2,
+                    "maximum_followups": maximum_followups,
                     "finalize": next_question is None,
                 }
                 if quality_feedback:
@@ -3499,6 +3644,7 @@ async def websocket_video_interview(websocket: WebSocket):
                     }
                     if next_question else None
                 )
+                knowledge_map["evidence_state"] = evidence_state
                 committed = await asyncio.to_thread(
                     _commit_live_assessment,
                     response_id=response_id,
@@ -3801,6 +3947,12 @@ async def websocket_video_interview(websocket: WebSocket):
                     knowledge_map = decrypt_json_field(row[10], row[1], {})
                     if not isinstance(knowledge_map, dict):
                         raise RuntimeError("The encrypted interview question plan is invalid")
+                    evidence_state = ensure_interview_evidence_state(
+                        knowledge_map.get("evidence_state"),
+                        knowledge_map,
+                    )
+                    knowledge_map["evidence_state"] = evidence_state
+                    prior_evaluations.clear()
                     interview_mode = row[3]
                     ws_settings = row[4] if isinstance(row[4], dict) else json.loads(row[4]) if row[4] else {}
                     opening_intro_delivered = bool(ws_settings.get("opening_intro_delivered"))
@@ -3921,14 +4073,6 @@ async def websocket_video_interview(websocket: WebSocket):
                         else None
                     )
 
-                    current_battleground = get_next_battleground(knowledge_map)
-                    if not current_battleground:
-                        await send_ws_message({
-                            "type": "error",
-                            "message": "No questions available for this interview"
-                        })
-                        continue
-
                     existing_questions, _ = await asyncio.to_thread(
                         _db_execute,
                         """
@@ -4018,12 +4162,39 @@ async def websocket_video_interview(websocket: WebSocket):
                                     "input_mode": existing[12] or "voice",
                                     "timing": _json_load(existing[13], {}),
                                 }
-                            elif answer_text:
-                                conversation_history.append({
-                                    "role": "candidate",
-                                    "content": answer_text,
-                                    "question_id": str(existing[0]),
-                                })
+                            else:
+                                stored_assessment = decrypt_json_field(existing[14], None, None)
+                                if (
+                                    isinstance(stored_assessment, dict)
+                                    and str(existing[2] or "").lower() not in {"warmup", "introduction"}
+                                ):
+                                    section_spec = next(
+                                        (
+                                            item
+                                            for item in knowledge_map.get("battlegrounds", [])
+                                            if str(item.get("section_id") or "") == str(existing[5] or "")
+                                        ),
+                                        {
+                                            "section_id": existing[5] or existing[0],
+                                            "label": existing[4] or "Interview topic",
+                                            "kind": "behavioral",
+                                            "expected_points": [],
+                                        },
+                                    )
+                                    evidence_state = update_interview_evidence_state(
+                                        evidence_state,
+                                        section_spec,
+                                        stored_assessment,
+                                        question_id=str(existing[0]),
+                                    )
+                                    prior_evaluations.append(stored_assessment)
+                                    del prior_evaluations[:-5]
+                                if answer_text:
+                                    conversation_history.append({
+                                        "role": "candidate",
+                                        "content": answer_text,
+                                        "question_id": str(existing[0]),
+                                    })
 
                         resumable_row = resumable_row or existing_questions[-1]
                         current_question_id = str(resumable_row[0])
@@ -4040,7 +4211,17 @@ async def websocket_video_interview(websocket: WebSocket):
                                 for battleground in knowledge_map.get("battlegrounds", [])
                                 if str(battleground.get("section_id") or "") == section_id
                             ),
-                            get_next_battleground(knowledge_map),
+                            select_next_battleground(
+                                knowledge_map,
+                                evidence_state,
+                                current_section_id=section_id,
+                                profile_type=str(ws_settings.get("profile_type") or "mid_tier"),
+                                remaining_seconds=max(
+                                    0,
+                                    configured_duration_seconds("max_minutes", 60)
+                                    - interview_elapsed_seconds(),
+                                ),
+                            ),
                         )
                         if not current_battleground:
                             await complete_interview(include_closing_audio=False, force=True, reason="recovery_finalize")
@@ -4050,6 +4231,8 @@ async def websocket_video_interview(websocket: WebSocket):
                             if resumable_row[7]
                             else datetime.now(timezone.utc)
                         )
+                        knowledge_map["evidence_state"] = evidence_state
+                        await persist_knowledge_map_state()
                         await send_ws_message({
                             "type": "session_started",
                             "mode": interview_mode,
@@ -4078,13 +4261,33 @@ async def websocket_video_interview(websocket: WebSocket):
                                 timing=pending_assessment["timing"],
                             ))
                         elif resumable_row[8] is not None and resumable_row[14] is not None:
-                            assessment = _json_load(resumable_row[14], {})
+                            assessment = decrypt_json_field(resumable_row[14], None, {})
                             if not assessment.get("next_question"):
                                 track_ws_task(complete_interview(
                                     include_closing_audio=False,
                                     force=True,
                                     reason="recovery_finalize",
                                 ))
+                        continue
+
+                    current_battleground = select_next_battleground(
+                        knowledge_map,
+                        evidence_state,
+                        profile_type=str(ws_settings.get("profile_type") or "mid_tier"),
+                        remaining_seconds=(
+                            max(
+                                0,
+                                configured_duration_seconds("max_minutes", 60) - interview_elapsed_seconds(),
+                            )
+                            if session_activated_at
+                            else None
+                        ),
+                    )
+                    if not current_battleground:
+                        await send_ws_message({
+                            "type": "error",
+                            "message": "No questions available for this interview"
+                        })
                         continue
 
                     # The warm-up is a committed, context-only question too,
@@ -4284,10 +4487,24 @@ async def websocket_video_interview(websocket: WebSocket):
                     )
 
                 elif msg_type == "text_answer":
-                    await send_ws_message({
-                        "type": "error",
-                        "message": "This Interview Round accepts microphone responses only.",
-                    })
+                    if not pipeline_initialized:
+                        await send_ws_message({
+                            "type": "error",
+                            "code": "media_not_ready",
+                            "message": "Complete the interview readiness check before answering.",
+                        })
+                        await send_processing_idle()
+                        continue
+                    typed_timing = message.get("timing") if isinstance(message.get("timing"), dict) else {}
+                    if "response_seconds" not in typed_timing and isinstance(message.get("response_seconds"), (int, float)):
+                        typed_timing["response_seconds"] = message.get("response_seconds")
+                    await process_candidate_response(
+                        message.get("text") or message.get("response") or "",
+                        idempotency_key=message.get("idempotency_key"),
+                        client_question_id=message.get("question_id"),
+                        input_mode="text",
+                        timing=typed_timing,
+                    )
 
                 elif msg_type == "video_frame":
                     continue

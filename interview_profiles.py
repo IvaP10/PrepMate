@@ -22,7 +22,7 @@ TECHNICAL_TOTAL_DURATION_MINUTES = TECHNICAL_CODING_QUESTION_COUNT * TECHNICAL_M
 
 PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
     "top_tier": {
-        "config_version": "profile-2026-07-v3",
+        "config_version": "profile-2026-08-v4",
         "label": "Top Tier",
         "strictness_level": "hard",
         "duration": {"min_minutes": 45, "target_minutes": 60, "max_minutes": 60},
@@ -44,6 +44,12 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
             "they tried first, why it did not work, which trade-off they accepted, what decision was wrong, "
             "and how they proved the final solution was better."
         ),
+        "adaptive_policy": {
+            "progression": "depth_first",
+            "strong_answer_action": "challenge_tradeoff",
+            "allow_strong_depth_probe": True,
+            "missing_evidence_action": "probe_evidence",
+        },
         "technical_instruction": (
             "Generate original problems matching a high-bar global technology interview. Never imply that a "
             "problem is leaked, exact, guaranteed, or currently used by a named company. Focus on multi-step "
@@ -56,7 +62,7 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         ),
     },
     "mid_tier": {
-        "config_version": "profile-2026-07-v3",
+        "config_version": "profile-2026-08-v4",
         "label": "Mid Tier",
         "strictness_level": "medium",
         "duration": {"min_minutes": 45, "target_minutes": 50, "max_minutes": 60},
@@ -76,6 +82,12 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
             "Focus on teamwork and execution: conflict, prioritization, deadline management, failed "
             "features, communication with teammates, and what they learned."
         ),
+        "adaptive_policy": {
+            "progression": "balanced_coverage",
+            "strong_answer_action": "advance",
+            "allow_strong_depth_probe": False,
+            "missing_evidence_action": "probe_evidence",
+        },
         "technical_instruction": (
             "Generate original practical coding questions for an established product engineering team. Never "
             "claim that a problem is exact, leaked, guaranteed, or currently used by a named company. Focus on "
@@ -88,7 +100,7 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         ),
     },
     "startup": {
-        "config_version": "profile-2026-07-v3",
+        "config_version": "profile-2026-08-v4",
         "label": "Startup",
         "strictness_level": "medium",
         "duration": {"min_minutes": 45, "target_minutes": 45, "max_minutes": 60},
@@ -107,6 +119,12 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
             "Focus on initiative, speed, adaptability, uncertainty, ownership, shipping under pressure, "
             "changing requirements, and knowingly accepted trade-offs."
         ),
+        "adaptive_policy": {
+            "progression": "speed_first",
+            "strong_answer_action": "advance",
+            "allow_strong_depth_probe": False,
+            "missing_evidence_action": "probe_evidence",
+        },
         "technical_instruction": (
             "Generate original practical, fast-paced coding questions for an early-stage team. Focus on working "
             "solutions under time pressure over algorithmic perfection. "
@@ -118,7 +136,7 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         ),
     },
     "custom": {
-        "config_version": "profile-2026-07-v3",
+        "config_version": "profile-2026-08-v4",
         "label": "Custom",
         "strictness_level": "medium",
         "duration": {"min_minutes": 45, "target_minutes": 50, "max_minutes": 60},
@@ -136,6 +154,12 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "behavioral_instruction": (
             "Focus on execution, collaboration, and decision-making relevant to the job requirements."
         ),
+        "adaptive_policy": {
+            "progression": "job_aligned_coverage",
+            "strong_answer_action": "advance",
+            "allow_strong_depth_probe": False,
+            "missing_evidence_action": "probe_evidence",
+        },
         "technical_instruction": (
             "Generate DSA coding challenges tailored specifically to the provided job description and company. "
             "Match difficulty to the seniority level implied by the role title. For the specific company and JD: "

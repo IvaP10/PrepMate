@@ -38,17 +38,15 @@ ANALYSIS_STAGES = (
     "technical_analysis",
     "self_review_summary",
     "deterministic_report",
-    "semantic_enhancement",
     "report_validation",
-    "performance_projection",
-    "weakness_update",
-    "improve_update",
-    "complete",
 )
 ANALYSIS_PREFLIGHT_STAGES = ("assessment_completion",)
 ANALYSIS_EXECUTION_STAGES = ANALYSIS_PREFLIGHT_STAGES + ANALYSIS_STAGES
 
-ANALYSIS_STAGE_VERSION = "evidence-v10"
+# v11 removes report/side-effect pass-through stages. The report builder is
+# deterministic and the canonical Performance/Improve writes remain after
+# validation/publication, so an older job must not reuse its stage graph.
+ANALYSIS_STAGE_VERSION = "evidence-v11"
 ANALYSIS_LEASE_SECONDS = 90
 ANALYSIS_MAX_RETRIES = 3
 REPORT_SIDE_EFFECT_LEASE_SECONDS = 120
@@ -63,8 +61,6 @@ CRITICAL_ANALYSIS_STAGES = {
     "technical_analysis",
     "deterministic_report",
     "report_validation",
-    "performance_projection",
-    "complete",
 }
 
 
@@ -1280,10 +1276,14 @@ def _report_has_noncritical_degradation(
     stage_outputs: Dict[str, Dict[str, Any]],
 ) -> bool:
     """Keep deterministic evidence usable while making enhancement failures visible."""
-    if any(
-        isinstance(output, dict) and bool(output.get("error"))
-        for output in stage_outputs.values()
-    ):
+    def contains_stage_error(value: Any) -> bool:
+        if isinstance(value, dict):
+            return bool(value.get("error")) or any(contains_stage_error(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_stage_error(item) for item in value)
+        return False
+
+    if any(contains_stage_error(output) for output in stage_outputs.values()):
         return True
     fallback_reason = str(report.get("ai_fallback_reason") or "").strip()
     return bool(fallback_reason and fallback_reason != "no_candidate_evidence")
@@ -1488,10 +1488,12 @@ def _legacy_stage_outputs(outputs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[
         "technical_code": outputs.get("technical_analysis") or {},
         "self_review_signals": outputs.get("self_review_summary") or {},
         "report_generation": (
-            outputs.get("complete")
-            or outputs.get("report_validation")
-            or outputs.get("semantic_enhancement")
+            outputs.get("report_validation")
             or outputs.get("deterministic_report")
+            # Legacy stage outputs are retained only as a recovery reader for
+            # jobs created before v11; the active graph never writes them.
+            or outputs.get("semantic_enhancement")
+            or outputs.get("complete")
             or {}
         ),
     }
@@ -2461,6 +2463,8 @@ async def run_analysis_job(
             progress = (
                 100
                 if stage == "complete"
+                else 95
+                if stage == "report_validation"
                 else math.floor(index / len(ANALYSIS_EXECUTION_STAGES) * 100)
             )
             await async_execute(
@@ -2749,43 +2753,28 @@ async def _run_stage(stage: str, interview_id: str, user_id: str, outputs: Dict[
                 "technical_code": outputs.get("technical_analysis") or {},
             },
         )
-    if stage in {"deterministic_report", "semantic_enhancement"}:
+    if stage == "deterministic_report":
         legacy = _legacy_stage_outputs(outputs)
-        if stage == "deterministic_report":
-            legacy["__deterministic_only"] = {"enabled": True}
+        legacy["__deterministic_only"] = {"enabled": True}
         return await _run_stage("report_generation", interview_id, user_id, legacy)
     if stage == "report_validation":
-        semantic = outputs.get("semantic_enhancement") or {}
-        report = (
-            semantic
-            if semantic and not semantic.get("error")
-            else outputs.get("deterministic_report") or {}
-        )
+        report = outputs.get("deterministic_report") or {}
+        # A legacy caller may still provide the old stage name while an
+        # already-running pre-v11 job is being inspected. It is a read-only
+        # compatibility fallback; no new semantic stage is executed.
+        if not report:
+            report = outputs.get("semantic_enhancement") or {}
         if not _valid_candidate_report(report, interview_id):
             raise RuntimeError("report_schema_validation_failed")
         return {**report, "validation": {"status": "passed", "version": "report-validation-v1"}}
-    if stage == "performance_projection":
-        report = outputs.get("report_validation") or {}
-        return {
-            "projection_version": "performance-projection-v1",
-            "overall_score": report.get("overall_score"),
-            "dimension_scores": report.get("dimension_scores") or {},
-            "gradable": report.get("overall_score") is not None,
-        }
-    if stage in {"weakness_update", "improve_update"}:
-        return {
-            "status": "deferred_until_canonical_analysis_commit",
-            "stage": stage,
-            "version": "canonical-update-v1",
-        }
+    # Performance and Improve are committed by _stage_canonical_performance
+    # and _publish_staged_report after report validation. The former
+    # pass-through projection/update stages were not independent transforms.
     if stage == "complete":
         validated = outputs.get("report_validation") or {}
-        semantic = outputs.get("semantic_enhancement") or {}
         return (
             validated
             if validated and not validated.get("error")
-            else semantic
-            if semantic and not semantic.get("error")
             else outputs.get("deterministic_report") or {}
         )
 
