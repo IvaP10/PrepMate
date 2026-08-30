@@ -831,6 +831,24 @@ class TechnicalModePureTests(unittest.TestCase):
 
 
 class TechnicalModeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        languages = {
+            language: {"available": True, "runtime": language, "reason": "Ready"}
+            for language in ("python", "javascript", "cpp", "java")
+        }
+        self.executor_status_patcher = patch(
+            "local_execution.executor_status",
+            return_value={
+                "healthy": True,
+                "executor": "test-sandbox",
+                "isolated": True,
+                "languages": languages,
+                "available_languages": list(languages),
+            },
+        )
+        self.executor_status_patcher.start()
+        self.addCleanup(self.executor_status_patcher.stop)
+
     async def test_attempt_aggregate_reload_is_revisioned_and_owner_scoped(self):
         aggregate_row = (
             "active", 7, 2, 1, 1,
