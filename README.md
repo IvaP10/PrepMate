@@ -2,19 +2,25 @@
 
 PrepMate is a local-first desktop interview coach for interview practice,
 technical rounds, evidence-backed reports, Performance history, and Improve
-coaching. The source repository is private; the customer application is
-distributed as signed macOS installers through an owner-approved binary
-release channel.
+coaching. This private repository contains the application source and one
+Apple Silicon development DMG stored with Git LFS. A signed and notarized
+customer release has not been published yet.
 
 There are no PrepMate accounts, subscriptions, payments, hosted databases,
 analytics, or PrepMate application servers.
 
-## Download
+## Current release status
 
-Install the current signed and notarized release from the approved distribution
-channel. Choose the Apple Silicon build for an M-series Mac or the Intel build
-for an Intel Mac. Each release includes release notes, SHA-256 checksums, SBOMs,
-and the required license and attribution notices.
+`desktop/release/PrepMate-0.1.0-alpha.1-mac-arm64.dmg` is an unsigned internal
+development artifact. It has no Apple notarization ticket and must not be
+advertised as a public or production-ready download.
+
+The private release workflow is prepared to build Apple Silicon and Intel
+assets, but customer distribution remains blocked until the owner, website,
+storage, signing, notarization, and clean-machine gates in
+[`PUBLIC_RELEASE_BLOCKERS.md`](PUBLIC_RELEASE_BLOCKERS.md) are complete. An
+approved release must include release notes, SHA-256 checksums, SBOMs, and the
+required license and attribution notices.
 
 The source repository and customer downloads are separate. No source code,
 source archive, or GitHub Release is required to download or use PrepMate.
@@ -36,13 +42,13 @@ and are never returned to the renderer.
 | Interviewer speech | Not included; questions remain readable text |
 | Technical questions without execution | Available |
 | Sandboxed code execution | Available on macOS when Seatbelt and the selected language runtime are detected |
-| macOS installer | Signed/notarized Apple Silicon and Intel DMG/ZIP release assets |
+| macOS installer | Unsigned Apple Silicon development DMG available; signed/notarized Apple Silicon and Intel releases pending |
 | Windows installer | Not released until secure execution and native packaging are verified |
 | Linux installer | Not released in this distribution |
 
 Camera and screen sharing are optional coaching controls and are never required
-for a score or report. The app has no automatic updater; users return to the
-approved distribution channel to install a newer version.
+for a score or report. The app has no automatic updater; after distribution is
+approved, users will return to the official channel to install newer versions.
 
 ## Local-first architecture
 
@@ -61,6 +67,18 @@ browser access is rejected. Sensitive database fields use AES-GCM with
 a separate key held in the OS keychain. Technical submissions execute only
 through a supported macOS Seatbelt sandbox and fail closed when it is
 unavailable.
+
+## Repository layout
+
+- `Frontend/` — the private Next.js renderer used only inside Electron.
+- `desktop/` — Electron startup, packaging configuration, entitlements, and
+  the Git LFS development DMG.
+- Root Python modules — the loopback FastAPI service and interview, technical,
+  report, Performance, and Improve workflows.
+- `local_migrations/` and `local_schema.sql` — immutable SQLite schema history
+  and the current local schema.
+- `scripts/` — source-boundary, release, license, migration, and bundle checks.
+- `tests/` — regression coverage; tests are not bundled into the customer app.
 
 ## Local data
 
@@ -82,6 +100,14 @@ Source development requires Python 3.12 or 3.13 and Node.js 22+:
 python3 -m pip install -r requirements.lock.txt
 npm ci --prefix Frontend
 npm ci --prefix desktop
+```
+
+The internal DMG is stored with Git LFS. Developers who need that artifact can
+retrieve it with:
+
+```bash
+git lfs install
+git lfs pull --include='desktop/release/*.dmg'
 ```
 
 Launch the complete desktop application from either the repository root or the
@@ -136,8 +162,8 @@ local code-execution details.
 
 ## License and notices
 
-PrepMate remains licensed under the [Apache License 2.0](LICENSE). Binary
-downloads include `LICENSE`, `NOTICE`, and
+PrepMate remains licensed under the [Apache License 2.0](LICENSE). Approved
+binary downloads must include `LICENSE`, `NOTICE`, and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The source repository is
 private, but the Apache-2.0 license and applicable attribution obligations
 remain in force for distributed binaries.
