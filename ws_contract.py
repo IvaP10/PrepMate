@@ -66,7 +66,6 @@ class ClientEvent:
     event_type: str
     sent_at: str
     payload: dict[str, Any]
-    legacy: bool = False
 
 
 def _uuid(value: Any, field: str) -> str:
@@ -76,7 +75,7 @@ def _uuid(value: Any, field: str) -> str:
         raise WSContractError("invalid_event_envelope", f"{field} must be a UUID") from exc
 
 
-def parse_client_event(message: Any, *, allow_legacy: bool = False) -> ClientEvent:
+def parse_client_event(message: Any) -> ClientEvent:
     if not isinstance(message, dict):
         raise WSContractError("invalid_event_envelope", "WebSocket event must be an object")
     event_type = str(message.get("type") or "").strip()
@@ -84,18 +83,6 @@ def parse_client_event(message: Any, *, allow_legacy: bool = False) -> ClientEve
         raise WSContractError("unknown_event_type", "Unsupported WebSocket event type")
 
     required = ("event_id", "sequence", "client_session_id", "interview_id", "sent_at", "payload")
-    if allow_legacy and not all(field in message for field in required):
-        payload = {key: value for key, value in message.items() if key != "type"}
-        return ClientEvent(
-            event_id="",
-            sequence=0,
-            client_session_id="",
-            interview_id=str(message.get("interview_id") or ""),
-            event_type=event_type,
-            sent_at="",
-            payload=payload,
-            legacy=True,
-        )
     if any(field not in message for field in required):
         raise WSContractError("invalid_event_envelope", "WebSocket event envelope is incomplete")
 

@@ -1,4 +1,4 @@
-"""Pure readiness-contract helpers shared by the API and unit tests."""
+"""Pure readiness-contract helpers shared by the local API."""
 
 from datetime import datetime, timezone
 

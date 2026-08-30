@@ -62,13 +62,8 @@ out/
 .pytype/
 *.tsbuildinfo
 
-# Test artifacts
-.pytest_cache/
-test_resume.pdf
+# Local transient artifacts
 tmp/
-Frontend/e2e/.generated/
-Frontend/test-results/
-Frontend/playwright-report/
 
 # Lockfiles are production inputs; commit frontend package locks.
 !Frontend/package-lock.json

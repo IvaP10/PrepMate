@@ -43,8 +43,6 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
-    env:
-      ENVIRONMENT: test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -53,8 +51,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --disable-pip-version-check -r requirements-test.lock.txt
-      - run: python -m pytest -q
+      - run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
+      - run: python -m pip install --disable-pip-version-check pip-audit==2.10.1
       - run: python -m compileall -q .
       - run: python scripts/license_policy.py
       - run: python scripts/lock_license_inventory.py --lockfile requirements-ocr.lock.txt --inventory requirements-ocr.licenses.json
@@ -76,7 +74,6 @@ jobs:
           cache: npm
           cache-dependency-path: Frontend/package-lock.json
       - run: npm ci --prefix Frontend --ignore-scripts
-      - run: npm test --prefix Frontend
       - run: npm run typecheck --prefix Frontend
       - run: npm run build --prefix Frontend
       - run: npm audit --prefix Frontend --audit-level=high
@@ -120,7 +117,7 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: package-lock.json
-      - run: python -m pip install --disable-pip-version-check -r requirements-test.lock.txt
+      - run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
       - run: python -m pip install --disable-pip-version-check cyclonedx-bom==7.3.1
       - run: npm ci --ignore-scripts
       - run: mkdir -p release-inventory

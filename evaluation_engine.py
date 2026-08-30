@@ -258,8 +258,8 @@ _SEMANTIC_RUBRIC_KEYS = {
 async def complete_json_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     """Import the configured router only when the semantic policy uses it.
 
-    This keeps the deterministic evaluator importable in workers and tests that
-    intentionally do not load production secrets or an OpenAI client.
+    This keeps the deterministic evaluator importable in workers without
+    loading production secrets or an OpenAI client until needed.
     """
 
     from llm_router import complete_json_async as routed_complete_json_async

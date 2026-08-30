@@ -66,8 +66,6 @@ a = Analysis(
     # environment.  Resume OCR remains a graceful source-runtime fallback and
     # is distributed separately through requirements-ocr.lock.txt.
     excludes=[
-        "pytest",
-        "unittest.mock",
         "paddleocr",
         "paddle",
         "paddlepaddle",

@@ -48,7 +48,6 @@ HISTORICAL_LOCAL_MIGRATION_CHECKSUMS = {
         "5cc4507e29a813018772f83b3df25640d382f4115e27c1672cb887f04796db1e",
     }),
 }
-_MIGRATION_TEST_HOOK = None
 REQUIRED_SCHEMA_TABLES = (
     "LocalSchemaVersion",
     "ResumeVersions",
@@ -353,15 +352,10 @@ def _apply_local_data_migration(connection: sqlite3.Connection, version: int) ->
             )
 
 
-def _ensure_local_schema(*, target_version: int | None = None) -> None:
+def _ensure_local_schema() -> None:
     """Apply each pending SQLite migration transactionally and verify its hash.
-
-    ``target_version`` exists for migration-upgrade tests; production callers
-    always apply the complete set.
     """
-    target = LOCAL_SCHEMA_VERSION if target_version is None else int(target_version)
-    if target < 1 or target > LOCAL_SCHEMA_VERSION:
-        raise ValueError("Invalid local SQLite target version")
+    target = LOCAL_SCHEMA_VERSION
 
     path = local_database_path()
     preexisting_file = path.exists() and path.stat().st_size > 0
@@ -416,10 +410,8 @@ def _ensure_local_schema(*, target_version: int | None = None) -> None:
                 raise RuntimeError(f"Local SQLite migration is empty: {migration_path.name}")
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                for index, statement in enumerate(statements, start=1):
+                for statement in statements:
                     _apply_migration_statement(connection, statement)
-                    if _MIGRATION_TEST_HOOK is not None:
-                        _MIGRATION_TEST_HOOK(version, index)
                 _apply_local_data_migration(connection, version)
                 connection.execute(
                     """

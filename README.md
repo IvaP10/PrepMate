@@ -7,6 +7,19 @@ profile to run an interview and produce an evidence-backed report.
 The app runs in Electron. Your data is stored locally on your computer. There
 is no PrepMate account or hosted PrepMate backend.
 
+## Repository boundaries
+
+This repository contains the private desktop product: the Electron shell, local
+API, local SQLite storage, and the in-app renderer in `Frontend/`. It is not the
+public marketing website and its renderer must not be deployed as a web app.
+
+The independent marketing and download site lives in the sibling
+`PrepMate-website` project. It is a static site for product information, legal
+pages, support, and approved macOS download links. It never connects to the
+desktop API or receives application data. The site reads a public release
+manifest; the release process keeps that manifest pending until a signed and
+notarized build is ready.
+
 ## Download and install the app
 
 The current download is an unsigned Apple Silicon macOS alpha build. A signed
@@ -179,9 +192,6 @@ PREPMATE_MAC_ARCH=x64 npm run package:mac
 ## Useful commands
 
 ```bash
-# Run Python and frontend tests
-npm test
-
 # Run frontend type checking
 npm run typecheck
 

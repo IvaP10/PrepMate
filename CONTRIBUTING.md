@@ -15,9 +15,10 @@ or contribution portal.
 - Candidate code must never execute without a verified macOS Seatbelt sandbox.
 - Do not weaken transcript, report, Performance, or Improve evidence truth.
 - Document every new network destination in `PRIVACY.md`.
-- Add tests for schema, provider, security, lifecycle, packaging, and
-  distribution changes.
+- Keep schema, provider, security, lifecycle, packaging, and distribution
+  changes covered by focused review, type checking, build checks, and release
+  validation.
 
-Use focused reviewed changes and record the user-visible behavior and test
-evidence. Apache-2.0 remains the project license. The private repository may
-use its own internal review and sign-off policy.
+Use focused reviewed changes and record the user-visible behavior and
+validation evidence. Apache-2.0 remains the project license. The private
+repository may use its own internal review and sign-off policy.

@@ -64,7 +64,7 @@ _worker_stop_event: asyncio.Event | None = None
 
 async def _start_local_worker() -> None:
     global _worker_task, _worker_stop_event
-    if settings.ENVIRONMENT == "test" or not settings.DEVELOPMENT_AUTO_WORKER:
+    if not settings.DEVELOPMENT_AUTO_WORKER:
         return
     from local_worker import run_local_workers
 
@@ -267,20 +267,16 @@ def _local_checks() -> dict[str, dict[str, Any]]:
         logger.error("Local storage readiness failed: %s", type(exc).__name__)
         storage_check = {"healthy": False, "storage": "sqlite", "reason": "Local storage or keychain is unavailable"}
 
-    if settings.ENVIRONMENT == "test":
-        worker_alive = True
-        worker_process = {"managed": False, "state": "test"}
-    else:
-        worker_alive = bool(_worker_task is not None and not _worker_task.done())
-        worker_process = {
-            "managed": True,
-            "state": "running" if worker_alive else "stopped",
-            "error": (
-                type(_worker_task.exception()).__name__
-                if _worker_task is not None and _worker_task.done() and not _worker_task.cancelled() and _worker_task.exception()
-                else None
-            ),
-        }
+    worker_alive = bool(_worker_task is not None and not _worker_task.done())
+    worker_process = {
+        "managed": True,
+        "state": "running" if worker_alive else "stopped",
+        "error": (
+            type(_worker_task.exception()).__name__
+            if _worker_task is not None and _worker_task.done() and not _worker_task.cancelled() and _worker_task.exception()
+            else None
+        ),
+    }
 
     runner = executor_status()
     content_ready = bool(settings.TECHNICAL_ALLOW_AUTHORED_FALLBACK)

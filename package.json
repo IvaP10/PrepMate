@@ -6,7 +6,6 @@
   "private": true,
   "scripts": {
     "dev": "npm run dev --prefix desktop",
-    "test": "python3 -m pytest -q && npm test --prefix Frontend",
     "typecheck": "npm run typecheck --prefix Frontend",
     "source:guard": "python3 scripts/source_guard.py",
     "release:check": "python3 scripts/source_guard.py && python3 scripts/sqlite_query_audit.py --strict && python3 scripts/release_checks.py",

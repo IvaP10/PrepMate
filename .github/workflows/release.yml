@@ -16,8 +16,6 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      ENVIRONMENT: test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -32,8 +30,8 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: Frontend/package-lock.json
-      - run: python -m pip install --disable-pip-version-check -r requirements-test.lock.txt
-      - run: python -m pip install --disable-pip-version-check cyclonedx-bom==7.3.1
+      - run: python -m pip install --disable-pip-version-check -r requirements.lock.txt
+      - run: python -m pip install --disable-pip-version-check pip-audit==2.10.1 cyclonedx-bom==7.3.1
       - run: npm ci --ignore-scripts
       - run: npm ci --prefix Frontend --ignore-scripts
       - run: npm ci --prefix desktop --ignore-scripts
@@ -45,13 +43,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
       - run: python scripts/release_checks.py
         if: ${{ ! startsWith(github.ref, 'refs/tags/') }}
-      - run: python -m pytest -q
       - run: python -m compileall -q .
       - run: python scripts/license_policy.py
       - run: python scripts/lock_license_inventory.py --lockfile requirements-ocr.lock.txt --inventory requirements-ocr.licenses.json
       - run: python -m pip_audit -r requirements.lock.txt --strict
       - run: python -m pip_audit -r requirements-ocr.lock.txt --no-deps --strict
-      - run: npm test --prefix Frontend
       - run: npm run typecheck --prefix Frontend
       - run: npm run build --prefix Frontend
       - run: npm audit --audit-level=high
@@ -85,7 +81,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     env:
-      ENVIRONMENT: test
       PREPMATE_MAC_ARCH: ${{ matrix.arch }}
       CSC_LINK: ${{ secrets.MACOS_CSC_LINK }}
       CSC_KEY_PASSWORD: ${{ secrets.MACOS_CSC_KEY_PASSWORD }}

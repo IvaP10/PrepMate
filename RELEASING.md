@@ -4,6 +4,10 @@ PrepMate is distributed as a binary-only macOS application from the official
 website. The source repository and CI remain private. This process never
 creates a public source archive or GitHub Release.
 
+The official website is the separate static `PrepMate-website` project. Netlify
+hosts that project; Cloudflare R2 serves immutable release assets and the public
+`latest.json` manifest. The website has no route to the desktop API.
+
 ## One-time private setup
 
 Configure the final values in `PUBLICATION_METADATA.json`:

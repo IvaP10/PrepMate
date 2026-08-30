@@ -3,7 +3,7 @@
 
 This is a release gate, not a query translator. Local runtime queries must be
 valid sqlite3 SQL at their call sites so a broad compatibility shim cannot hide
-an untested PostgreSQL dependency.
+an unsupported PostgreSQL dependency.
 """
 
 from __future__ import annotations

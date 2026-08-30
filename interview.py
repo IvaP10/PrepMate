@@ -2407,7 +2407,7 @@ async def start_interview(
                 "UPDATE Interviews SET settings = ? WHERE interview_id = ?",
                 (json.dumps(interview_settings), interview_id),
             )
-        elif settings.ENVIRONMENT != "test":
+        else:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Create a server-owned blueprint and complete preflight before starting an official attempt",
@@ -2492,8 +2492,6 @@ async def start_interview(
     except Exception:
         connection.rollback()
         logger.exception("Failed to start interview")
-        if settings.ENVIRONMENT == "test":
-            raise
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to start interview. Please try again."
@@ -3756,51 +3754,47 @@ async def websocket_video_interview(websocket: WebSocket):
                     return
 
                 raw_message = json.loads(data)
-                client_event = parse_client_event(
-                    raw_message,
-                    allow_legacy=settings.ENVIRONMENT == "test",
-                )
-                if not client_event.legacy:
-                    if coordination_store is None:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "event_dedup_unavailable",
-                            "message": "The event controller is temporarily unavailable. Reconnecting safely…",
-                        })
-                        await websocket.close(code=1013, reason="Event deduplication unavailable")
-                        return
-                    if interview_id and client_event.interview_id != interview_id:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "event_interview_mismatch",
-                            "message": "The event does not belong to this interview.",
-                        })
-                        continue
-                    try:
-                        claim_status = claim_event_sequence(coordination_store, client_event)
-                    except Exception:
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "event_dedup_unavailable",
-                            "message": "The event controller is temporarily unavailable. Reconnecting safely…",
-                        })
-                        await websocket.close(code=1013, reason="Event deduplication unavailable")
-                        return
-                    if claim_status == "duplicate":
-                        await send_ws_message({
-                            "type": "event_ack",
-                            "event_id": client_event.event_id,
-                            "status": "duplicate",
-                        })
-                        continue
-                    if claim_status == "out_of_order":
-                        await send_ws_message({
-                            "type": "error",
-                            "code": "event_sequence_out_of_order",
-                            "event_id": client_event.event_id,
-                            "message": "The client event sequence is out of order.",
-                        })
-                        continue
+                client_event = parse_client_event(raw_message)
+                if coordination_store is None:
+                    await send_ws_message({
+                        "type": "error",
+                        "code": "event_dedup_unavailable",
+                        "message": "The event controller is temporarily unavailable. Reconnecting safely…",
+                    })
+                    await websocket.close(code=1013, reason="Event deduplication unavailable")
+                    return
+                if interview_id and client_event.interview_id != interview_id:
+                    await send_ws_message({
+                        "type": "error",
+                        "code": "event_interview_mismatch",
+                        "message": "The event does not belong to this interview.",
+                    })
+                    continue
+                try:
+                    claim_status = claim_event_sequence(coordination_store, client_event)
+                except Exception:
+                    await send_ws_message({
+                        "type": "error",
+                        "code": "event_dedup_unavailable",
+                        "message": "The event controller is temporarily unavailable. Reconnecting safely…",
+                    })
+                    await websocket.close(code=1013, reason="Event deduplication unavailable")
+                    return
+                if claim_status == "duplicate":
+                    await send_ws_message({
+                        "type": "event_ack",
+                        "event_id": client_event.event_id,
+                        "status": "duplicate",
+                    })
+                    continue
+                if claim_status == "out_of_order":
+                    await send_ws_message({
+                        "type": "error",
+                        "code": "event_sequence_out_of_order",
+                        "event_id": client_event.event_id,
+                        "message": "The client event sequence is out of order.",
+                    })
+                    continue
                 message = {
                     **client_event.payload,
                     "type": client_event.event_type,

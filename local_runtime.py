@@ -6,7 +6,6 @@ import json
 import os
 import platform
 import base64
-import hashlib
 import hmac
 import secrets
 import shutil
@@ -26,8 +25,6 @@ SETTINGS_FILE_NAME = "settings.json"
 PROVIDER_KEY_MARKERS_FIELD = "provider_key_saved"
 DATA_KEY_ACCOUNT = "data-encryption-key:v1"
 SUPPORTED_PROVIDERS = {"openai", "anthropic", "google", "openai_compatible"}
-_TEST_DATA_KEY = hashlib.sha256(b"prepmate-test-only-data-key").digest()
-_TEST_PROVIDER_KEYS: dict[str, str] = {}
 
 
 def _configured_data_dir() -> str:
@@ -199,10 +196,6 @@ def _keychain_account(provider: str) -> str:
     return f"provider-api-key:{str(provider).strip().lower()}"
 
 
-def _test_runtime() -> bool:
-    return os.getenv("ENVIRONMENT", "").strip().lower() == "test" or "pytest" in sys.modules
-
-
 def configured_api_token() -> str:
     """Return the per-launch token injected by the desktop shell, if present."""
     return (os.getenv("PREPMATE_API_TOKEN", "").strip() or os.getenv("INTERAI_API_TOKEN", "").strip())
@@ -325,8 +318,6 @@ def _native_keychain_delete(account: str, service: str = KEYCHAIN_SERVICE) -> No
 
 def get_provider_api_key(provider: str | None = None) -> str:
     selected = str(provider or get_local_preferences().get("provider") or "openai").strip().lower()
-    if _test_runtime():
-        return _TEST_PROVIDER_KEYS.get(selected, "")
     account = _keychain_account(selected)
     try:
         backend = _keyring()
@@ -355,10 +346,6 @@ def set_provider_api_key(provider: str, api_key: str) -> None:
         raise ValueError("Unsupported AI provider")
     if len(api_key) < 8:
         raise ValueError("The API key looks too short")
-    if _test_runtime():
-        _TEST_PROVIDER_KEYS[provider] = api_key
-        _record_provider_key_state(provider, True)
-        return
     account = _keychain_account(provider)
     try:
         backend = _keyring()
@@ -373,10 +360,6 @@ def set_provider_api_key(provider: str, api_key: str) -> None:
 
 def delete_provider_api_key(provider: str | None = None) -> None:
     selected = str(provider or get_local_preferences().get("provider") or "openai").strip().lower()
-    if _test_runtime():
-        _TEST_PROVIDER_KEYS.pop(selected, None)
-        _record_provider_key_state(selected, False)
-        return
     account = _keychain_account(selected)
     try:
         backend = _keyring()
@@ -402,8 +385,6 @@ def delete_provider_api_key(provider: str | None = None) -> None:
 
 def delete_data_encryption_key() -> None:
     """Remove the database key from both the current and legacy keychain names."""
-    if _test_runtime():
-        return
     try:
         backend = _keyring()
         services = (KEYCHAIN_SERVICE, LEGACY_KEYCHAIN_SERVICE)
@@ -523,12 +504,8 @@ def has_provider_api_key(provider: str | None = None) -> bool:
 def get_or_create_data_encryption_key() -> bytes:
     """Load the local field-encryption key from the OS credential store.
 
-    The database and settings file never contain this key. Tests use an
-    isolated deterministic key so CI does not need a desktop keychain.
+    The database and settings file never contain this key.
     """
-    if _test_runtime():
-        return _TEST_DATA_KEY
-
     encoded = ""
     try:
         backend = _keyring()
