@@ -73,4 +73,7 @@ Frontend/playwright-report/
 # Lockfiles are production inputs; commit frontend package locks.
 !Frontend/package-lock.json
 !desktop/package-lock.json
-desktop/release/
+# Keep generated release output ignored except for DMG installers, which are
+# stored in Git LFS for the private source repository.
+desktop/release/*
+!desktop/release/*.dmg
