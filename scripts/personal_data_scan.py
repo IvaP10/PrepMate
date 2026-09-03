@@ -21,7 +21,7 @@ SAFE_EMAIL_DOMAINS = {
     "example.net",
     "example.test",
 }
-SAFE_EMAIL_SUFFIXES = (".internal", ".invalid", ".localhost", ".test")
+SAFE_EMAIL_SUFFIXES = (".example", ".internal", ".invalid", ".localhost", ".test")
 DEPENDENCY_LOCKS = {"package-lock.json", "npm-shrinkwrap.json"}
 PRIVATE_FIXTURE_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".pdf", ".docx"}
 
