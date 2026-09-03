@@ -1,0 +1,33 @@
+{
+  "schema": "prepmate-download-manifest-v1",
+  "status": "not_published",
+  "product_name": "PrepMate",
+  "version": "0.1.0-alpha.1",
+  "channel": "alpha",
+  "supported_macos_versions": [
+    "macOS 13 Ventura and later"
+  ],
+  "known_limitations": [
+    "Alpha release; configure a supported AI provider for AI-assisted features.",
+    "Technical execution requires macOS Seatbelt and a supported language runtime.",
+    "Updates are installed manually from the official Download page."
+  ],
+  "downloads": {
+    "macos": {
+      "arm64": {},
+      "x64": {}
+    }
+  },
+  "release_notes_url": "",
+  "verification": {
+    "checksums": "",
+    "sbom": [],
+    "license_inventory": ""
+  },
+  "legal": {
+    "license": "/LICENSE",
+    "notice": "/NOTICE",
+    "privacy": "/PRIVACY.md",
+    "third_party_notices": "/THIRD_PARTY_NOTICES.md"
+  }
+}
