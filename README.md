@@ -10,15 +10,20 @@ is no PrepMate account or hosted PrepMate backend.
 ## Repository boundaries
 
 This repository contains the private desktop product: the Electron shell, local
-API, local SQLite storage, and the in-app renderer in `Frontend/`. It is not the
-public marketing website and its renderer must not be deployed as a web app.
+API, local SQLite storage, and the in-app renderer in `Frontend/`. It also
+contains the public marketing site in `website/`; the GitHub Pages workflow
+deploys that directory to `https://ivap10.github.io/PrepMate/`.
 
-The independent marketing and download site lives in the sibling
-`PrepMate-website` project. It is a static site for product information, legal
-pages, support, and approved macOS download links. It never connects to the
-desktop API or receives application data. The site reads a public release
-manifest; the release process keeps that manifest pending until a signed and
-notarized build is ready.
+The `website/` project is static and contains product information, legal pages,
+support, and approved macOS download links. It never connects to the desktop
+API or receives application data. The site reads a public release manifest; the
+release process keeps that manifest pending until a signed and notarized build
+is ready.
+
+The separate `PrepMate-website` repository is not the source for this
+project-site URL. Changes made only there do not trigger the `PrepMate` Pages
+workflow; update `website/` in this repository and push `main` when publishing
+the site.
 
 ## Download and install the app
 

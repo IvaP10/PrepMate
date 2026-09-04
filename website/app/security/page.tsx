@@ -12,7 +12,6 @@ export const dynamic = "force-static";
 export default function SecurityPage() {
   return (
     <InfoLayout
-      eyebrow="Security"
       title="Trust is part of the product."
       lede="The application is designed around a small local boundary: a loopback API, encrypted local data, OS-keychain secrets, and explicit provider traffic."
     >

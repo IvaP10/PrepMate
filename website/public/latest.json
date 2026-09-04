@@ -10,7 +10,7 @@
   "known_limitations": [
     "Alpha release; configure a supported AI provider for AI-assisted features.",
     "Technical execution requires macOS Seatbelt and a supported language runtime.",
-    "Updates are installed manually from the official Download page."
+    "Updates are installed manually from the official PrepMate site."
   ],
   "downloads": {
     "macos": {

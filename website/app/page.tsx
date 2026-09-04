@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { MacDownloadButton } from "@/components/mac-download-button";
 import { MotionEnhancer } from "@/components/motion-enhancer";
 import { PrepMateLogo } from "@/components/prepmate-logo";
 import { SiteFooter } from "@/components/site-footer";
@@ -103,7 +104,6 @@ export default function Home() {
         <div className="hero-sticky">
           <div className="hero hero-redesign">
             <div className="hero-copy hero-copy-redesign">
-              <p className="availability-pill"><span aria-hidden="true" /> Built for macOS</p>
               <h1 id="hero-title">
                 <span className="hero-title-line"><span>Practice the interview.</span></span>
                 <span className="hero-title-line"><span>Keep the advantage.</span></span>
@@ -114,7 +114,7 @@ export default function Home() {
                 into your next focused practice.
               </p>
               <div className="hero-actions">
-                <SiteLink className="button button-primary" href="/download">Download for macOS <span aria-hidden="true">↓</span></SiteLink>
+                <MacDownloadButton className="button button-primary">Download for macOS <span aria-hidden="true">↓</span></MacDownloadButton>
               </div>
               <p className="hero-note">macOS 13+ · Apple Silicon &amp; Intel · No account required</p>
             </div>
@@ -139,7 +139,6 @@ export default function Home() {
 
       <section className="landing-section flow-section" id="how-it-works">
         <div className="section-heading">
-          <p className="section-kicker">One deliberate practice loop</p>
           <h2>From first answer<br />to focused repetition.</h2>
           <p>
             PrepMate connects the parts most interview tools leave scattered:
@@ -161,7 +160,6 @@ export default function Home() {
       <section className="product-storyboard" id="product" data-motion="storyboard" aria-label="PrepMate product story">
         <div className="storyboard-sticky">
           <div className="product-intro storyboard-intro">
-            <p className="section-kicker">The app is the experience</p>
             <h2>Everything you need.<br /><span>Nothing competing for attention.</span></h2>
             <span className="storyboard-scroll-cue">Scroll to explore <i aria-hidden="true">↓</i></span>
           </div>
@@ -276,7 +274,6 @@ export default function Home() {
 
       <section className="privacy-section" id="privacy" data-motion="privacy">
         <div className="privacy-copy">
-          <p className="section-kicker">Local first, by design</p>
           <h2>Your practice belongs on your computer.</h2>
           <p>
             Resumes, answers, reports, Performance, and Improve history stay in
@@ -306,7 +303,6 @@ export default function Home() {
 
       <section className="desktop-statement landing-section" data-motion="statement">
         <div className="desktop-statement-content">
-          <p className="section-kicker">Deliberately desktop</p>
           <h2>Not another tab.<br /><span>A place to rehearse.</span></h2>
           <p>
             PrepMate is a dedicated macOS app, with local history, OS-keychain
@@ -318,12 +314,11 @@ export default function Home() {
 
       <section className="final-cta">
         <div>
-          <p className="section-kicker">Available for macOS only</p>
           <h2>Your next interview deserves a rehearsal.</h2>
-          <p>Choose the build for your Apple Silicon or Intel Mac on the download page.</p>
+          <p>The macOS installer downloads directly to your Mac.</p>
         </div>
         <div className="final-cta-actions">
-              <SiteLink className="button button-contrast" href="/download">Download for macOS <span aria-hidden="true">↓</span></SiteLink>
+          <MacDownloadButton className="button button-contrast">Download for macOS <span aria-hidden="true">↓</span></MacDownloadButton>
           <span>No web or Windows version at this time.</span>
         </div>
       </section>

@@ -1,4 +1,5 @@
 import { PrepMateLogo } from "./prepmate-logo";
+import { MacDownloadButton } from "./mac-download-button";
 import { SiteLink } from "./site-link";
 
 export function SiteHeader() {
@@ -14,9 +15,9 @@ export function SiteHeader() {
         <SiteLink href="/#privacy">Privacy</SiteLink>
         <SiteLink href="/support">Support</SiteLink>
       </nav>
-      <SiteLink className="header-cta" href="/download">
+      <MacDownloadButton className="header-cta">
         Download <span aria-hidden="true">↓</span>
-      </SiteLink>
+      </MacDownloadButton>
     </header>
   );
 }

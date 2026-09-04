@@ -12,7 +12,6 @@ export const dynamic = "force-static";
 export default function LicensePage() {
   return (
     <InfoLayout
-      eyebrow="License and notices"
       title="Open licensing, private source."
       lede="The source repository is private, but distributed PrepMate binaries remain under Apache-2.0 and include the applicable attribution materials."
     >

@@ -11,7 +11,6 @@ export const dynamic = "force-static";
 export default function PrivacyPage() {
   return (
     <InfoLayout
-      eyebrow="Privacy boundary"
       title="Your practice stays yours."
       lede="PrepMate is a local-first macOS app. It does not require a PrepMate account or send application data to a PrepMate-operated server."
     >

@@ -13,7 +13,6 @@ export const dynamic = "force-static";
 export default function SupportPage() {
   return (
     <InfoLayout
-      eyebrow="Support"
       title="Get unstuck, without sending your private practice."
       lede="PrepMate has no hosted support account or application-data inbox. Contact the support route with redacted, reproducible details."
     >
@@ -24,7 +23,7 @@ export default function SupportPage() {
         <h2>Keep these details private</h2>
         <p>Never attach API keys, resumes, transcripts, provider responses, database files, signing material, or unredacted local paths. Provider outages, provider retention, billing, and provider-account issues must be handled with the selected AI provider.</p>
         <h2>Before you write</h2>
-        <p>Check the <SiteLink className="text-link" href="/download">download page</SiteLink> for the current release and the <SiteLink className="text-link" href="/privacy">privacy boundary</SiteLink> for what can leave the device.</p>
+        <p>Use the Download button above for the current release and read the <SiteLink className="text-link" href="/privacy">privacy boundary</SiteLink> for what can leave the device.</p>
       </section>
     </InfoLayout>
   );

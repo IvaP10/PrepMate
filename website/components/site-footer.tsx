@@ -1,3 +1,4 @@
+import { MacDownloadButton } from "./mac-download-button";
 import { PrepMateLogo } from "./prepmate-logo";
 import { SiteLink } from "./site-link";
 
@@ -9,7 +10,7 @@ export function SiteFooter() {
         <span>AI interview practice for macOS.</span>
       </div>
       <nav className="footer-links" aria-label="Footer navigation">
-        <SiteLink href="/download">Download</SiteLink>
+        <MacDownloadButton className="footer-download">Download</MacDownloadButton>
         <SiteLink href="/changelog">Release notes</SiteLink>
         <SiteLink href="/privacy">Privacy</SiteLink>
         <SiteLink href="/security">Security</SiteLink>

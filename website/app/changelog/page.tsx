@@ -11,7 +11,6 @@ export const dynamic = "force-static";
 export default function ChangelogPage() {
   return (
     <InfoLayout
-      eyebrow="Release notes"
       title="What changed."
       lede="PrepMate is in alpha. Release notes describe packaged behavior, privacy boundaries, and known limitations."
     >
@@ -21,7 +20,7 @@ export default function ChangelogPage() {
           <li>Local SQLite history with OS-keychain provider credentials and encrypted sensitive fields.</li>
           <li>Behavioral interviews, technical rounds, evidence-backed reports, Performance, and Improve coaching.</li>
           <li>Optional camera and screen coaching with no punitive or pass/fail signals.</li>
-          <li>Signed and notarized macOS Apple Silicon and Intel installers through the official Download page.</li>
+          <li>Signed and notarized macOS Apple Silicon and Intel installers through the official PrepMate site.</li>
           <li>No PrepMate account, hosted storage, billing, telemetry, or automatic updater.</li>
         </ul>
       </section>
