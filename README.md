@@ -15,10 +15,11 @@ contains the public marketing site in `website/`; the GitHub Pages workflow
 deploys that directory to `https://ivap10.github.io/PrepMate/`.
 
 The `website/` project is static and contains product information, legal pages,
-support, and approved macOS download links. It never connects to the desktop
-API or receives application data. The site reads a public release manifest; the
-release process keeps that manifest pending until a signed and notarized build
-is ready.
+support, and the current Apple Silicon macOS alpha download link. It never
+connects to the desktop API or receives application data. The site reads a
+public release manifest; the checked-in alpha DMG is ad-hoc signed and not
+notarized, and the release process will replace it with a verified manifest
+when a signed and notarized build is ready.
 
 The separate `PrepMate-website` repository is not the source for this
 project-site URL. Changes made only there do not trigger the `PrepMate` Pages

@@ -17,7 +17,7 @@ export function SiteFooter() {
         <SiteLink href="/support">Support</SiteLink>
         <SiteLink href="/license">License</SiteLink>
       </nav>
-      <span className="footer-platform">macOS only</span>
+      <span className="footer-platform">Apple Silicon macOS</span>
     </footer>
   );
 }

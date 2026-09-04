@@ -1,20 +1,31 @@
 {
   "schema": "prepmate-download-manifest-v1",
-  "status": "not_published",
+  "status": "published",
   "product_name": "PrepMate",
   "version": "0.1.0-alpha.1",
   "channel": "alpha",
+  "released_at": "2026-08-30T04:22:01+00:00",
   "supported_macos_versions": [
     "macOS 13 Ventura and later"
   ],
   "known_limitations": [
     "Alpha release; configure a supported AI provider for AI-assisted features.",
     "Technical execution requires macOS Seatbelt and a supported language runtime.",
+    "Apple Silicon only; an Intel build is not published.",
+    "This alpha DMG is ad-hoc signed and not notarized; macOS may show a security warning.",
     "Updates are installed manually from the official PrepMate site."
   ],
+  "download_page": "https://ivap10.github.io/PrepMate/",
   "downloads": {
     "macos": {
-      "arm64": {},
+      "arm64": {
+        "dmg": {
+          "filename": "PrepMate-0.1.0-alpha.1-mac-arm64.dmg",
+          "url": "https://github.com/IvaP10/PrepMate/raw/refs/heads/main/desktop/release/PrepMate-0.1.0-alpha.1-mac-arm64.dmg",
+          "sha256": "a25458cf7e3a5bc4fd4e76d317a9e12dfcdaba45e5068317043ebf054c73e1a8",
+          "size_bytes": 176245415
+        }
+      },
       "x64": {}
     }
   },

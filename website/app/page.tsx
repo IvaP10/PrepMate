@@ -116,7 +116,7 @@ export default function Home() {
               <div className="hero-actions">
                 <MacDownloadButton className="button button-primary">Download for macOS <span aria-hidden="true">↓</span></MacDownloadButton>
               </div>
-              <p className="hero-note">macOS 13+ · Apple Silicon &amp; Intel · No account required</p>
+              <p className="hero-note">macOS 13+ · Apple Silicon only · Unsigned alpha · No account required</p>
             </div>
             <div className="hero-product-stage" aria-label="PrepMate desktop app preview">
               <div className="stage-orbit stage-orbit-one" aria-hidden="true" />
@@ -319,7 +319,7 @@ export default function Home() {
         </div>
         <div className="final-cta-actions">
           <MacDownloadButton className="button button-contrast">Download for macOS <span aria-hidden="true">↓</span></MacDownloadButton>
-          <span>No web or Windows version at this time.</span>
+          <span>No Intel, web, or Windows version at this time.</span>
         </div>
       </section>
 

@@ -20,7 +20,7 @@ export default function ChangelogPage() {
           <li>Local SQLite history with OS-keychain provider credentials and encrypted sensitive fields.</li>
           <li>Behavioral interviews, technical rounds, evidence-backed reports, Performance, and Improve coaching.</li>
           <li>Optional camera and screen coaching with no punitive or pass/fail signals.</li>
-          <li>Signed and notarized macOS Apple Silicon and Intel installers through the official PrepMate site.</li>
+          <li>Unsigned Apple Silicon macOS alpha DMG linked from the official PrepMate site; Intel is not published.</li>
           <li>No PrepMate account, hosted storage, billing, telemetry, or automatic updater.</li>
         </ul>
       </section>

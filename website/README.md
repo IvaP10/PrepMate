@@ -4,9 +4,10 @@ This is the public information and download site for the private-source
 PrepMate desktop application. It contains no application backend, account
 system, provider credentials, analytics, or customer data.
 
-The local preview uses public/latest.json, which intentionally reports that
-the public release is pending. Before publishing the site, configure these
-public values in the hosting environment:
+The current `public/latest.json` exposes the Apple Silicon alpha DMG through
+the public GitHub repository. It is ad-hoc signed and not notarized; replace
+this manifest with the verified release manifest before distributing a
+production build. Configure these public values in the hosting environment:
 
 - NEXT_PUBLIC_PREPMATE_RELEASE_MANIFEST_URL
 - NEXT_PUBLIC_PREPMATE_SUPPORT_EMAIL

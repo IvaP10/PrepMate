@@ -47,19 +47,19 @@ function safeDownloadUrl(value: string | undefined) {
 }
 
 function preferredArchitectures(): MacArchitecture[] {
-  if (typeof navigator === "undefined") return ["arm64", "x64"];
+  if (typeof navigator === "undefined") return ["arm64"];
 
   const browserNavigator = navigator as Navigator & {
     userAgentData?: { architecture?: string };
   };
   const reportedArchitecture = browserNavigator.userAgentData?.architecture || "";
-  if (/arm|aarch/i.test(reportedArchitecture)) return ["arm64", "x64"];
-  if (/x86|x64|amd/i.test(reportedArchitecture)) return ["x64", "arm64"];
-  if (/arm64|aarch64/i.test(navigator.userAgent)) return ["arm64", "x64"];
+  if (/arm|aarch/i.test(reportedArchitecture)) return ["arm64"];
+  if (/x86|x64|amd/i.test(reportedArchitecture)) return ["x64"];
+  if (/arm64|aarch64/i.test(navigator.userAgent)) return ["arm64"];
 
-  // Safari intentionally reports Apple Silicon Macs as Intel Macs. Prefer the
-  // current arm64 release when the browser does not expose the architecture.
-  return ["arm64", "x64"];
+  // Safari does not expose Apple Silicon reliably. The current public alpha is
+  // arm64, so prefer it when the browser does not expose an architecture.
+  return ["arm64"];
 }
 
 function loadMacDownload() {
