@@ -150,7 +150,7 @@ pycparser==3.0
     # via cffi
 pycryptodome==3.23.0
     # via bce-python-sdk
-pydantic==2.11.7
+pydantic==2.13.4
     # via
     #   -r requirements.txt
     #   fastapi
