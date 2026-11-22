@@ -21,6 +21,6 @@
     "python": ">=3.12,<3.14"
   },
   "devDependencies": {
-    "@cyclonedx/cyclonedx-npm": "6.0.1"
+    "@cyclonedx/cyclonedx-npm": "7.0.1"
   }
 }
